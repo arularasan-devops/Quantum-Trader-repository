@@ -1,0 +1,1387 @@
+"""Angel One (SmartAPI) live MCX Crude Oil provider.
+
+Implements :class:`MarketDataProvider` against Angel One's SmartAPI so the
+decision engine runs on **real** MCX Crude Oil futures + option data. Nothing
+else in the app changes — set ``QT_DATA_PROVIDER=angelone`` and supply the
+credentials as environment variables (see ``.env.example``).
+
+Credentials (read from the environment — never hard-code, never commit):
+    SMARTAPI_KEY           API key of your SmartAPI "trading" app
+    SMARTAPI_CLIENT_CODE   your Angel One client / login id
+    SMARTAPI_PIN           your login PIN / MPIN
+    SMARTAPI_TOTP_SECRET   the TOTP secret behind your authenticator QR
+
+Notes / limitations (be honest):
+* SmartAPI does not publish option Greeks, so IV is solved from the live
+  premium (Black-Scholes) and Greeks derived from it here.
+* SmartAPI has request-rate limits; keep ``QT_TICK_INTERVAL_SECONDS`` >= 1.0
+  (2-3s recommended) so one FULL market-quote call per tick stays within them.
+* This module talks to a live third-party API and therefore must be validated
+  during MCX market hours with your own credentials.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import random
+import re as _re
+import threading
+import time
+
+import httpx
+
+from app.ai import safety
+from app.config import settings
+from app.market import options
+from app.market.provider import MarketDataProvider
+from app.market.tick_quality import feed_quality
+from app.models import Candle, NewsItem, OptionQuote, OptionType, OrderResult
+
+_log = logging.getLogger("app.market.angelone")
+
+
+# Redact anything that looks like a bearer token, JWT, API key or private key
+# from a log message so the SmartAPI SDK never leaks credentials into logs.
+_SECRET_PATTERNS = [
+    (_re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]+", _re.IGNORECASE), r"\1***REDACTED***"),
+    (_re.compile(r"(['\"]?Authorization['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+"), r"\1***REDACTED***"),
+    (_re.compile(r"(eyJ[A-Za-z0-9._\-]{10,})"), "***REDACTED_JWT***"),
+    (_re.compile(r"(['\"]?X-PrivateKey['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+"), r"\1***REDACTED***"),
+    (_re.compile(r"(['\"]?(?:api[_-]?key|token|refreshToken|feedToken|jwtToken|password|pin)['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+", _re.IGNORECASE), r"\1***REDACTED***"),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    out = text
+    for pat, repl in _SECRET_PATTERNS:
+        out = pat.sub(repl, out)
+    return out
+
+
+class _RateLimitLogFilter(logging.Filter):
+    """SmartAPI SDK log hygiene:
+
+    1. DROP the SDK's own AB1021 / 'Too many requests' ERROR lines — we already
+       detect, back off and retry these internally, so they are just noise.
+    2. REDACT bearer tokens / JWTs / API keys / private keys from every other
+       SmartAPI log line so credentials never leak into logs.
+
+    Any non-rate-limit error still logs, just with secrets scrubbed.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        low = msg.lower()
+        if (
+            "ab1021" in low
+            or "too many requests" in low
+            or "exceeding access rate" in low
+            # WebSocket reconnect churn — the SDK retries/resubscribes on its own
+            # and our watchdog resurrects it, so these transient lines are handled
+            # noise that alarm users without indicating a real fault.
+            or "resubscribe/reconnect" in low
+            or "max retry attempts reached" in low
+            or "error occurred during subscribe" in low
+            or "socket is already closed" in low
+            or "connection is already closed" in low
+        ):
+            return False
+        redacted = _redact_secrets(msg)
+        if redacted != msg:
+            # Replace the record's payload with the scrubbed, pre-formatted text.
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+# The SmartConnect SDK logs rate-limit errors through logzero (logger name
+# "logzero_default", which carries its OWN handler), plus its module loggers.
+# Filter just the handled AB1021 noise so operators aren't alarmed by expected
+# throttling; every other SmartAPI error still logs normally.
+_rl_filter = _RateLimitLogFilter()
+for _name in (
+    "logzero_default",
+    "SmartApi",
+    "smartConnect",
+    "smartapi",
+    "SmartApi.smartConnect",
+    "smartWebSocketV2",
+    "SmartApi.smartWebSocketV2",
+):
+    _lg = logging.getLogger(_name)
+    _lg.addFilter(_rl_filter)
+    for _h in _lg.handlers:
+        _h.addFilter(_rl_filter)
+try:  # logzero attaches a handler directly to its logger object
+    import logzero as _logzero
+
+    _logzero.logger.addFilter(_rl_filter)
+    for _h in _logzero.logger.handlers:
+        _h.addFilter(_rl_filter)
+except Exception:
+    pass
+
+SCRIP_MASTER_URL = (
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+)
+_QUOTE_MODE = "FULL"
+# Angel /quote FULL mode caps tokens per request (~50). Batch below that.
+_QUOTE_TOKEN_CHUNK = 45
+
+# Cap on every Angel REST call. The SDK defaults to 7s, and a 7s CONNECT stall
+# was seen holding a quote call (and therefore a tick) in a live log — an entry
+# or exit must never wait that long on a network that has already gone quiet.
+# Losing one poll is recoverable; blocking the loop is not.
+_REST_TIMEOUT_SEC = 4
+# Angel allows only a few concurrent WebSocket connections per account, so ALL
+# instruments share ONE stream (below), and that single socket is capped to a
+# safe number of subscribed tokens.
+_MAX_WS_TOKENS = 900
+
+# Angel's historical getCandleData expects fromdate/todate in EXCHANGE-LOCAL
+# time, i.e. IST — NOT the server's local clock. On a UTC machine (common under
+# WSL/Docker) sending naive local timestamps shifts the window 5.5h and silently
+# returns 0 candles for instruments that only trade daytime IST (Nifty/Sensex
+# 09:15-15:30), while MCX (open till 23:30 IST) still catches data. Always build
+# the window in IST so it's correct regardless of the host timezone.
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+def _ist_window(hours: float) -> tuple[str, str]:
+    """Return (fromdate, todate) strings in IST for a getCandleData request."""
+    to = dt.datetime.now(dt.timezone.utc).astimezone(_IST)
+    frm = to - dt.timedelta(hours=hours)
+    fmt = "%Y-%m-%d %H:%M"
+    return frm.strftime(fmt), to.strftime(fmt)
+
+# SmartWebSocketV2 exchange-type codes (see Angel One streaming docs).
+_WS_EXCHANGE_CODE = {"NSE": 1, "NFO": 2, "BSE": 3, "BFO": 4, "MCX": 5, "CDS": 13}
+# Streaming mode 3 = SNAP_QUOTE (LTP + volume + open interest).
+_WS_MODE_SNAP_QUOTE = 3
+# If no websocket tick arrives within this many seconds we treat the stream as
+# stale and fall back to REST polling for that tick (self-healing).
+_WS_STALE_SECONDS = 8.0
+
+# --- shared, process-wide caches -------------------------------------------
+# The scrip master is a ~15-20 MB JSON listing every tradable contract. It is
+# the same for every instrument, so downloading + parsing it on *each*
+# instrument switch was the main reason swapping (nifty <-> sensex) felt very
+# slow. Cache it once per process. Likewise, reuse a single SmartAPI login
+# across providers instead of doing a fresh login + TOTP for every switch.
+_scrip_lock = threading.Lock()
+_scrip_master_cache: list | None = None
+
+# --- per-shard historical-API rate limiter ----------------------------------
+# Angel's historical getCandleData endpoint is strictly rate-limited (AB1021
+# "Too many requests"). Every instrument on the SAME Angel key pulls history
+# from that key's endpoint, so without coordination they race and trip the
+# limit. Each shard (Angel key) owns its OWN limiter, so with multiple keys the
+# historical warm-up runs in parallel (N keys -> ~N times the throughput).
+_HIST_MIN_INTERVAL = 3.5   # min seconds between historical calls, per key
+_HIST_COOLDOWN = 12.0      # base pause after a rate-limit (grows exponentially)
+_HIST_COOLDOWN_MAX = 90.0  # cap the exponential back-off here
+_HIST_JITTER = 0.75        # random spread (s) added to spacing to de-sync shards
+
+
+class _HistLimiter:
+    """Serialises + spaces historical calls for ONE Angel key and backs off on
+    AB1021, so instruments on that key share its budget instead of fighting.
+
+    On repeated rate-limits the cooldown grows exponentially (with a cap) and a
+    small random jitter is added to call spacing so multiple keys don't fire in
+    lock-step. A successful call resets the back-off."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+        self._cooldown_until = 0.0
+        self._consecutive_trips = 0
+
+    def reserve(self) -> float:
+        with self._lock:
+            now = time.time()
+            spacing = _HIST_MIN_INTERVAL + random.uniform(0.0, _HIST_JITTER)
+            earliest = max(now, self._last_call + spacing, self._cooldown_until)
+            self._last_call = earliest
+            return max(0.0, earliest - now)
+
+    def trip_cooldown(self) -> None:
+        with self._lock:
+            self._consecutive_trips += 1
+            backoff = _HIST_COOLDOWN * (2 ** (self._consecutive_trips - 1))
+            backoff = min(backoff, _HIST_COOLDOWN_MAX)
+            backoff += random.uniform(0.0, _HIST_JITTER * 2)
+            self._cooldown_until = time.time() + backoff
+
+    def note_success(self) -> None:
+        with self._lock:
+            self._consecutive_trips = 0
+
+
+def _is_rate_limited(text: str) -> bool:
+    t = (text or "").lower()
+    # Angel signals throttling several different ways: the documented AB1021
+    # "Too many requests", and a gateway-level "Access denied because of
+    # exceeding access rate" that SmartConnect surfaces as a JSON-parse error.
+    return (
+        "ab1021" in t
+        or "too many" in t
+        or "exceeding access rate" in t
+        or "access denied" in t
+        or "couldn't parse the json" in t
+        or "could not parse the json" in t
+    )
+
+
+def _historical_candles(shard: "_Shard", params: dict, *, blocking: bool) -> tuple[list, str]:
+    """Rate-limited, AB1021-aware wrapper around getCandleData for ONE shard.
+
+    Returns ``(rows, diag)``. ``blocking`` should be True only for the FIRST
+    fetch of an instrument (when there is no cached data yet): it then retries
+    with backoff so a rate-limited instrument still gets its initial candles.
+    For routine refreshes (cached data already present) it makes a single
+    attempt and never blocks the tick.
+    """
+    smart = shard.smart
+    limiter = shard.hist
+    attempts = 2 if blocking else 1
+    for _ in range(attempts):
+        wait = limiter.reserve()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = smart.getCandleData(params)
+        except Exception as exc:
+            if _is_rate_limited(str(exc)):
+                limiter.trip_cooldown()
+                continue
+            return [], f"getCandleData error: {exc}"
+        if isinstance(resp, dict) and (resp.get("errorcode") == "AB1021" or _is_rate_limited(str(resp.get("message")))):
+            limiter.trip_cooldown()
+            continue
+        rows = (resp or {}).get("data") or []
+        if rows:
+            limiter.note_success()
+            return rows, ""
+        msg = (resp or {}).get("message") if isinstance(resp, dict) else None
+        code = (resp or {}).get("errorcode") if isinstance(resp, dict) else None
+        return [], f"getCandleData returned 0 candles (message={msg!r} errorcode={code!r})"
+    return [], "historical API rate-limited (AB1021) — sharing budget with other instruments, will retry shortly"
+
+
+def _get_scrip_master() -> list:
+    global _scrip_master_cache
+    if _scrip_master_cache is None:
+        with _scrip_lock:
+            if _scrip_master_cache is None:
+                _scrip_master_cache = httpx.get(SCRIP_MASTER_URL, timeout=60.0).json()
+    return _scrip_master_cache
+
+
+class _Instrument:
+    __slots__ = ("token", "symbol", "strike", "expiry", "opt_type", "is_future", "lot_size")
+
+    def __init__(self, token: str, symbol: str, strike: float, expiry: dt.date,
+                 opt_type: OptionType | None, is_future: bool, lot_size: int = 1) -> None:
+        self.token = token
+        self.symbol = symbol
+        self.strike = strike
+        self.expiry = expiry
+        self.opt_type = opt_type
+        self.is_future = is_future
+        self.lot_size = lot_size
+
+
+class _LiveStream:
+    """Shared Angel One SmartWebSocketV2 push feed for the WHOLE app.
+
+    Angel allows only a few concurrent WebSocket connections per account, so we
+    must NOT open one socket per instrument (25 instruments -> connection storm
+    -> "max retry attempts reached"). Instead every instrument registers its
+    token set with this single shared socket, which subscribes the union across
+    all exchanges and routes each incoming tick to the owning instrument's
+    callback by token. Sub-second and off the REST rate budget; if it fails, the
+    providers transparently fall back to (chunked) REST polling.
+    """
+
+    def __init__(self, smart, relogin=None) -> None:
+        self._routes: dict[str, object] = {}       # token -> on_tick callback
+        self._token_exch: dict[str, int] = {}       # token -> exchange code
+        self._provider_tokens: dict[int, set[str]] = {}  # provider id -> tokens
+        self._subscribed: set[str] = set()          # tokens live on the socket
+        self._connected = False
+        self._last_tick_at = 0.0
+        self._closed = False                         # set only by close()
+        self._reconnects = 0
+        self._built_at = 0.0                         # when the current socket was created
+        # Lifecycle counters. A flapping socket is invisible otherwise: every
+        # rebuild silently drops the whole app back to 3s REST polling, which
+        # reads on screen as "the broker is slow today".
+        self._drops = 0
+        self._rebuilds = 0
+        self._last_drop_at = 0.0
+        self._last_error = ""
+        self._smart = smart
+        # Optional callable returning a freshly-logged-in smart client, used when
+        # the JWT has expired so the socket can re-authenticate on reconnect.
+        self._relogin = relogin
+        self._lock = threading.Lock()
+        self._sws = None
+        self._build_socket(smart)
+        # Watchdog: a LAST-RESORT resurrector. SmartWebSocketV2 already retries and
+        # resubscribes on its own, so we deliberately keep hands off and only rebuild
+        # the socket (with a fresh login) after it has been dead for a long stretch —
+        # otherwise our rebuild races the SDK's retry and stacks up zombie sockets
+        # ("max retry attempts reached").
+        self._watchdog = threading.Thread(target=self._watch, daemon=True)
+        self._watchdog.start()
+
+    def _build_socket(self, smart) -> None:
+        from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+        self._smart = smart
+        sws = SmartWebSocketV2(
+            smart._qt_jwt, smart._qt_api_key, smart._qt_client, smart._qt_feed
+        )
+        sws.on_open = self._on_open
+        sws.on_data = self._on_data
+        sws.on_error = self._on_error
+        sws.on_close = self._on_close
+        self._sws = sws
+        self._built_at = time.time()
+        self._thread = threading.Thread(target=sws.connect, daemon=True)
+        self._thread.start()
+
+    def _watch(self) -> None:
+        """LAST-RESORT reconnect. Let the SDK's own retry/resubscribe fix transient
+        drops; only rebuild the socket ourselves when it has been continuously dead
+        for a long time (SDK gave up) AND we haven't just rebuilt — so we never run
+        two sockets at once. A rebuild re-logs in first, since a persistent failure
+        is usually an expired JWT."""
+        _GRACE = 90.0        # let a freshly-built socket + the SDK's retry settle
+        _DEAD_AFTER = 90.0   # only intervene after this many seconds continuously dead
+        dead_since = 0.0
+        while not self._closed:
+            time.sleep(10.0)
+            if self._closed:
+                break
+            now = time.time()
+            stale = self._last_tick_at and (now - self._last_tick_at) > (_WS_STALE_SECONDS * 8)
+            healthy = self._connected and not stale
+            if healthy:
+                dead_since = 0.0
+                self._reconnects = 0
+                continue
+            if dead_since == 0.0:
+                dead_since = now
+                continue
+            # Give the SDK time to self-heal, and never rebuild within the grace
+            # window of the last build (prevents overlapping sockets).
+            if (now - dead_since) < _DEAD_AFTER or (now - self._built_at) < _GRACE:
+                continue
+            self._reconnects += 1
+            self._rebuilds += 1
+            _log.warning(
+                "angel websocket dead for %.0fs — rebuilding (attempt %d, last error: %s)",
+                now - dead_since,
+                self._reconnects,
+                self._last_error or "none reported",
+            )
+            try:
+                try:
+                    self._sws.close_connection()
+                except Exception:
+                    pass
+                time.sleep(2.0)  # let the old socket's thread fully unwind
+                smart = self._smart
+                if self._relogin is not None:
+                    try:
+                        fresh = self._relogin()
+                        if fresh is not None and getattr(fresh, "_qt_jwt", None):
+                            smart = fresh
+                    except Exception:
+                        pass
+                self._build_socket(smart)
+            except Exception:
+                pass
+            dead_since = 0.0
+            # Back off hard between rebuild attempts so we never storm Angel.
+            time.sleep(min(300.0, 60.0 * self._reconnects))
+
+    def _on_open(self, _wsapp) -> None:
+        self._connected = True
+        self._reconnects = 0
+        _log.info("angel websocket connected (%d drop(s), %d rebuild(s) so far)", self._drops, self._rebuilds)
+        with self._lock:
+            self._subscribed = set()
+            self._apply(set(self._routes.keys()))
+
+    def _on_close(self, _wsapp) -> None:
+        self._connected = False
+        self._last_drop_at = time.time()
+        self._drops += 1
+        self._last_error = "socket closed by the server"
+        # Every instrument THIS socket served has lost its push feed, so their
+        # freshness must reflect that immediately rather than after the next
+        # tick that may never come. Scoped to this socket's own tokens: a second
+        # credential shard may still be perfectly healthy.
+        feed_quality.note_reconnect(tokens=self._subscribed_tokens())
+        _log.warning("angel websocket closed (drop #%d) — falling back to REST polling", self._drops)
+
+    def _on_error(self, _wsapp, _error) -> None:
+        self._connected = False
+        self._last_drop_at = time.time()
+        self._drops += 1
+        self._last_error = _redact_secrets(str(_error))[:200]
+        feed_quality.note_reconnect(tokens=self._subscribed_tokens())
+        _log.warning("angel websocket error (drop #%d): %s", self._drops, self._last_error)
+
+    def _on_data(self, _wsapp, message) -> None:
+        if not isinstance(message, dict):
+            return
+        token = str(message.get("token") or "").strip('"')
+        ltp = message.get("last_traded_price")
+        if not token or ltp is None:
+            return
+        cb = self._routes.get(token)
+        if cb is None:
+            return
+        # SmartWebSocketV2 sends prices in paise (x100) and OI/volume as ints.
+        price = float(ltp) / 100.0
+        oi = int(message.get("open_interest", 0) or 0)
+        vol = int(message.get("volume_trade_for_the_day", 0) or 0)
+        self._last_tick_at = time.time()
+        # SNAP_QUOTE also carries the exchange clock, a sequence number and the
+        # best-5 book. All three were being discarded, which is why feed age,
+        # duplicate/out-of-order delivery and the real option spread could not
+        # be reported at all. Passed through as metadata only.
+        cb(token, price, oi, vol, {
+            "exchange_ms": message.get("exchange_timestamp"),
+            "seq": message.get("sequence_number"),
+            "bid": _best_price(message.get("best_5_buy_data"), paise=True),
+            "ask": _best_price(message.get("best_5_sell_data"), paise=True),
+        })
+
+    def set_provider_tokens(self, key: int, exch_code: int, tokens: list[str], cb) -> None:
+        """Register/replace one instrument's token set and re-diff the union."""
+        with self._lock:
+            self._provider_tokens[key] = set(tokens)
+            for t in tokens:
+                self._routes[t] = cb
+                self._token_exch[t] = exch_code
+            # Union across every registered instrument, capped so we never blow
+            # Angel's per-socket token ceiling (overflow instruments fall back to
+            # REST polling automatically via their staleness check).
+            union: list[str] = []
+            for toks in self._provider_tokens.values():
+                union.extend(toks)
+            desired = set(union[:_MAX_WS_TOKENS])
+            if self._connected:
+                self._apply(desired)
+
+    def _apply(self, desired: set[str]) -> None:
+        add = desired - self._subscribed
+        remove = self._subscribed - desired
+        if remove:
+            self._send("unsubscribe", remove)
+        if add:
+            self._send("subscribe", add)
+        self._subscribed = desired
+
+    def _send(self, action: str, tokens: set[str]) -> None:
+        by_exch: dict[int, list[str]] = {}
+        for t in tokens:
+            by_exch.setdefault(self._token_exch.get(t, 5), []).append(t)
+        payload = [{"exchangeType": ec, "tokens": tk} for ec, tk in by_exch.items()]
+        try:
+            fn = self._sws.subscribe if action == "subscribe" else self._sws.unsubscribe
+            fn("qt", _WS_MODE_SNAP_QUOTE, payload)
+        except Exception:
+            self._connected = False
+
+    def _subscribed_tokens(self) -> list[str]:
+        """Tokens THIS socket is responsible for (used to scope a drop)."""
+        return list(self._subscribed) or list(self._routes.keys())
+
+    def connected(self) -> bool:
+        return self._connected
+
+    def healthy(self, now: float) -> bool:
+        return self._connected and (now - self._last_tick_at) <= _WS_STALE_SECONDS
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._sws.close_connection()
+        except Exception:
+            pass
+
+
+def _login_with(creds: dict) -> object:
+    """Log in one Angel API key and stash the tokens the WebSocket needs."""
+    try:
+        import pyotp
+        from SmartApi import SmartConnect
+    except ImportError as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "Angel One SDK not installed. Run: pip install smartapi-python pyotp"
+        ) from exc
+
+    smart = SmartConnect(api_key=creds["key"], timeout=_REST_TIMEOUT_SEC)
+    totp = pyotp.TOTP(creds["totp"]).now()
+    session = smart.generateSession(creds["client"], creds["pin"], totp)
+    if not session or not session.get("status"):
+        raise RuntimeError(f"Angel One login failed: {session}")
+    try:
+        smart._qt_jwt = (session.get("data") or {}).get("jwtToken")
+        smart._qt_feed = smart.getfeedToken()
+        smart._qt_api_key = creds["key"]
+        smart._qt_client = creds["client"]
+    except Exception:
+        smart._qt_jwt = None
+    return smart
+
+
+def _credential_sets() -> list[dict]:
+    """Read one or more Angel API credential sets from the environment.
+
+    The primary key uses the unsuffixed vars (SMARTAPI_KEY, SMARTAPI_CLIENT_CODE,
+    SMARTAPI_PIN, SMARTAPI_TOTP_SECRET). Extra keys use numeric suffixes
+    (_2, _3, …). Each additional key is a separate Angel "app"/session that adds
+    its own WebSocket + token budget and runs its historical warm-up in parallel.
+    """
+    sets: list[dict] = []
+    for suffix in ["", "_2", "_3", "_4", "_5"]:
+        key = os.environ.get(f"SMARTAPI_KEY{suffix}")
+        client = os.environ.get(f"SMARTAPI_CLIENT_CODE{suffix}")
+        pin = os.environ.get(f"SMARTAPI_PIN{suffix}")
+        totp = os.environ.get(f"SMARTAPI_TOTP_SECRET{suffix}")
+        if key and client and pin and totp:
+            sets.append({"key": key, "client": client, "pin": pin, "totp": totp})
+    return sets
+
+
+class _Shard:
+    """One Angel API key = one login session + one WebSocket + one historical
+    rate-limiter. Instruments are spread across shards so multiple keys multiply
+    the connection/token budget and parallelise the historical warm-up."""
+
+    def __init__(self, creds: dict) -> None:
+        self._creds = creds
+        self.smart = _login_with(creds)
+        self.hist = _HistLimiter()
+        self.stream: _LiveStream | None = None
+        if getattr(self.smart, "_qt_jwt", None):
+            try:
+                self.stream = _LiveStream(self.smart, relogin=self._relogin)
+            except Exception:
+                self.stream = None
+
+    def _relogin(self):
+        """Re-authenticate this shard's Angel session (used by the live-stream
+        watchdog when the JWT has expired). Updates the shard's own client so
+        REST calls also use the fresh token."""
+        fresh = _login_with(self._creds)
+        if getattr(fresh, "_qt_jwt", None):
+            self.smart = fresh
+        return fresh
+
+
+_shards: list[_Shard] | None = None
+_shards_lock = threading.Lock()
+
+
+def _get_shards() -> list[_Shard]:
+    """Build (once) the list of Angel shards from the configured credential
+    sets. A key that fails to log in is skipped; at least one must succeed."""
+    global _shards
+    with _shards_lock:
+        if _shards is None:
+            built: list[_Shard] = []
+            creds_list = _credential_sets()
+            if not creds_list:
+                raise RuntimeError(
+                    "Angel One provider missing credentials: set SMARTAPI_KEY, "
+                    "SMARTAPI_CLIENT_CODE, SMARTAPI_PIN, SMARTAPI_TOTP_SECRET "
+                    "(see .env.example)."
+                )
+            for i, creds in enumerate(creds_list):
+                try:
+                    built.append(_Shard(creds))
+                except Exception as exc:
+                    _log.warning("Angel shard %d login failed, skipping: %s", i + 1, exc)
+            if not built:
+                raise RuntimeError("Angel One login failed for all configured keys.")
+            _shards = built
+        return _shards
+
+
+_assign_lock = threading.Lock()
+_assignment: dict[str, int] = {}
+
+
+def _shard_for(symbol: str) -> _Shard:
+    """Assign an instrument to a shard, balanced ROUND-ROBIN across the available
+    Angel keys and stable within a run.
+
+    We deliberately do NOT hash the symbol: with only a handful of instruments a
+    hash can pile them all onto one key and leave the others idle. Round-robin
+    guarantees an even spread regardless of how few instruments are configured.
+    """
+    shards = _get_shards()
+    if len(shards) == 1:
+        return shards[0]
+    with _assign_lock:
+        idx = _assignment.get(symbol)
+        if idx is None:
+            idx = len(_assignment) % len(shards)
+            _assignment[symbol] = idx
+    return shards[idx]
+
+
+def feed_health() -> dict:
+    """READ-ONLY diagnostic: how many Angel keys logged in, whether each key's
+    WebSocket is connected and how fresh its ticks are, and which instruments
+    are assigned to each key. Never touches orders. Masks all credentials."""
+    now = time.time()
+    try:
+        shards = _get_shards()
+    except Exception as exc:
+        return {"ok": False, "error": _redact_secrets(str(exc)), "shards": []}
+
+    with _assign_lock:
+        assign_snapshot = dict(_assignment)
+
+    out_shards: list[dict] = []
+    for i, shard in enumerate(shards):
+        client = getattr(shard.smart, "_qt_client", None) or f"account_{i + 1}"
+        stream = shard.stream
+        connected = bool(stream and stream.connected())
+        last_tick = getattr(stream, "_last_tick_at", 0.0) if stream else 0.0
+        tick_age = round(now - last_tick, 1) if last_tick else None
+        drop_at = getattr(stream, "_last_drop_at", 0.0) if stream else 0.0
+        out_shards.append(
+            {
+                "index": i + 1,
+                "client_masked": _mask(client),
+                "logged_in": bool(getattr(shard.smart, "_qt_jwt", None)),
+                "ws_connected": connected,
+                "ws_healthy": bool(stream and stream.healthy(now)),
+                "last_tick_age_sec": tick_age,
+                # A socket that keeps dying and being rebuilt looks identical to a
+                # healthy one in a snapshot, so report the history too.
+                "ws_drops": getattr(stream, "_drops", 0) if stream else 0,
+                "ws_rebuilds": getattr(stream, "_rebuilds", 0) if stream else 0,
+                "last_drop_age_sec": round(now - drop_at, 1) if drop_at else None,
+                "last_ws_error": (getattr(stream, "_last_error", "") if stream else "") or None,
+                "instruments": sorted(s for s, idx in assign_snapshot.items() if idx == i),
+                # Token utilisation, so "should we shard the socket?" is answered
+                # with the real subscription count instead of a guess.
+                "ws_tokens_subscribed": (
+                    len(getattr(stream, "_subscribed", ()) or ()) if stream else 0
+                ),
+                "ws_tokens_routed": (
+                    len(getattr(stream, "_routes", {}) or {}) if stream else 0
+                ),
+            }
+        )
+    total_routed = sum(s["ws_tokens_routed"] for s in out_shards)
+    total_subbed = sum(s["ws_tokens_subscribed"] for s in out_shards)
+    return {
+        "ok": True,
+        "keys_configured": len(shards),
+        "shards": out_shards,
+        # Part U: capacity report only. Extra sockets are NOT opened here; the
+        # numbers are what a sharding decision should be based on.
+        "sharding": {
+            "sockets_active": sum(1 for s in out_shards if s["ws_connected"]),
+            "tokens_per_socket_cap": _MAX_WS_TOKENS,
+            "tokens_routed_total": total_routed,
+            "tokens_subscribed_total": total_subbed,
+            "tokens_overflowing_to_rest": max(0, total_routed - total_subbed),
+            "capacity_used_pct": (
+                round(100.0 * total_subbed / (_MAX_WS_TOKENS * max(1, len(shards))), 1)
+            ),
+            "note": (
+                "One socket per credential set. Splitting tokens across more "
+                "sockets only helps once a socket is near its cap or is dropping; "
+                "the live log's problem was drops, not the cap."
+            ),
+        },
+    }
+
+
+def _as_int(v: object) -> int | None:
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _best_price(levels: object, *, paise: bool) -> float | None:
+    """Top-of-book price from a best-5 / depth list, or None.
+
+    ``paise`` must be stated by the caller, never inferred: the WebSocket's
+    ``best_5_*_data`` carries prices x100 while the REST quote's ``depth`` block
+    carries rupees, and BOTH label the field ``price``. Guessing from the field
+    name would silently put a REST spread out by 100x.
+    """
+    if not isinstance(levels, list) or not levels:
+        return None
+    first = levels[0]
+    if not isinstance(first, dict):
+        return None
+    p = _to_float(first.get("price") or first.get("ltp"))
+    if not p:
+        return None
+    return round(p / 100.0, 4) if paise else p
+
+
+def _to_float(v: object) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def account_info() -> dict:
+    """READ-ONLY snapshot of the real Angel account(s): available cash, used
+    margin, net balance, and open-position P&L. This only READS from Angel
+    (funds + positions); it never places or modifies an order.
+
+    Aggregates across all configured shards (accounts). Raises RuntimeError if
+    no Angel session is available so the caller can report it cleanly.
+    """
+    shards = _get_shards()
+    accounts: list[dict] = []
+    total_available = 0.0
+    total_used = 0.0
+    total_net = 0.0
+    total_open_pnl = 0.0
+    total_realised = 0.0
+    positions_out: list[dict] = []
+
+    for i, shard in enumerate(shards):
+        smart = shard.smart
+        client = getattr(smart, "_qt_client", None) or f"account_{i + 1}"
+        acct: dict = {"client_masked": _mask(client)}
+        try:
+            rms = smart.rmsLimit() or {}
+            d = rms.get("data") or {}
+            avail = _to_float(d.get("availablecash")) or _to_float(d.get("net"))
+            used = _to_float(d.get("utiliseddebits")) or _to_float(d.get("utilisedmargin"))
+            net = _to_float(d.get("net"))
+            acct["available_cash"] = avail
+            acct["used_margin"] = used
+            acct["net_balance"] = net
+            total_available += avail or 0.0
+            total_used += used or 0.0
+            total_net += net or 0.0
+        except Exception as exc:
+            acct["funds_error"] = str(exc)
+
+        try:
+            pos = smart.position() or {}
+            rows = pos.get("data") or []
+            for r in rows:
+                unreal = _to_float(r.get("unrealised")) or 0.0
+                real = _to_float(r.get("realised")) or 0.0
+                total_open_pnl += unreal
+                total_realised += real
+                positions_out.append({
+                    "account": _mask(client),
+                    "symbol": r.get("tradingsymbol"),
+                    "product": r.get("producttype"),
+                    "net_qty": r.get("netqty"),
+                    "ltp": _to_float(r.get("ltp")),
+                    "buy_avg": _to_float(r.get("buyavgprice")),
+                    "sell_avg": _to_float(r.get("sellavgprice")),
+                    "unrealised": unreal,
+                    "realised": real,
+                })
+        except Exception as exc:
+            acct["positions_error"] = str(exc)
+
+        accounts.append(acct)
+
+    return {
+        "accounts": accounts,
+        "totals": {
+            "available_cash": round(total_available, 2),
+            "used_margin": round(total_used, 2),
+            "net_balance": round(total_net, 2),
+            "open_pnl": round(total_open_pnl, 2),
+            "realised_pnl_today": round(total_realised, 2),
+        },
+        "positions": positions_out,
+    }
+
+
+_cash_cache: dict[str, float] = {"value": 0.0, "ts": 0.0}
+_cash_lock = threading.Lock()
+
+
+def available_cash(ttl: float = 30.0) -> float | None:
+    """READ-ONLY live available cash across all Angel accounts, cached for ``ttl``
+    seconds so per-tick sizing never hammers the funds endpoint. Returns None if
+    the balance can't be read (caller should then fall back to configured
+    capital). Never places or modifies an order."""
+    now = time.time()
+    with _cash_lock:
+        if _cash_cache["ts"] and (now - _cash_cache["ts"]) < ttl:
+            return _cash_cache["value"] or None
+    try:
+        info = account_info()
+        cash = float((info.get("totals") or {}).get("available_cash") or 0.0)
+    except Exception:
+        return _cash_cache["value"] or None
+    with _cash_lock:
+        _cash_cache["value"] = cash
+        _cash_cache["ts"] = now
+    return cash or None
+
+
+def _mask(client: str) -> str:
+    s = str(client)
+    if len(s) <= 4:
+        return s
+    return s[:2] + "***" + s[-2:]
+
+
+class AngelOneProvider(MarketDataProvider):
+    EXCHANGE = "MCX"
+
+    def __init__(self, spec=None) -> None:
+        self._exchange = (spec.exchange if spec else None) or settings.angel_exchange or self.EXCHANGE
+        self._root = (spec.symbol if spec else None) or settings.angel_symbol_root or "CRUDEOIL"
+        # This instrument is assigned to one Angel key (shard); all its live
+        # data (login session, WebSocket, historical rate limiter) comes from it.
+        self._shard = _shard_for(self._root)
+        self._smart = self._shard.smart
+        # Per-instrument option strike spacing (falls back to the global default
+        # only when no spec is supplied).
+        self._strike_step = spec.strike_step if spec else settings.strike_step
+
+        self._future: _Instrument | None = None
+        self._options: list[_Instrument] = []  # nearest-expiry option instruments
+        self._by_token: dict[str, _Instrument] = {}
+        self._load_instruments()
+
+        # live caches
+        self._spot: float = 0.0
+        self._quotes: dict[str, dict] = {}  # token -> {ltp, oi, volume}
+        self._fut_candles: list[Candle] = []
+        self._opt_candles: dict[str, list[Candle]] = {}
+        self._last_quote_at = 0.0
+        self._last_fut_candles_at = 0.0
+        self._candle_diag: str = ""
+
+        # Real-time push feed (falls back to REST polling if it can't start).
+        self._stream: _LiveStream | None = None
+        self._subscribed_tokens: list[str] = []
+        self._ws_exchange_code = _WS_EXCHANGE_CODE.get(self._exchange, 5)
+        self._last_ws_tick = 0.0  # per-instrument: last time THIS instrument got a push
+        self._streaming = False   # True while prices arrive via WebSocket push
+        # Per-token tick times: an ATM option can go quiet (illiquid strike)
+        # while the underlying keeps streaming, and only the option age exposes
+        # that — the frozen-premium rows looked like live signals on the board.
+        self._token_tick_at: dict[str, float] = {}
+        # Session feed accounting, so "is the feed slow?" is answered with a
+        # measured share of the session rather than the state of this instant.
+        self._feed_day = ""
+        self._push_sec = 0.0
+        self._rest_sec = 0.0
+        self._fallbacks = 0
+        self._last_mode_at = 0.0
+        self._was_streaming = False
+        self._start_stream()
+
+        self._refresh_futures_candles()
+        self._last_fut_candles_at = time.time()  # avoid an immediate re-fetch in step()
+        self.step()
+
+    # --------------------------------------------------------- live streaming
+    def _start_stream(self) -> None:
+        """Attach to this shard's WebSocket push feed. If the shard has no live
+        socket, ``self._stream`` stays None and the provider uses REST polling."""
+        self._stream = self._shard.stream
+
+    def _on_stream_tick(self, token: str, ltp: float, oi: int, vol: int,
+                        meta: dict | None = None) -> None:
+        meta = meta or {}
+        # Tick accounting is observability only: the verdict is recorded, and the
+        # provider cache below still stores what the broker sent (unchanged
+        # behaviour). The scanner reads the guarded copy instead.
+        verdict = feed_quality.record_tick(
+            self._root, token,
+            ltp=ltp,
+            exchange_ms=_as_int(meta.get("exchange_ms")),
+            seq=_as_int(meta.get("seq")),
+            source="push",
+        )
+        if ltp <= 0:
+            return
+        prev = self._quotes.get(token) or {}
+        bid, ask = meta.get("bid"), meta.get("ask")
+        self._quotes[token] = {
+            "ltp": ltp, "oi": oi, "volume": vol,
+            "bid": bid if bid is not None else prev.get("bid"),
+            "ask": ask if ask is not None else prev.get("ask"),
+            "high": prev.get("high"), "low": prev.get("low"),
+            "open": prev.get("open"), "prev_close": prev.get("prev_close"),
+            "tick_verdict": verdict,
+        }
+        now = time.time()
+        self._last_ws_tick = now
+        self._token_tick_at[token] = now
+        if self._future and token == self._future.token:
+            self._spot = ltp
+
+    def _sync_subscription(self) -> None:
+        if self._stream is None or not self._future:
+            return
+        tokens = [self._future.token, *self._atm_option_tokens()]
+        if tokens != self._subscribed_tokens:
+            self._subscribed_tokens = tokens
+            self._stream.set_provider_tokens(
+                id(self), self._ws_exchange_code, tokens, self._on_stream_tick
+            )
+
+    # ------------------------------------------------------ instrument setup
+    def _load_instruments(self) -> None:
+        data = _get_scrip_master()
+        futures: list[_Instrument] = []
+        options_all: list[_Instrument] = []
+        for row in data:
+            if row.get("exch_seg") != self._exchange:
+                continue
+            if row.get("name") != self._root:
+                continue
+            expiry = _parse_expiry(row.get("expiry", ""))
+            if expiry is None:
+                continue
+            itype = (row.get("instrumenttype") or "").upper()
+            token = str(row.get("token"))
+            sym = row.get("symbol", "")
+            lot = int(float(row.get("lotsize", 1) or 1))
+            # Handle BOTH commodity (MCX: FUTCOM/OPTFUT) and index/equity
+            # (NFO/BFO: FUTIDX/FUTSTK / OPTIDX/OPTSTK) contracts. The previous
+            # code only matched FUTCOM/OPTFUT, so Nifty & Sensex (index type)
+            # resolved to nothing and failed.
+            if itype.startswith("FUT"):
+                futures.append(_Instrument(token, sym, 0.0, expiry, None, True, lot))
+            elif itype.startswith("OPT"):
+                strike = float(row.get("strike", 0)) / 100.0  # scrip master strike is x100
+                otype = OptionType.CALL if sym.endswith("CE") else OptionType.PUT
+                options_all.append(_Instrument(token, sym, strike, expiry, otype, False, lot))
+
+        today = dt.date.today()
+        fut_future = sorted((f for f in futures if f.expiry >= today), key=lambda x: x.expiry)
+        if not fut_future:
+            raise RuntimeError(
+                f"No current {self._root} futures contract found on {self._exchange} "
+                f"in the scrip master."
+            )
+        self._future = fut_future[0]
+
+        opt_expiries = sorted({o.expiry for o in options_all if o.expiry >= today})
+        if not opt_expiries:
+            raise RuntimeError(
+                f"No current {self._root} option contracts found on {self._exchange} "
+                f"in the scrip master."
+            )
+        nearest = opt_expiries[0]
+        self._options = [o for o in options_all if o.expiry == nearest]
+        self._by_token = {i.token: i for i in [self._future, *self._options]}
+
+    # ----------------------------------------------------------- live pulls
+    def _atm_option_tokens(self) -> list[str]:
+        if not self._options:
+            return []
+        spot = self._spot or _median_strike(self._options)
+        # Use the PER-INSTRUMENT strike spacing (Nifty 50, Sensex 100, Crude 50),
+        # not the global default — otherwise Sensex's ATM window is computed on
+        # the wrong grid and can miss the real strikes.
+        step = self._strike_step
+        atm = round(spot / step) * step
+        n = settings.strikes_each_side
+        lo, hi = atm - n * step, atm + n * step
+        return [o.token for o in self._options if lo <= o.strike <= hi]
+
+    def _refresh_quotes(self) -> None:
+        tokens = [self._future.token] + self._atm_option_tokens() if self._future else []
+        if not tokens:
+            return
+        # Angel's /quote FULL endpoint accepts at most ~50 tokens per request;
+        # a wide strike window (e.g. QT_STRIKES_EACH_SIDE=15 -> 60+ tokens) trips
+        # "Tokens max limit exceeded" (AB4029). Split into <=45-token batches.
+        for i in range(0, len(tokens), _QUOTE_TOKEN_CHUNK):
+            batch = tokens[i : i + _QUOTE_TOKEN_CHUNK]
+            try:
+                resp = self._smart.getMarketData(_QUOTE_MODE, {self._exchange: batch})
+            except Exception:
+                continue
+            rows = ((resp or {}).get("data") or {}).get("fetched") or []
+            for row in rows:
+                token = str(row.get("symbolToken"))
+                depth = row.get("depth") or {}
+                if token == (self._future.token if self._future else None):
+                    # Age on the REST fallback is the age of this poll, and the
+                    # poll floor is 3s — that is the number the board needs to
+                    # show instead of an implied "live".
+                    feed_quality.record_tick(
+                        self._root, token,
+                        ltp=_to_float(row.get("ltp")),
+                        exchange_ms=None,
+                        source="rest",
+                    )
+                self._quotes[token] = {
+                    "ltp": float(row.get("ltp", 0) or 0),
+                    "oi": int(row.get("opnInterest", 0) or 0),
+                    "volume": int(row.get("tradeVolume", 0) or 0),
+                    # Official exchange day OHLC (FULL mode) so the dashboard can
+                    # show the SAME day High/Low as the broker app. 'close' here
+                    # is the PREVIOUS session close (Angel's convention).
+                    "high": _to_float(row.get("high")),
+                    "low": _to_float(row.get("low")),
+                    "open": _to_float(row.get("open")),
+                    "prev_close": _to_float(row.get("close")),
+                    # Real book, when the quote carries it: the only genuine
+                    # source of option spread in this app (Phase 3 had none).
+                    # REST depth is quoted in rupees, unlike the socket's paise.
+                    "bid": _best_price(depth.get("buy"), paise=False),
+                    "ask": _best_price(depth.get("sell"), paise=False),
+                }
+        if self._future and self._future.token in self._quotes:
+            self._spot = self._quotes[self._future.token]["ltp"] or self._spot
+
+    def _refresh_futures_candles(self) -> None:
+        if not self._future:
+            return
+        # 48h IST lookback: enough 1-minute bars for the indicators even right
+        # after the open (covers the previous session), and in IST so the window
+        # actually overlaps daytime-only markets (Nifty/Sensex).
+        frm, to = _ist_window(48)
+        params = {
+            "exchange": self._exchange,
+            "symboltoken": self._future.token,
+            "interval": "ONE_MINUTE",
+            "fromdate": frm,
+            "todate": to,
+        }
+        # Block-with-backoff only until this instrument has its FIRST batch of
+        # candles; after that keep serving the cache and refresh non-blocking so
+        # a transient AB1021 never wipes out a working chart.
+        blocking = not self._fut_candles
+        rows, diag = _historical_candles(self._shard, params, blocking=blocking)
+        candles = _to_candles(rows)
+        if candles:
+            self._fut_candles = candles
+            self._candle_diag = ""
+        elif not self._fut_candles:
+            # No cached data yet — surface WHY (rate-limit / token / permission),
+            # never a silently-blank instrument. No credentials are ever logged.
+            self._candle_diag = f"{self._root}/{self._exchange}: {diag}"
+            _log.warning(self._candle_diag)
+
+    # ------------------------------------------------- provider interface
+    def step(self) -> None:
+        now = time.time()
+        # Keep the socket subscribed to the current futures + ATM option window.
+        self._sync_subscription()
+        # Prices come from the WebSocket push feed in real time. Only fall back
+        # to REST quote polling when the stream is absent or has gone quiet —
+        # that keeps updates sub-second AND off the REST rate limit.
+        # This instrument is "streaming" only if the shared socket is connected
+        # AND *this* instrument's own tokens have pushed recently. An instrument
+        # whose tokens went quiet (illiquid, or dropped by the token cap) falls
+        # back to chunked REST polling on its own, even while the socket is up.
+        streaming = (
+            self._stream is not None
+            and self._stream.connected()
+            and (now - self._last_ws_tick) <= _WS_STALE_SECONDS
+        )
+        self._streaming = streaming
+        self._account_feed(streaming, now)
+        # When falling back to REST quotes, poll no faster than every 3s — the
+        # quote endpoint shares Angel's gateway "access rate" budget with the
+        # historical API, so aggressive polling (tick_interval can be 1s) starves
+        # the candle calls and triggers "exceeding access rate".
+        if not streaming and now - self._last_quote_at >= max(3.0, settings.tick_interval_seconds):
+            self._refresh_quotes()
+            self._last_quote_at = now
+        # Candles (for indicators) always come from the 1-minute historical API.
+        if now - self._last_fut_candles_at >= 60.0:
+            self._refresh_futures_candles()
+            self._last_fut_candles_at = now
+
+    def feed_mode(self) -> str:
+        return "push" if self._streaming else "rest"
+
+    def _account_feed(self, streaming: bool, now: float) -> None:
+        """Accumulate how long this session has run on push vs the REST fallback.
+
+        A snapshot of the current mode cannot answer "is my data slow today" —
+        an instrument that drops to the 3s poll for twenty minutes an hour looks
+        healthy every time you happen to look at it.
+        """
+        today = dt.date.today().isoformat()
+        if today != self._feed_day:
+            self._feed_day = today
+            self._push_sec = self._rest_sec = 0.0
+            self._fallbacks = 0
+            self._last_mode_at = now
+            self._was_streaming = streaming
+            return
+        elapsed = max(0.0, now - self._last_mode_at) if self._last_mode_at else 0.0
+        # Ignore a long gap (process paused, market closed overnight) so it does
+        # not swamp the session share with time nobody was watching.
+        if elapsed <= 60.0:
+            if self._was_streaming:
+                self._push_sec += elapsed
+            else:
+                self._rest_sec += elapsed
+        if self._was_streaming and not streaming:
+            self._fallbacks += 1
+        self._was_streaming = streaming
+        self._last_mode_at = now
+
+    def _token_age(self, token: str | None, now: float) -> float | None:
+        if not token:
+            return None
+        at = self._token_tick_at.get(token) or 0.0
+        if at <= 0:
+            # Never pushed: age from the last REST refresh instead of claiming
+            # freshness we do not have.
+            at = self._last_quote_at
+        return round(now - at, 1) if at > 0 else None
+
+    def feed_health(self) -> dict:
+        now = time.time()
+        atm = self._atm_option_tokens()
+        opt_ages = [a for a in (self._token_age(t, now) for t in atm) if a is not None]
+        total = self._push_sec + self._rest_sec
+        connected = bool(self._stream and self._stream.connected())
+        if self._streaming:
+            note = "Live WebSocket push."
+        elif connected:
+            note = (
+                f"Socket is up but {self._root} has not pushed for "
+                f"{_WS_STALE_SECONDS:.0f}s — polling REST every 3s."
+            )
+        else:
+            note = "WebSocket down — polling REST every 3s."
+        return {
+            "mode": self.feed_mode(),
+            "live": self._streaming,
+            "underlying_age_sec": self._token_age(
+                self._future.token if self._future else None, now
+            ),
+            "option_age_sec": min(opt_ages) if opt_ages else None,
+            "stale_after_sec": _WS_STALE_SECONDS,
+            "ws_connected": connected,
+            "subscribed_tokens": len(self._subscribed_tokens),
+            "push_pct_today": round(100.0 * self._push_sec / total, 1) if total > 0 else None,
+            "fallbacks_today": self._fallbacks,
+            "note": note,
+        }
+
+    def futures_price(self) -> float:
+        # Prefer the live LTP; if the quote endpoint hasn't answered yet (or is
+        # throttled), fall back to the last known futures candle close so the
+        # header shows a real price instead of 0.0.
+        if self._spot:
+            return round(self._spot, 1)
+        if self._fut_candles:
+            return round(self._fut_candles[-1].close, 1)
+        return 0.0
+
+    def futures_candles(self, limit: int = 240) -> list[Candle]:
+        return self._fut_candles[-limit:]
+
+    def day_ohlc(self, symbol: str | None = None) -> dict | None:
+        # Official exchange day OHLC captured from the FULL /quote feed, so the
+        # dashboard shows the SAME day High/Low as the broker app instead of a
+        # value derived from the collected candle window.
+        if symbol is None:
+            token = self._future.token if self._future else None
+        else:
+            inst = next((o for o in self._options if o.symbol == symbol), None)
+            token = inst.token if inst else None
+        if not token:
+            return None
+        q = self._quotes.get(token)
+        if not q or q.get("high") is None:
+            return None
+        return {
+            "high": q.get("high"),
+            "low": q.get("low"),
+            "open": q.get("open"),
+            "prev_close": q.get("prev_close"),
+        }
+
+    def option_chain(self) -> list[OptionQuote]:
+        r = settings.risk_free_rate
+        chain: list[OptionQuote] = []
+        atm_tokens = set(self._atm_option_tokens())
+        t = self._time_to_expiry()
+        for inst in self._options:
+            if inst.token not in atm_tokens:
+                continue
+            q = self._quotes.get(inst.token)
+            if not q or q["ltp"] <= 0 or self._spot <= 0:
+                continue
+            is_call = inst.opt_type == OptionType.CALL
+            iv = options.implied_vol(q["ltp"], self._spot, inst.strike, r, t, is_call)
+            g = options.greeks(self._spot, inst.strike, r, iv, t, is_call)
+            chain.append(OptionQuote(
+                symbol=inst.symbol,
+                strike=inst.strike,
+                option_type=inst.opt_type,
+                premium=round(q["ltp"], 1),
+                iv=iv,
+                delta=g["delta"],
+                gamma=g["gamma"],
+                theta=g["theta"],
+                vega=g["vega"],
+                oi=q["oi"],
+                oi_change=0,  # SmartAPI FULL quote does not expose OI delta directly
+                volume=q["volume"],
+                bid=q.get("bid"),
+                ask=q.get("ask"),
+            ))
+        return chain
+
+    def option_candles(self, symbol: str, limit: int = 240) -> list[Candle]:
+        inst = next((o for o in self._options if o.symbol == symbol), None)
+        if inst is None:
+            return []
+        cached = self._opt_candles.get(symbol)
+        if cached:
+            return cached[-limit:]
+        frm, to = _ist_window(48)
+        # Non-blocking: option charts are secondary to the futures decision, so
+        # they must never stall the tick. They share the same historical budget
+        # via the limiter and simply fill in once the rate limit allows.
+        rows, _ = _historical_candles(self._shard, {
+            "exchange": self._exchange,
+            "symboltoken": inst.token,
+            "interval": "ONE_MINUTE",
+            "fromdate": frm,
+            "todate": to,
+        }, blocking=False)
+        candles = _to_candles(rows)
+        if candles:
+            self._opt_candles[symbol] = candles
+        return candles[-limit:]
+
+    def news(self) -> list[NewsItem]:
+        # Angel One does not provide a news feed; wire a licensed news source
+        # (Reuters/EIA/OPEC) separately. Returning empty keeps the panel honest.
+        return []
+
+    def diagnostics(self) -> str:
+        # Surfaced on the dashboard when candles are empty, so "waiting for
+        # market data" explains the real cause (rate-limit / bad token / no
+        # historical entitlement) instead of leaving the user guessing.
+        return self._candle_diag
+
+    def nearest_expiry(self) -> "dt.date | None":
+        return self._options[0].expiry if self._options else None
+
+    # ------------------------------------------------------------- trading
+    def supports_trading(self) -> bool:
+        return True
+
+    def place_order(self, option_symbol: str, side: str, lots: int) -> OrderResult:
+        # Phase 6 kill switch — must be the first statement, before any SDK call.
+        safety.assert_order_allowed("angelone.place_order", option_symbol, side, lots)
+        inst = next((o for o in self._options if o.symbol == option_symbol), None)
+        if inst is None:
+            return OrderResult(ok=False, mode="live", side=side, option_symbol=option_symbol,
+                               lots=lots, message=f"Unknown option {option_symbol}")
+        quantity = max(1, lots) * max(1, inst.lot_size)
+        params = {
+            "variety": settings.angel_order_variety,
+            "tradingsymbol": inst.symbol,
+            "symboltoken": inst.token,
+            "transactiontype": side.upper(),  # BUY / SELL
+            "exchange": self._exchange,
+            "ordertype": settings.angel_order_type,
+            "producttype": settings.angel_product,
+            "duration": "DAY",
+            "price": "0",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(quantity),
+        }
+        # Route the real order through the primary Angel key when configured, so
+        # order placement never competes with this instrument's data shard. Data
+        # (quotes/history) still uses this instrument's own shard.
+        order_smart = self._smart
+        if settings.orders_on_primary_only:
+            try:
+                shards = _get_shards()
+                if shards:
+                    order_smart = shards[0].smart
+            except Exception:
+                order_smart = self._smart
+        try:
+            resp = order_smart.placeOrder(params)
+        except Exception as exc:  # pragma: no cover - live API
+            return OrderResult(ok=False, mode="live", side=side, option_symbol=option_symbol,
+                               lots=lots, message=f"Order error: {exc}")
+        order_id = str(resp) if resp else None
+        q = self._quotes.get(inst.token)
+        fill = round(q["ltp"], 1) if q else None
+        return OrderResult(ok=bool(order_id), mode="live", side=side, option_symbol=option_symbol,
+                           lots=lots, fill_premium=fill, order_id=order_id,
+                           message="Order placed" if order_id else "Order rejected")
+
+    # --------------------------------------------------------------- helpers
+    def _time_to_expiry(self) -> float:
+        if not self._options:
+            return settings.days_to_expiry / 365.0
+        days = max(0.5, (self._options[0].expiry - dt.date.today()).days + 0.5)
+        return days / 365.0
+
+
+def _parse_expiry(raw: str) -> dt.date | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(raw.upper(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _median_strike(opts: list[_Instrument]) -> float:
+    strikes = sorted(o.strike for o in opts)
+    return strikes[len(strikes) // 2] if strikes else 0.0
+
+
+def _to_candles(rows: list) -> list[Candle]:
+    out: list[Candle] = []
+    for row in rows:
+        try:
+            ts = dt.datetime.fromisoformat(str(row[0]))
+            out.append(Candle(
+                time=int(ts.timestamp()),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+            ))
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out

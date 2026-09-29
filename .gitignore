@@ -1,0 +1,97 @@
+# ============================================================
+# Quantum Trader canonical repository
+# ============================================================
+
+# ------------------------------------------------------------
+# Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+env/
+
+# ------------------------------------------------------------
+# Node / frontend generated content
+# ------------------------------------------------------------
+node_modules/
+.next/
+dist/
+build/
+out/
+
+# ------------------------------------------------------------
+# Runtime
+# ------------------------------------------------------------
+*.log
+logs/
+tmp/
+temp/
+*.pid
+*.sock
+
+# ------------------------------------------------------------
+# IDE
+# ------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------
+# LOCAL MARKET / RESEARCH DATA
+#
+# IMPORTANT:
+# The actual datasets remain on the WSL filesystem.
+# They are available to the local Quantum Trader application
+# and AI agents.
+#
+# They are intentionally NOT stored in GitHub.
+# ------------------------------------------------------------
+backend/data/*
+
+# Keep a small documentation file describing local data.
+!backend/data/README.md
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Local AI logs
+.ai/logs/
+
+# Previous failed Git metadata backups
+.git-before-clean-push-*/
+
+# Temporary archives
+*.tar
+*.tar.gz
+.git-before-clean-push/
+backend/data/
+
+# Local historical market datasets
+backend/CRUDEOIL_ONE_MINUTE.jsonl
+backend/*_ONE_MINUTE.jsonl

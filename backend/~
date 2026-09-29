@@ -1,0 +1,468 @@
+# ==========================================================================
+# Quantum Trader — environment configuration
+# Copy to .env and adjust. NEVER commit a real .env (see .gitignore).
+# ==========================================================================
+
+# ---- Backend server ----
+QT_HOST=0.0.0.0
+QT_PORT=8000
+QT_CORS_ORIGINS=http://localhost:3000
+
+# ---- Market data provider ----
+# angelone | simulated | kite | upstox | truedata
+# Production/default is "angelone" — REAL live broker data. Fill the SMARTAPI_*
+# credentials below. "simulated" exists only for fully-offline development and
+# must NOT be used for real analysis (it produces synthetic prices).
+QT_DATA_PROVIDER=angelone
+
+# Angel One instrument selection (defaults are correct for MCX Crude Oil).
+# QT_ANGEL_SYMBOL_ROOT also sets the instrument analysed at startup; switch it
+# live from the dashboard dropdown (CRUDEOIL / NATURALGAS / GOLD / SILVER / COPPER).
+QT_ANGEL_EXCHANGE=MCX
+QT_ANGEL_SYMBOL_ROOT=CRUDEOIL
+
+# ---- Limit which instruments load (optional) ----
+# Comma-separated list. Only these are warmed / streamed / scanned; everything
+# else is skipped. FEWER instruments = much faster first load and no Angel history
+# throttling (AB1021), because the one-time candle warm-up is per instrument.
+# Leave blank to load the full set. Example for a fast focused test:
+#   QT_INSTRUMENTS=CRUDEOIL,NATURALGAS
+QT_INSTRUMENTS=
+
+# ---- Daily auto-pick: let the app choose today's stocks (optional) ----
+# When true, each trading day the app asks Angel for the biggest F&O movers
+# (gainers AND losers, by % price) and focuses the dashboard/screener on the top
+# QT_AUTO_PICK_COUNT liquid stock options, PLUS the always-on core below. So you
+# don't research manually and the feed stays light/fast. Picks refresh once per
+# day (see GET /api/auto-pick; add ?refresh=true to re-pick now). Needs the live
+# Angel feed; on the simulated feed or if the call fails it uses the core only.
+# NOTE: a non-blank QT_INSTRUMENTS above overrides this.
+#QT_AUTO_PICK_ENABLED=false
+#QT_AUTO_PICK_COUNT=5
+#QT_AUTO_PICK_CORE=CRUDEOIL,NIFTY,SENSEX
+QT_CREDIT_SPREAD_ENABLED=true
+# ---- Groww live feed (optional; complements Angel One) ----
+# Angel One caps ONE account at ~1000 tokens / a few WebSockets, so running all
+# 25 instruments on it alone throttles the live feed. Enable Groww to split the
+# load across TWO independent broker accounts: Angel keeps the MCX commodities
+# (Crude/NaturalGas/Gold/…) and Groww serves the NSE/BSE index + stock options
+# (Nifty/Sensex/Reliance/SBI/…). Neither account is overloaded, so the live data
+# stays fast. With this false (default) nothing changes — Angel serves everything.
+QT_ENABLE_GROWW=false
+
+# ---- Order execution ----
+# paper = track a simulated position only (NO real orders). Safe default.
+# live  = place REAL orders via the broker provider (requires a confirm step).
+QT_TRADE_MODE=paper
+QT_ANGEL_PRODUCT=INTRADAY       # INTRADAY (MIS) or CARRYFORWARD (NRML)
+QT_ANGEL_ORDER_VARIETY=NORMAL   # NORMAL / STOPLOSS
+QT_ANGEL_ORDER_TYPE=MARKET      # MARKET / LIMIT
+
+# ---- Paper auto-trader (SIMULATED fills only; never places a real order) ----
+# When enabled it auto-enters a paper position on a BUY at/above the confidence
+# gate and auto-exits at Target 1 or the stop. Hard-guarded to paper mode: it
+# refuses to run whenever QT_TRADE_MODE=live. You can also toggle it live from
+# the dashboard (the ⚡ AUTO-TRADE panel) without editing this file.
+QT_AUTO_TRADE_ENABLED=true  # true to arm it on startup
+QT_AUTO_TRADE_MIN_CONFIDENCE=75 # only auto-buy at/above this conviction %
+QT_AUTO_TRADE_MAX_LOTS=1        # HARD upper cap on lots per auto entry
+QT_AUTO_TRADE_SAFE_SIZING=true  # size lots by risk% of capital, then cap by max_lots
+QT_AUTO_TRADE_RIDE_TRAIL=true   # ride winner with the T1/T2/T3 ratchet target-lock (never gives back a hit target; off = book at T1)
+QT_AUTO_TRADE_TRAIL_PCT=10      # legacy trailing stop distance below peak (%), used only when ride-trail is OFF
+QT_AUTO_TRADE_MAX_CONCURRENT=3  # max instruments the bot may hold at once (one position per instrument)
+QT_AUTO_TRADE_MOMENTUM_ENTRY=false # A) only enter when the entry trigger is live and premium momentum is up (off = enter as soon as the signal says BUY, no waiting)
+QT_AUTO_TRADE_NO_CHASE=true        # B) skip already-extended / trap-like moves (no chasing)
+QT_AUTO_TRADE_NO_CHASE_TRAP_PROB=60  # skip when buy-trap probability (%) is at/above this
+QT_AUTO_TRADE_PRE_T1_TRAIL=true        # exit the running high if it rolls over BEFORE T1 (don't wait forever)
+QT_AUTO_TRADE_PRE_T1_TRAIL_ARM_PCT=40  # arm the pre-T1 peak trail once this % of the way from entry to T1
+QT_AUTO_TRADE_PRE_T1_TRAIL_GIVEBACK_PCT=30  # exit on giving back this % of the run from the peak (min ~2 pts)
+# Per-instrument overrides (JSON). Empty = use the global capital / max-lots for every instrument.
+# Capital here is that instrument's own budget; lots here is a HARD fixed size (live caps still apply).
+QT_AUTO_TRADE_INSTRUMENT_CAPITAL={}    # e.g. {"NIFTY": 50000, "CRUDEOIL": 60000}
+QT_AUTO_TRADE_INSTRUMENT_LOTS={}       # e.g. {"NIFTY": 1, "CRUDEOIL": 1}
+QT_DAILY_PROFIT_TARGET=0        # ₹ goal → stop opening NEW trades once reached (0=off; NOT a guaranteed minimum)
+
+# ---- LIVE auto-execution (DANGER: REAL MONEY) ----
+# The bot places REAL Angel orders ONLY when ALL THREE hold:
+#   QT_TRADE_MODE=live  AND  QT_AUTO_TRADE_ENABLED=true  AND  QT_AUTO_TRADE_ALLOW_LIVE=true
+# If the live feed is on but ALLOW_LIVE is false, the bot stays hands-off (no orders).
+# The edge is thin and validated on UNDERLYING moves only — live losses are possible.
+# Start tiny (small capital, 1 lot), supervise the first sessions, keep the caps low.
+QT_AUTO_TRADE_ALLOW_LIVE=true        # master arm for real orders (second, deliberate switch)
+QT_AUTO_TRADE_LIVE_MAX_LOTS=1         # hard lots cap for a LIVE auto entry
+QT_AUTO_TRADE_LIVE_MAX_ORDER_VALUE=60000  # reject a live auto-BUY above this ₹ notional
+# One-click LIVE auto-buy: size each entry from the broker's REAL available cash
+# (not the fixed QT_CAPITAL), scaled by the signal's confidence (higher confidence
+# = larger share of balance). The Auto-Bot panel's "Live Auto-Buy" button flips
+# this on together with ENABLED + ALLOW_LIVE in one action, and auto-sets the
+# per-order ₹ cap to your available cash (one order can never exceed your balance).
+QT_AUTO_TRADE_USE_LIVE_BALANCE=true
+
+QT_AI_ENABLED=true          # compute + journal AI decisions (read-only, no trades)
+QT_AI_PAPER_ENABLED=true    # let the AI open/manage its own PAPER positions
+QT_AI_PAPER_CAPITAL=500000  # notional AI paper account
+QT_AI_MIN_PROBABILITY=0.55  # P(target before stop) needed for BUY_NOW
+
+# ---- Zero-to-Hero expiry sleeve (SPECULATIVE / HIGH RISK / SEPARATE budget) ----
+# A tiny EXPIRY-DAY punt: buy a cheap far-OTM option in the day's bias direction.
+# Can multiply, but usually expires WORTHLESS. NO backtest, NO edge — not the safe
+# strategy. Walled off: it can never lose more than QT_ZERO_TO_HERO_BUDGET in a day.
+# Advisory unless the bot is also armed for live (same live switches as the core).
+QT_ZERO_TO_HERO_ENABLED=true         # arm the expiry sleeve
+QT_ZERO_TO_HERO_BUDGET=5000           # ₹ you are willing to LOSE ENTIRELY per day
+QT_ZERO_TO_HERO_MIN_PREMIUM=2         # cheap-leg premium window (₹) — lower bound
+QT_ZERO_TO_HERO_MAX_PREMIUM=40        # cheap-leg premium window (₹) — upper bound
+QT_ZERO_TO_HERO_OTM_STEPS=4           # strikes beyond ATM to reach for
+QT_ZERO_TO_HERO_EXPIRY_ONLY=true      # only fire on the actual expiry day
+
+# ---- Risk Management v2 (stop-loss refinement + Pre-Trade Validator) ----
+# Feature-flagged, fully reversible. Runs AFTER the frozen engine and touches
+# ONLY the stop + validation layer (never entry logic / confidence / strategy).
+# When on: the premium stop is refined with a Greeks-aware (Delta+Gamma) model,
+# and a BUY that fails validation is REJECTED (shown as AVOID with reasons)
+# instead of being forced onto an unrealistic stop. Set false to restore the
+# exact prior behaviour.
+QT_RISK_V2_ENABLED=false
+QT_RISK_V2_MAX_PREMIUM_LOSS_PCT=40   # reject a BUY whose stop risks > this % of premium
+QT_RISK_V2_MIN_REWARD_RISK=1.2       # reject a BUY with reward:risk below this
+QT_RISK_V2_MIN_OI=0                  # min open interest (0 = liquidity floor off)
+QT_RISK_V2_MIN_VOLUME=0              # min traded volume (0 = liquidity floor off)
+QT_RISK_V2_MAX_SPREAD_PCT=5          # max bid/ask spread % (only when feed gives bid/ask)
+
+# ---- Execution Intelligence Layer (Phase 3.6; ADVISORY, feature-flagged) ----
+# Runs AFTER Risk v2 and BEFORE the final recommendation. It NEVER changes the
+# BUY/WAIT direction, confidence, or strategy — it only advises execution quality
+# (enter now / wait for a better entry / change strike / skip) and explains why.
+# Off by default → the app behaves exactly as before.
+QT_EXECUTION_INTELLIGENCE_ENABLED=false
+QT_EXEC_EXTENDED_ATR=1.5    # >this many ATR beyond VWAP = "extended", advise a pullback
+QT_EXEC_SURVIVAL_MIN=60     # trade-survival score below this → advise WAIT/CHANGE/SKIP
+QT_EXEC_STRIKE_SEARCH=2     # strikes either side to evaluate for a more resilient leg
+
+# ---- Early Momentum Advisory Engine (ADVISORY, feature-flagged, PARALLEL) ----
+# A SECOND, independent engine that runs alongside the frozen confirmation engine.
+# It flags an EARLY BUY when a NEW trend is *starting* — first higher-low (lower-
+# high for shorts) + VWAP reclaim + rising volume + improving option chain +
+# underlying confirmation — i.e. materially earlier than the confirmation BUY,
+# WITHOUT trying to catch the exact bottom. It also runs a Signal Delay Analyzer
+# that measures how much of each move was already gone at the confirmation BUY.
+# It NEVER changes the frozen engine's signal/confidence/strategy. Off by default.
+QT_EARLY_MOMENTUM_ENABLED=true
+QT_EARLY_MOMENTUM_MIN_SCORE=60        # aligned-evidence score (0..100) to advise EARLY BUY
+QT_EARLY_MOMENTUM_MAX_ATR_FROM_VWAP=1.2  # reject once price is this many ATR past VWAP (not "early")
+QT_SIGNAL_DELAY_LATE_PCT=50           # flag a confirmation BUY "late" once this % of the move is gone
+
+# ---- Early-Early Mode (Stage 2.5; SEPARATE add-on, ADVISORY, feature-flagged) ----
+# An even-earlier advisory tier that sits BETWEEN Stage 2 (Structure) and Stage 3
+# (Early Buy). It fires only when MULTIPLE evidence pieces align at once (first
+# higher-low + a bullish VWAP-reclaim candle + above-average volume + positive
+# EMA slope + improving option-chain + adequate room before resistance) AND the
+# leg passes reward:risk >= 2:1 and liquidity validation — NEVER on one green
+# candle. Completely isolated from the frozen engine and the Early Momentum
+# logic; advisory-only, never auto-executed. Off by default → the tool behaves
+# exactly as before unless enabled.
+QT_EARLY_EARLY_ENABLED=true
+QT_EARLY_EARLY_MIN_EVIDENCE=5         # of the six evidence pieces, how many must pass
+QT_EARLY_EARLY_MIN_RR=2.0             # minimum reward:risk (to Target 1) before issuing
+QT_EARLY_EARLY_MAX_SPREAD_PCT=8       # reject illiquid legs (only when feed gives bid/ask)
+QT_EARLY_EARLY_MIN_ROOM_ATR=1.5       # min ATR of room to resistance/support before issuing
+
+# ---- Quick Scalp Engine (SEPARATE add-on, ADVISORY, feature-flagged) ----
+# A dedicated SHORT-duration scalp engine for small 8–20 point OPTION-premium
+# moves off EXHAUSTION / BOUNCE setups (a selling/buying climax + ATR stretch from
+# VWAP + support/resistance rejection + volume spike + first higher-low/lower-high
+# + micro-structure break + option-premium stabilization). It also drives a LIVE
+# EXIT alert that flashes "EXIT NOW" the moment a running scalp rolls over.
+# Completely independent of the frozen engine, Early Momentum and Early-Early;
+# advisory-only, NEVER auto-executed. Off by default → the tool behaves exactly as
+# before unless enabled.
+QT_SCALP_ENABLED=false
+QT_SCALP_MIN_CONDITIONS=5             # of the seven conditions, how many must align
+QT_SCALP_TARGET_POINTS=10.0           # fixed OPTION-premium objective (raise toward 15–20 for bigger scalps)
+QT_SCALP_MIN_RR=1.5                   # minimum reward:risk (tight-stop model) before issuing
+QT_SCALP_MIN_ATR_EXTENSION=1.5        # ATR of stretch from VWAP that flags exhaustion
+QT_SCALP_BREAKEVEN_FRAC=0.5           # move stop to breakeven once premium travels this fraction of target
+QT_SCALP_MAX_HOLD_CANDLES=6           # hard time-stop: exit after this many candles if target not hit
+
+# ---- Candle-Flow engine (SEPARATE "Flow" dashboard tab) ----
+# A raw 1-minute candle rider on its own tab: BUY while the candle prints
+# GREEN in the moving direction, HOLD while green, EXIT the instant it turns
+# RED (or the premium gives back ~QT_FLOW_GIVEBACK_POINTS from its peak), and
+# auto-SWITCH CE↔PE when the flow flips. It DELIBERATELY drops the VWAP-distance,
+# score and room-to-resistance gates so it fires early — higher risk, more fakes.
+# Completely independent of the frozen engine, Early Momentum, Early-Early and
+# Quick Scalp; advisory-only, NEVER auto-executed; logged to its own
+# flow_signals.jsonl (read-only /api/flow-report). Off by default.
+QT_FLOW_ENABLED=true
+QT_FLOW_MIN_BODY_FRAC=0.30            # a candle is "decisive" only if its body is ≥ this fraction of its full range
+QT_FLOW_GIVEBACK_POINTS=4.0           # ratcheting trail: EXIT once the premium gives back this many points from its running peak (your 3–5 pt trail)
+QT_FLOW_CONFIRM_CANDLES=2            # de-whipsaw: consecutive decisive candles needed before BUY / side-flip / colour-turn EXIT (1=twitchy, 2=steady)
+QT_FLOW_STICKY_CANDLES=3             # how many candles a fresh entry keeps the big "just entered" BUY tag
+QT_FLOW_PAPER_LOTS=1                 # PAPER-ONLY lots used to turn Flow points into a ₹ P&L in the history (never sizes a real order)
+# NOTE: Flow paper-lots + trail give-back are ALSO editable live from the Flow
+# dashboard tab (dashboard settings are preferred; these env values are just the
+# startup defaults). Flow is PAPER-ONLY and has NO live-order path by design —
+# the measured edge does not survive real option costs, so never size up on it.
+
+# ---- AI Command Center (V4) — NEW read-only "one glance" dashboard tab ----
+# Aggregates the REAL signals the engines already compute (market regime, India
+# VIX, breadth, expected move, opportunity-ranked watchlist, trade lifecycle,
+# position health, exit AI) into a single page. It computes NOTHING new and
+# fabricates NO numbers — any metric without enough real data shows
+# "calibrating / N/A". Read-only, advisory-only, never places an order and
+# never changes the frozen engine. Off by default (tab shows a disabled card).
+QT_AI_COMMAND_CENTER=false
+
+# ---- Instrument ----
+QT_UNDERLYING_SYMBOL=MCX:CRUDEOIL
+QT_TRADINGVIEW_SYMBOL=MCX:CRUDEOIL
+QT_LOT_SIZE=100
+QT_TICK_INTERVAL_SECONDS=1.0
+QT_CANDLE_INTERVAL_SECONDS=60
+
+# ---- Simulated feed ----
+QT_SIM_START_PRICE=6900
+QT_SIM_ANNUAL_VOL=0.35
+QT_SIM_SEED=0
+
+# ---- Options model ----
+QT_RISK_FREE_RATE=0.065
+QT_STRIKE_STEP=50
+QT_STRIKES_EACH_SIDE=10
+QT_DAYS_TO_EXPIRY=7
+
+# ---- Costs ----
+QT_BROKERAGE_PER_LOT=20
+
+# ---- Risk management / position sizing ----
+QT_CAPITAL=100000              # capital used to size positions
+QT_RISK_PER_TRADE_PCT=2.0      # % of capital risked per trade (sets suggested lots)
+QT_MAX_DAILY_LOSS=5000         # halt new trades once day P&L <= -this
+QT_MAX_TRADES_PER_DAY=10       # cap on entries per session
+QT_MAX_CONSECUTIVE_LOSSES=3    # cool-down: halt after N losses in a row
+QT_AUTO_SQUAREOFF_IST=23:25    # advise flat after this IST time
+
+# ---- News source ----
+# rss | simulated  (rss fetches REAL public headlines; "simulated" is synthetic
+# and must not be used for real analysis). Default is rss.
+QT_NEWS_SOURCE=rss
+# Comma-separated RSS URLs. If left empty while QT_NEWS_SOURCE=rss, sensible
+# free defaults are used (Moneycontrol / Economic Times / Reuters public RSS).
+# QT_NEWS_RSS_FEEDS=https://www.moneycontrol.com/rss/latestnews.xml,https://...
+
+# ---- Economic-event calendar / pre-event guard ----
+# Warn + mildly dampen confidence around high-impact scheduled events
+# (EIA crude inventory, US NFP, F&O expiry). Never a hard block.
+QT_EVENT_GUARD_ENABLED=true
+QT_EVENT_GUARD_BEFORE_MINUTES=20
+QT_EVENT_GUARD_AFTER_MINUTES=10
+# Optional public ICS calendar URL to merge extra events (FOMC/RBI/results):
+# QT_EVENTS_ICS_URL=https://example.com/economic-calendar.ics
+
+# ---- Stock fundamentals (NSE official, best-effort) ----
+# Delivery %, results date and FII/DII from NSE public endpoints. Degrades to
+# "unavailable" if NSE rate-limits the host. Read-only; no orders.
+QT_FUNDAMENTALS_ENABLED=true
+
+# ---- Persistence & self-learning ----
+# Directory for the SQLite history DB and the learned-weights file.
+QT_DATA_DIR=data
+# Record live candles + option-chain snapshots so the backtest replays REAL
+# captured history instead of a fresh synthetic series.
+QT_STORE_HISTORY=true
+# Auto-record each completed live bar (futures + option chain) into the RESEARCH
+# store during the tick loop, so the Backtest/Research tab runs on REAL captured
+# history with no manual "Capture" step. Only active on a real broker feed
+# (QT_DATA_PROVIDER=angelone) so the research DB is never polluted with
+# simulated bars. Paper mode is fine — this only records data, never trades.
+QT_RESEARCH_AUTOCAPTURE=true
+# Notional starting capital for the PAPER account (Account tab). Equity shown =
+# this + cumulative realised paper P&L. Paper-only — never a real broker balance.
+QT_PAPER_CAPITAL=100000
+# Self-learning: collect closed-trade outcome stats per decision factor.
+QT_LEARNING_ENABLED=true
+# HOW learning is applied (safety). "advisory" (default) = engine only COLLECTS
+# stats and RECOMMENDS weight changes; the live rules stay FIXED so it can't
+# silently drift/overfit. "auto" = actually apply learned weights, but only for
+# factors with >= QT_LEARNING_MIN_TRADES closed trades. Review the advisory
+# recommendations first, then switch to auto if you approve them.
+QT_LEARNING_MODE=advisory
+QT_LEARNING_MIN_TRADES=30
+# Performance / Validation Mode: every closed trade is logged with its full
+# decision context (see the Performance report). REAL metrics (win rate, Sharpe,
+# expectancy, drawdown, …) are only computed once the feed is a real broker AND
+# at least this many trades have been recorded — never fabricated from the demo.
+QT_PERFORMANCE_MIN_TRADES=20
+
+# ---- Research & validation platform (Phase 2) ----
+# Database for the research store (historical futures/options, signal snapshots,
+# replay trades, shadow log, data-quality issues). Leave EMPTY or use a
+# "sqlite:///..." path for the zero-dependency local SQLite fallback (stored
+# under QT_DATA_DIR). A "postgresql://user:pass@host:5432/db" URL uses
+# PostgreSQL (needs the optional psycopg dependency). NEVER hard-code a DB
+# password in source — supply this URL via your environment / secrets manager.
+# QT_DB_URL=
+# QT_DB_URL=postgresql://quantum:CHANGE_ME@localhost:5432/quantum_research
+QT_DB_URL=
+# Shadow mode: run the FROZEN engine live and log every recommendation without
+# placing any order, then score it against the actual move after the horizon.
+QT_SHADOW_MODE=false
+QT_SHADOW_HORIZON_MINUTES=15
+
+# ---- WhatsApp alerts (optional; off unless enabled AND provider secrets set) ----
+QT_WHATSAPP_ENABLED=false
+QT_WHATSAPP_PROVIDER=meta       # meta (WhatsApp Cloud API) | twilio
+# Send a detailed BUY alert to WhatsApp only when conviction >= this % (default 95)
+QT_WHATSAPP_SIGNAL_MIN_CONFIDENCE=95
+# Recipient in international format (no +), e.g. 919876543210
+# WHATSAPP_TO=
+#
+# --- Meta WhatsApp Cloud API (QT_WHATSAPP_PROVIDER=meta) ---
+# Create an app at https://developers.facebook.com → WhatsApp; use the
+# permanent System User token, not the 24h test token.
+# WHATSAPP_TOKEN=            # provide via environment, never commit
+# WHATSAPP_PHONE_NUMBER_ID=  # from the WhatsApp → API Setup page
+#
+# --- Twilio WhatsApp (QT_WHATSAPP_PROVIDER=twilio) ---
+# TWILIO_ACCOUNT_SID=
+# TWILIO_AUTH_TOKEN=
+# TWILIO_WHATSAPP_FROM=whatsapp:+14155238886   # your Twilio WhatsApp sender
+
+# ---- Signal stability (keeps the recommendation concrete, not flickering) ----
+# A different signal must persist this long before it replaces the live one.
+QT_SIGNAL_CONFIRM_SECONDS=20
+# Minimum time a shown signal is held (except urgent EXIT on an open position).
+QT_SIGNAL_MIN_HOLD_SECONDS=30
+
+QT_FUTURES_PAPER_ENABLED=true
+QT_AUTO_TRADE_NO_ENTRY_OPEN_MINUTES=15
+QT_AUTO_TRADE_POST_STOP_COOLDOWN_SEC=1800
+QT_FUTURES_SIZE_BY_MARGIN=false     # true = max lots by margin, ~2% risk/trade
+QT_FUTURES_PAPER_LOTS=5             # ceiling only
+QT_FUTURES_MIN_ATR_PCT=0.03
+
+# ---- Decision gate (fewer, higher-quality trades) ----
+# A BUY is only emitted at/above this confidence (evidence agreement %) —
+# otherwise the engine returns WAIT. Confidence is agreement of the signals,
+# NOT a guaranteed win probability. NOTE: a flat 90 permanently pinned the
+# low-volatility indices (Nifty/Sensex) at WAIT; 66 lets real BUY/PUT calls fire
+# on indices too while still demanding a one-sided read. The gate is auto-nudged
+# by regime (trend relaxes it, chop tightens it). Raise it for fewer signals.
+QT_BUY_MIN_CONFIDENCE=75
+# Higher-timeframe TREND-GATE factor (in 1-min candles). The frozen BUY only
+# fires with the higher-TF trend (CE in UP / PE in DOWN). Default 5 = the classic
+# 5-min gate: safe, but the BUY appears late (after ~6–8 green 1-min candles).
+# Set 1 to gate on the 1-min trend → BUY fires as the green run starts, but with
+# FAR more false signals. Fully reversible; this is the only frozen timeframe knob.
+QT_HTF_FACTOR=5
+# A BUY also requires this much one-sided Level-1/2/3 (price-action / premium /
+# OI) evidence. Lagging indicators (EMA/RSI/MACD/BB) can only confirm, never
+# trigger, a BUY on their own.
+QT_BUY_MIN_PRIMARY_STRENGTH=0.30
+# --- Signal stability (fewer, higher-conviction trades; less whipsaw) ---
+# How strong the OPPOSITE direction must be before the engine EXITs + flips your
+# held CALL<->PUT. Higher = only genuine, confirmed reversals flip; small wiggles
+# are ridden out (trailing stop handles risk) instead of whipsawing CE/PE.
+QT_REVERSAL_MIN_STRENGTH=0.30
+# Direction below this |net| = "no clear side" -> WAIT (stops CE/PE flip-flop).
+QT_NEUTRAL_DEAD_BAND=0.16
+# In a RANGING/choppy regime, suppress fresh directional BUYs and WAIT (ranges
+# are where targets stall and signals whipsaw). false = allow range trades.
+QT_RANGING_BLOCKS_ENTRY=true
+# Entry style (also toggleable live from the Decision screen's "Entry" switch):
+#   pullback  = only enter on a pullback/retest, never the breakout candle
+#               (safest; can miss clean trends that don't pull back).
+#   momentum  = ALSO enter a confirmed trend continuation (5-min trend + 1-min
+#               agree, not over-extended) so strong runs are caught.
+#   pattern   = the confirmation-candle method: ALSO enter on a closed candle
+#               pattern (engulfing / star / hammer / piercing / marubozu) that
+#               agrees with the 5-min trend — fires the most often.
+QT_ENTRY_MODE=pullback
+# Momentum entries need at least this directional strength (0..1) so only
+# genuinely strong trends fire a continuation BUY (not weak drift).
+QT_MOMENTUM_MIN_STRENGTH=0.34
+# While HOLDing and at least this % underwater (but trend still intact), show an
+# optional "average down 1 lot" suggestion. Never automated, never places order.
+QT_AVERAGE_DOWN_TRIGGER_PCT=12
+
+# ---- Trading session (IST). Flags MARKET OPEN/CLOSED in the dashboard. ----
+# MCX Crude Oil ~09:00-23:30 IST, Mon-Fri.
+QT_MARKET_OPEN_IST=09:00
+QT_MARKET_CLOSE_IST=23:30
+QT_MARKET_DAYS=0-4
+# With a LIVE feed keep this false so the app respects real trading hours
+# (outside the session it reports MARKET CLOSED instead of emitting signals).
+# Set true ONLY for the 24/7 simulated demo.
+QT_IGNORE_MARKET_HOURS=false
+
+# ==========================================================================
+# Broker credentials (only needed when QT_DATA_PROVIDER != simulated).
+# Provide via your secrets manager / environment — do NOT hard-code.
+# ==========================================================================
+# --- Angel One SmartAPI (required when QT_DATA_PROVIDER=angelone) ---
+# SMARTAPI_KEY=            # API key of your SmartAPI "trading" app
+# SMARTAPI_CLIENT_CODE=    # your Angel One client / login id
+# SMARTAPI_PIN=            # your login PIN / MPIN
+# SMARTAPI_TOTP_SECRET=    # the TOTP secret behind your authenticator QR
+#
+QT_AUTO_TRADE_PRE_T1_TRAIL_MIN_GIVEBACK=1   # smaller = exit even closer to the stall
+QT_AUTO_TRADE_MAX_STOP_PCT=15               # optional hard cap on per-trade loss
+
+SMARTAPI_KEY=oHLFhIRY
+SMARTAPI_CLIENT_CODE=KPKP1046
+SMARTAPI_PIN=4132
+SMARTAPI_TOTP_SECRET=UKWPYPTGB776TRGOCNSHLWS3RQ
+
+
+SMARTAPI_KEY_2=n6v39ASb
+SMARTAPI_CLIENT_CODE_2=AACA514808
+SMARTAPI_PIN_2=4132
+SMARTAPI_TOTP_SECRET_2=CTHQ32CRP6XTM3CIZWNP5MUDKU
+
+# --- OPTIONAL: extra Angel keys for multi-key sharding (faster, more headroom) ---
+# Each extra SmartAPI "app" (create at https://smartapi.angelbroking.com/ -> My Apps)
+# is a separate session with its OWN WebSocket + token budget. Instruments are
+# split across all configured keys, so the historical warm-up runs in parallel
+# and you get more live tokens. Add _2 (and _3, _4, _5) sets — the app uses them
+# automatically. With only the primary key above, behaviour is unchanged.
+# SMARTAPI_KEY_2=
+# SMARTAPI_CLIENT_CODE_2=  # can be the SAME Angel client id as above
+# SMARTAPI_PIN_2=
+# SMARTAPI_TOTP_SECRET_2=  # TOTP secret of the SECOND app (each app has its own)
+# SMARTAPI_KEY_3=
+# SMARTAPI_CLIENT_CODE_3=
+# SMARTAPI_PIN_3=
+# SMARTAPI_TOTP_SECRET_3=
+#
+# With 2+ keys, route ALL live orders through the PRIMARY key so real orders
+# never queue behind data-fetch rate-limits; quotes/history still shard across
+# every key for speed. No effect with a single key. (Model A.)
+QT_ORDERS_ON_PRIMARY_ONLY=true
+#
+# --- Groww Trading API (required when QT_ENABLE_GROWW=true, or QT_DATA_PROVIDER=groww) ---
+# Create an API key at https://groww.in/trade-api (Groww app -> Trading API).
+# Serves the NSE/BSE (NFO/BFO) index + stock options on a SEPARATE account from
+# Angel, so the two feeds don't compete. Groww issues one of TWO key types —
+# use the matching secret var (the SDK mints a daily access token for you):
+#   * "Approval" key (most common)  -> set GROWW_API_KEY + GROWW_API_SECRET
+#   * "TOTP" key                    -> set GROWW_API_KEY + GROWW_TOTP_SECRET (base32)
+# Or skip both and paste a ready daily token in GROWW_ACCESS_TOKEN.
+# NOTE: the API SECRET is NOT a base32 TOTP seed — putting it in GROWW_TOTP_SECRET
+# causes a "Non-base32 digit found" login error. Never hard-code / commit these.
+# GROWW_API_KEY=
+# GROWW_API_SECRET=         # for an "approval" API key
+# GROWW_TOTP_SECRET=        # ONLY for a "TOTP" API key (base32 seed)
+# GROWW_ACCESS_TOKEN=       # alternative: a ready daily token (skip the above)
+#
+# --- Other brokers (not yet wired) ---
+# KITE_API_KEY=
+# KITE_API_SECRET=
+# UPSTOX_API_KEY=
+# UPSTOX_API_SECRET=
+# TRUEDATA_USER=
+# TRUEDATA_PASSWORD=
+
+# ---- Frontend (Next.js public vars) ----
+NEXT_PUBLIC_API_BASE=http://localhost:8000
+NEXT_PUBLIC_WS_BASE=ws://localhost:8000
+NEXT_PUBLIC_TV_SYMBOL=MCX:CRUDEOIL

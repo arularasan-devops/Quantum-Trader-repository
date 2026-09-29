@@ -1,0 +1,11 @@
+# Offline research only — NOT needed to run the trading app.
+#
+# Kept out of requirements.txt deliberately: the runtime image should not carry a
+# 100MB ML stack for a script that never runs in production, and the live
+# decision path must not be able to import a model by accident.
+#
+#   .venv/bin/pip install -r requirements-research.txt
+#
+# Used by phase5_analyze.py (the P(target before stop) model). Pinned exactly;
+# 1.6.1 is a long-published release, not a fresh one.
+scikit-learn==1.6.1

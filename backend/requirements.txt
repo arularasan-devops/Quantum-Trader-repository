@@ -1,0 +1,21 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+numpy==2.2.1
+python-dotenv==1.0.1
+websockets==14.1
+httpx==0.28.1
+
+# Live Angel One (SmartAPI) feed — only needed when QT_DATA_PROVIDER=angelone.
+smartapi-python==1.5.5
+pyotp==2.9.0
+
+# Live Groww feed — only needed when QT_ENABLE_GROWW=true (NSE/BSE equity + index
+# options). Angel keeps MCX commodities; Groww offloads the NSE/BSE names onto an
+# independent account so neither feed is overloaded.
+growwapi==1.5.0
+
+# PostgreSQL research store — only needed when QT_DB_URL is a postgresql:// URL.
+# Without it the research store transparently falls back to a local SQLite file.
+psycopg[binary]==3.2.3

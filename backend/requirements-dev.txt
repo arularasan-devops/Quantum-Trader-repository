@@ -1,0 +1,9 @@
+# Lint only — not needed to run the trading app, and never imported by it.
+#
+#   .venv/bin/pip install -r requirements-dev.txt
+#
+# Pinned to the exact version every phase was verified against. An unpinned
+# `pip install ruff` picks up whatever defaults the newest release ships with,
+# which is why the same clean tree linted clean here and reported ISC004/BLE001
+# on a newer build — a linter version difference, not a code change.
+ruff==0.15.22

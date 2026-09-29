@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  background: #090c10;
+  color: #e6edf3;
+  height: 100%;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e2733;
+  border-radius: 8px;
+}
+
+.panel {
+  @apply bg-panel border border-line rounded-xl;
+}
+.panel-title {
+  @apply text-[11px] uppercase tracking-widest text-muted px-3 pt-3 pb-2;
+}
+
+@keyframes pulseGlow {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.12);
+  }
+}
+.decision-pulse {
+  animation: pulseGlow 2.2s ease-in-out infinite;
+}

@@ -1,0 +1,337 @@
+"""Persistent market history (SQLite).
+
+Records live futures candles and option-chain snapshots per instrument so the
+backtest can replay REAL captured history instead of a fresh synthetic series.
+Lightweight and dependency-free (stdlib sqlite3); swap for TimescaleDB/Postgres
+when scaling out (see DEPLOYMENT.md).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+
+from app.config import settings
+from app.models import Candle, OptionQuote
+
+
+class HistoryStore:
+    def __init__(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._lock = threading.Lock()
+        # check_same_thread=False: the tick loop runs in an executor thread.
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS candles (
+                   instrument TEXT NOT NULL,
+                   ts INTEGER NOT NULL,
+                   open REAL, high REAL, low REAL, close REAL, volume REAL,
+                   PRIMARY KEY (instrument, ts)
+               )"""
+        )
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS chain_snapshots (
+                   instrument TEXT NOT NULL,
+                   ts INTEGER NOT NULL,
+                   payload TEXT NOT NULL,
+                   source TEXT,
+                   PRIMARY KEY (instrument, ts)
+               )"""
+        )
+        # Additive migration for stores created before provenance labelling.
+        # Legacy rows keep source NULL and must be reported as UNKNOWN: a Phase 3
+        # audit unknowingly ran on simulator chains, which is exactly what an
+        # explicit label prevents.
+        try:
+            self._db.execute("ALTER TABLE chain_snapshots ADD COLUMN source TEXT")
+        except sqlite3.OperationalError:
+            pass
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS paper_trades (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   instrument TEXT NOT NULL,
+                   ts INTEGER NOT NULL,
+                   option TEXT,
+                   option_type TEXT,
+                   entry REAL, exit REAL,
+                   lots INTEGER,
+                   net_pnl REAL,
+                   win INTEGER,
+                   holding_minutes INTEGER,
+                   mode TEXT
+               )"""
+        )
+        # Complete trade journal — the FULL record of every closed trade (paper
+        # AND live) with the reason, confidence, whether the bot opened it, a
+        # plain-English analyst note and the frozen decision context (JSON). This
+        # is the "record everything" store, separate from the compact
+        # paper_trades table used by the older Account report.
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS trade_journal (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   instrument TEXT NOT NULL,
+                   ts INTEGER NOT NULL,
+                   option TEXT,
+                   option_type TEXT,
+                   entry REAL, exit REAL,
+                   lots INTEGER,
+                   net_pnl REAL,
+                   win INTEGER,
+                   holding_minutes INTEGER,
+                   mode TEXT,
+                   auto INTEGER,
+                   exit_reason TEXT,
+                   confidence REAL,
+                   note TEXT,
+                   context TEXT
+               )"""
+        )
+        self._db.commit()
+        self._last_chain_ts: dict[str, int] = {}
+
+    def record_candle(self, instrument: str, candle: Candle) -> None:
+        self.record_candles(instrument, [candle])
+
+    def record_candles(self, instrument: str, candles: list[Candle]) -> int:
+        """Persist a window of bars in one transaction; returns rows written.
+
+        Recording only the newest bar per pass was why 38% of Crude's one-minute
+        history was missing: an instrument is re-processed every few seconds only
+        when the scan reaches it, so every minute that elapsed between two passes
+        was simply never stored, while the provider's window held those bars all
+        along. The primary key makes re-writing the same bar a no-op, so passing
+        the recent tail costs nothing and closes the gaps.
+        """
+        if not candles:
+            return 0
+        rows = [
+            (instrument, int(c.time), c.open, c.high, c.low, c.close, c.volume)
+            for c in candles
+        ]
+        with self._lock:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?)", rows)
+            self._db.commit()
+        return len(rows)
+
+    def candle_gaps(self, instrument: str, limit: int = 1200,
+                    step: int = 60) -> dict:
+        """Missing-bar report for the stored series: expected vs present bars
+        inside each contiguous session, so a data-quality claim is measurable.
+
+        Session boundaries are inferred from gaps larger than an hour (overnight /
+        weekend), which are absences by definition and are not counted as missing.
+        """
+        stamps = [int(c.time) for c in self.candles(instrument, limit)]
+        if len(stamps) < 2:
+            return {"instrument": instrument, "bars": len(stamps), "expected": 0,
+                    "missing": 0, "missing_pct": None, "gaps": []}
+        session_break = 3600
+        expected = 0
+        missing = 0
+        gaps: list[dict] = []
+        for prev, cur in zip(stamps, stamps[1:]):
+            delta = cur - prev
+            if delta <= 0 or delta > session_break:
+                continue
+            expected += delta // step
+            if delta > step:
+                lost = delta // step - 1
+                missing += lost
+                gaps.append({"from_ts": prev, "to_ts": cur, "missing_bars": lost})
+        expected += 1  # the first bar of the window is present by definition
+        gaps.sort(key=lambda g: g["missing_bars"], reverse=True)
+        return {
+            "instrument": instrument,
+            "bars": len(stamps),
+            "expected": expected,
+            "missing": missing,
+            "missing_pct": round(100.0 * missing / expected, 2) if expected else None,
+            "from_ts": stamps[0],
+            "to_ts": stamps[-1],
+            "gaps": gaps[:20],
+        }
+
+    def record_chain(self, instrument: str, ts: int, chain: list[OptionQuote],
+                     min_interval: int = 60) -> None:
+        """Store an option-chain snapshot, throttled to min_interval seconds."""
+        last = self._last_chain_ts.get(instrument, 0)
+        if ts - last < min_interval:
+            return
+        payload = json.dumps([q.model_dump(mode="json") for q in chain])
+        from app.research.capture import current_source
+
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO chain_snapshots "
+                "(instrument, ts, payload, source) VALUES (?,?,?,?)",
+                (instrument, ts, payload, current_source()),
+            )
+            self._db.commit()
+        self._last_chain_ts[instrument] = ts
+
+    def candles(self, instrument: str, limit: int = 600) -> list[Candle]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT ts, open, high, low, close, volume FROM candles "
+                "WHERE instrument=? ORDER BY ts DESC LIMIT ?",
+                (instrument, limit),
+            ).fetchall()
+        rows.reverse()
+        return [
+            Candle(time=r[0], open=r[1], high=r[2], low=r[3], close=r[4], volume=r[5])
+            for r in rows
+        ]
+
+    def record_trade(self, instrument: str, trade: dict) -> None:
+        """Persist one closed paper trade so the Account tab and monthly
+        reports survive restarts (the in-memory journal does not)."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO paper_trades (instrument, ts, option, option_type, "
+                "entry, exit, lots, net_pnl, win, holding_minutes, mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    instrument, int(trade.get("time", 0)), trade.get("option"),
+                    trade.get("option_type"), trade.get("entry"), trade.get("exit"),
+                    int(trade.get("lots") or 0), float(trade.get("net_pnl") or 0.0),
+                    1 if trade.get("win") else 0,
+                    trade.get("holding_minutes"), trade.get("mode", "paper"),
+                ),
+            )
+            self._db.commit()
+
+    def paper_trades(self, *, since: int | None = None,
+                     until: int | None = None) -> list[dict]:
+        """Return closed paper trades (all instruments) ordered oldest-first,
+        optionally bounded to a [since, until) unix-time window."""
+        clauses = []
+        params: list[int] = []
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("ts < ?")
+            params.append(int(until))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT instrument, ts, option, option_type, entry, exit, lots, "
+                "net_pnl, win, holding_minutes, mode FROM paper_trades" + where
+                + " ORDER BY ts ASC",
+                tuple(params),
+            ).fetchall()
+        cols = ["instrument", "ts", "option", "option_type", "entry", "exit",
+                "lots", "net_pnl", "win", "holding_minutes", "mode"]
+        out = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["win"] = bool(d["win"])
+            out.append(d)
+        return out
+
+    def record_journal(self, instrument: str, trade: dict, note: str) -> None:
+        """Persist the COMPLETE closed-trade record (reason, confidence, bot flag,
+        analyst note, full context) so nothing shown on the dashboard is lost on
+        restart. Best-effort — a logging failure never blocks trading."""
+        ctx = trade.get("context")
+        conf = trade.get("confidence")
+        if conf is None and isinstance(ctx, dict):
+            conf = ctx.get("confidence")
+        try:
+            conf_val = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf_val = None
+        context_json = json.dumps(ctx, default=str) if ctx is not None else None
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO trade_journal (instrument, ts, option, option_type, "
+                "entry, exit, lots, net_pnl, win, holding_minutes, mode, auto, "
+                "exit_reason, confidence, note, context) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    instrument, int(trade.get("time", 0)), trade.get("option"),
+                    trade.get("option_type"), trade.get("entry"), trade.get("exit"),
+                    int(trade.get("lots") or 0), float(trade.get("net_pnl") or 0.0),
+                    1 if trade.get("win") else 0, trade.get("holding_minutes"),
+                    trade.get("mode", "paper"), 1 if trade.get("auto") else 0,
+                    trade.get("exit_reason"), conf_val, note, context_json,
+                ),
+            )
+            self._db.commit()
+
+    def journal(self, *, since: int | None = None, until: int | None = None,
+                limit: int | None = None, exclude_flow: bool = False) -> list[dict]:
+        """Return the complete trade journal (all instruments), newest-first,
+        optionally bounded to a [since, until) unix-time window. When
+        ``exclude_flow`` is set, Candle-Flow paper legs are omitted so the board
+        shows only real Signal/Auto-Buy trades."""
+        clauses = []
+        params: list[int] = []
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("ts < ?")
+            params.append(int(until))
+        if exclude_flow:
+            clauses.append("COALESCE(note, '') NOT LIKE 'Candle-Flow%'")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        # ``context`` is pulled only to surface the entry trigger (PULLBACK /
+        # REVERSAL / IGNITION / MOMENTUM); the raw JSON stays out of the result
+        # so the journal payload remains small.
+        sql = ("SELECT instrument, ts, option, option_type, entry, exit, lots, "
+               "net_pnl, win, holding_minutes, mode, auto, exit_reason, "
+               "confidence, note, context FROM trade_journal" + where
+               + " ORDER BY ts DESC")
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(sql, tuple(params)).fetchall()
+        cols = ["instrument", "ts", "option", "option_type", "entry", "exit",
+                "lots", "net_pnl", "win", "holding_minutes", "mode", "auto",
+                "exit_reason", "confidence", "note", "context"]
+        out = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["win"] = bool(d["win"])
+            d["auto"] = bool(d["auto"])
+            raw = d.pop("context", None)
+            trigger = None
+            parsed = None
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    val = parsed.get("entry_trigger")
+                    trigger = str(val).upper() if val else None
+            d["entry_trigger"] = trigger
+            # Capital accounting is carried inside ``context`` (no schema change,
+            # so every existing row in the history keeps loading) and lifted to
+            # the top level here for the journal view and the CSV. Rows written
+            # before this existed simply report None.
+            for field in (
+                "capital_used",
+                "notional",
+                "risk_rupees",
+                "cost_rupees",
+                "return_on_capital_pct",
+                "lot_size",
+            ):
+                d[field] = parsed.get(field) if isinstance(parsed, dict) else None
+            out.append(d)
+        return out
+
+    def candle_count(self, instrument: str) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM candles WHERE instrument=?", (instrument,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+
+store = HistoryStore(os.path.join(settings.data_dir, "history.db"))
