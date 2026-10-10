@@ -37,3 +37,90 @@ body {
 .decision-pulse {
   animation: pulseGlow 2.2s ease-in-out infinite;
 }
+
+/* Integrated local dashboard styles */
+:root {
+  --accent: #16c784;
+  --accent-dim: rgba(22, 199, 132, 0.15);
+}
+
+html,
+body {
+  background: #05070a;
+  color: #e6edf3;
+  height: 100%;
+}
+
+body {
+  background-image: radial-gradient(1200px 600px at 50% -10%, rgba(22, 199, 132, 0.06), transparent 60%);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e2733;
+  border-radius: 8px;
+}
+
+/* Card shell — dark glass with a subtle accent border */
+.card {
+  background: linear-gradient(180deg, rgba(18, 24, 32, 0.9), rgba(10, 14, 19, 0.92));
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+}
+/* A card that must scroll its own content. `.card` clips to its rounded corners
+   with overflow:hidden, and because this file is plain CSS after
+overscroll-behavior: contain;
+}
+.card-accent {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: 0 0 40px -18px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.card-title {
+  @apply text-[12px] font-semibold tracking-wide text-white/55 px-4 pt-3;
+}
+
+/* Neon text glow used for the giant signal word */
+.neon {
+  color: var(--accent);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--accent) 70%, transparent),
+    0 0 24px color-mix(in srgb, var(--accent) 55%, transparent),
+    0 0 60px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.neon-outline {
+  -webkit-text-stroke: 2px var(--accent);
+  color: transparent;
+  text-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent),
+    0 0 40px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.pill {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+@keyframes softPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.72; transform: scale(1.015); }
+}
+.pulse { animation: softPulse 1.8s ease-in-out infinite; }
+
+@keyframes glowPulse {
+  0%, 100% { filter: drop-shadow(0 0 10px color-mix(in srgb, var(--accent) 60%, transparent)); }
+  50% { filter: drop-shadow(0 0 26px color-mix(in srgb, var(--accent) 90%, transparent)); }
+}
+.glow-pulse { animation: glowPulse 2.2s ease-in-out infinite; }
+
+@keyframes spinSlow { to { transform: rotate(360deg); } }
+.spin-slow { animation: spinSlow 8s linear infinite; }
+
+@keyframes riseIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: riseIn 0.5s ease-out; }
