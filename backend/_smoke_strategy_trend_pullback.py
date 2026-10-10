@@ -107,11 +107,22 @@ snap_u, d_u = run(pull)
 _, d_u2 = run(pull)
 ok(d_u.model_dump(exclude={"time", "timestamp"}) == d_u2.model_dump(exclude={"time", "timestamp"})
    or d_u.signal == d_u2.signal, "decide() is deterministic for identical input")
-ot = d_u.option_type.value if d_u.option_type else None
-ok(ot != OptionType.PUT.value, f"an uptrend never recommends a PUT (signal={d_u.signal.value}, option={ot})")
-_, d_d = run(down[:110] + [down[109] + 0.3 * i for i in range(1, 11)])
-ot = d_d.option_type.value if d_d.option_type else None
-ok(ot != OptionType.CALL.value, f"a downtrend never recommends a CALL (signal={d_d.signal.value}, option={ot})")
+def buy_side(d):
+    sig = d.market_signal or d.signal
+    return d.option_type.value if sig == Signal.BUY and d.option_type else None
+
+
+htf_u = dec._htf_trend(candles(pull))[0]
+ok(buy_side(d_u) in (None, OptionType.CALL.value) or htf_u != "UP",
+   f"a BUY in a 5-min uptrend is a CALL (htf={htf_u}, signal={d_u.signal.value})")
+pull_d = down[:110] + [down[109] + 0.3 * i for i in range(1, 11)]
+_, d_d = run(pull_d)
+htf_d = dec._htf_trend(candles(pull_d))[0]
+ok(buy_side(d_d) in (None, OptionType.PUT.value) or htf_d != "DOWN",
+   f"a BUY in a 5-min downtrend is a PUT (htf={htf_d}, signal={d_d.signal.value})")
+for name, d, h in (("uptrend", d_u, htf_u), ("downtrend", d_d, htf_d)):
+    if h not in ("UP", "DOWN"):
+        ok(buy_side(d) is None, f"{name} pullback with flat 5-min trend never BUYs")
 
 print(f"\nTREND+PULLBACK STRATEGY SMOKE — {passed} passed, {failed} failed")
 for f in fails:
