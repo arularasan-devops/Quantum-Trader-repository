@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Create a dedicated non-root user and drop privileges.
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 COPY --chown=appuser:appgroup app/ ./app/
+# Pre-create the data dir so a mounted named volume inherits appuser ownership.
+RUN mkdir -p /app/data && chown appuser:appgroup /app/data
 USER appuser
 
 EXPOSE 8000

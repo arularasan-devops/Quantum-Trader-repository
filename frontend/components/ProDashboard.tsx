@@ -953,9 +953,10 @@ function FeedStatus({ snap }: { snap: Snapshot }) {
   // the honest one to show.
   const age = Math.max(h.underlying_age_sec ?? 0, h.option_age_sec ?? 0);
   const stale = age > h.stale_after_sec;
-  const label = mode === "simulated" ? "Simulated" : h.live && !stale ? "LIVE" : "DELAYED";
-  const color = mode === "simulated" ? MUTED : h.live && !stale ? GREEN : AMBER;
-  const detail = mode === "simulated" ? "" : ` ${age.toFixed(0)}s`;
+  const down = h.source === "UNAVAILABLE" || h.state === "DISCONNECTED";
+  const label = down ? "DISCONNECTED" : mode === "simulated" ? "Simulated" : h.live && !stale ? "LIVE" : "DELAYED";
+  const color = down ? RED : mode === "simulated" ? MUTED : h.live && !stale ? GREEN : AMBER;
+  const detail = down || mode === "simulated" ? "" : ` ${age.toFixed(0)}s`;
   const title =
     h.note +
     (h.push_pct_today !== null ? ` · ${h.push_pct_today}% of today on push` : "") +

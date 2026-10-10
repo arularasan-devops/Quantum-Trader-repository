@@ -354,7 +354,7 @@ class GrowwProvider(MarketDataProvider):
 
     def feed_mode(self) -> str:
         # Groww live data arrives via ~1s REST polling on its own account budget.
-        return "rest" if self._client is not None else "simulated"
+        return "rest" if self._client is not None else "unavailable"
 
     def feed_health(self) -> dict:
         # Groww has no push socket here, so the age of the last successful poll

@@ -134,7 +134,10 @@ class _UnavailableProvider(MarketDataProvider):
         self.reason = reason
 
     def feed_health(self) -> dict:
-        return {"mode": "rest", "live": False, "note": self.reason}
+        return {"mode": "unavailable", "live": False, "note": self.reason}
+
+    def feed_mode(self) -> str:
+        return "unavailable"
 
     def step(self) -> None:
         return None
@@ -153,6 +156,36 @@ class _UnavailableProvider(MarketDataProvider):
 
     def news(self):
         return []
+
+
+def classify_feed(health: FeedHealth, provider: MarketDataProvider) -> FeedHealth:
+    """Stamp provider/source/state onto a provider's raw health reading.
+
+    Only the simulator itself may be labelled SIMULATED; a real provider that
+    reports "simulated" (e.g. Groww with no session) is UNAVAILABLE, never a
+    silent fallback to synthetic prices.
+    """
+    from app.market.simulated import SimulatedProvider
+
+    health.provider = (settings.data_provider or "").lower()
+    health.checked_at = time.time()
+    if isinstance(provider, SimulatedProvider):
+        health.source, health.state = "SIMULATED", "SIMULATED"
+        return health
+    if isinstance(provider, _UnavailableProvider) or health.mode in ("simulated", "unavailable"):
+        health.source, health.state = "UNAVAILABLE", "DISCONNECTED"
+        health.live = False
+        return health
+    health.source = "LIVE"
+    ages = [a for a in (health.underlying_age_sec, health.option_age_sec)
+            if isinstance(a, (int, float))]
+    if not ages or max(ages) > float(health.stale_after_sec) * 4:
+        health.state = "DISCONNECTED"
+    elif health.live and max(ages) <= float(health.stale_after_sec):
+        health.state = "CONNECTED"
+    else:
+        health.state = "DEGRADED"
+    return health
 
 
 class AppState:
@@ -289,8 +322,10 @@ class AppState:
         health = self._feed_health()
         ages = [a for a in (health.underlying_age_sec, health.option_age_sec)
                 if isinstance(a, (int, float))]
-        if not ages:
-            return health.mode == "simulated"
+        if health.source == "SIMULATED":
+            return True
+        if health.source != "LIVE" or not ages:
+            return False
         return max(ages) <= float(health.stale_after_sec)
 
     def _feed_health(self) -> FeedHealth:
@@ -300,9 +335,13 @@ class AppState:
         snapshot, so any failure degrades to the plain feed mode.
         """
         try:
-            return FeedHealth(**self.provider.feed_health())
+            health = FeedHealth(**self.provider.feed_health())
         except Exception:
-            return FeedHealth(mode=self.provider.feed_mode())
+            try:
+                health = FeedHealth(mode=self.provider.feed_mode())
+            except Exception:
+                health = FeedHealth(mode="unavailable", note="provider health unreadable")
+        return classify_feed(health, self.provider)
 
     # ---------- instrument selection (analysis only — never auto-trades) ----------
     @property

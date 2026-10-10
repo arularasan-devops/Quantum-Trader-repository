@@ -133,12 +133,56 @@ _DDL = [
 ]
 
 
+# Bump when a new additive migration is added to ``_migrate``. Recorded in
+# ``schema_migrations`` so operators can verify which schema a store is on.
+STORE_SCHEMA_VERSION = 2
+
+_SCHEMA_MIGRATIONS_DDL = """CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    INTEGER PRIMARY KEY,
+    applied_at BIGINT NOT NULL,
+    note       TEXT
+)"""
+
+
 class ResearchStore:
     def __init__(self, db: Database | None = None) -> None:
         self.db = db or Database()
         for ddl in _DDL:
             self.db.execute(ddl)
+        self.db.execute(_SCHEMA_MIGRATIONS_DDL)
         self._migrate()
+        self._record_schema_version()
+
+    def _record_schema_version(self) -> None:
+        import time as _time
+
+        verb = "INSERT OR IGNORE INTO" if not self.db.is_postgres else "INSERT INTO"
+        conflict = " ON CONFLICT (version) DO NOTHING" if self.db.is_postgres else ""
+        for version, note in ((1, "base research tables"),
+                              (2, "mcx_options bid/ask/source + schema_migrations")):
+            self.db.execute(
+                f"{verb} schema_migrations (version, applied_at, note) VALUES (?,?,?)"
+                + conflict,
+                (version, int(_time.time()), note),
+            )
+
+    def schema_version(self) -> int:
+        rows = self.db.query("SELECT MAX(version) AS v FROM schema_migrations")
+        return int(rows[0]["v"] or 0) if rows else 0
+
+    def status(self) -> dict[str, Any]:
+        """Read-only health of the store: backend, schema version, row counts."""
+        counts: dict[str, int] = {}
+        for table in ("trade_history", "signal_snapshots", "shadow_log",
+                      "mcx_futures", "mcx_options", "data_quality"):
+            rows = self.db.query(f"SELECT COUNT(*) AS n FROM {table}")
+            counts[table] = int(rows[0]["n"]) if rows else 0
+        return {
+            "backend": self.backend,
+            "schema_version": self.schema_version(),
+            "expected_schema_version": STORE_SCHEMA_VERSION,
+            "row_counts": counts,
+        }
 
     def _migrate(self) -> None:
         """Additive-only column migrations for stores created before Phase 4.

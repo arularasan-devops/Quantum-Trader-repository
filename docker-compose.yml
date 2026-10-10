@@ -10,11 +10,26 @@ services:
     env_file: .env
     environment:
       QT_CORS_ORIGINS: http://localhost:3000
+      # Inside the Compose network the DB is reached by service name, never
+      # localhost. Overrides any QT_DB_URL in .env (which is for host runs).
+      QT_DB_URL: postgresql://quantum:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/quantum
+      QT_DATA_DIR: /app/data
+    volumes:
+      # SQLite history/journals/risk-guard state that is not in PostgreSQL.
+      - backend-data:/app/data
     ports:
       - "8000:8000"
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   frontend:
@@ -26,7 +41,8 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
   redis:
@@ -34,6 +50,11 @@ services:
     command: ["redis-server", "--save", "60", "1"]
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
   postgres:
@@ -45,8 +66,14 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantum -d quantum"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
 volumes:
   redis-data:
   pg-data:
+  backend-data:

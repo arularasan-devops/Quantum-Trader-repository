@@ -960,8 +960,33 @@ async def health() -> dict:
     return {
         "status": "ok",
         "provider": settings.data_provider,
+        "data_source": "SIMULATED" if (settings.data_provider or "").lower() == "simulated"
+        else "LIVE_PROVIDER",
         "trade_mode": "live" if registry.get(DEFAULT_INSTRUMENT).is_live else "paper",
     }
+
+
+@app.get("/api/db/status")
+async def db_status() -> dict:
+    """Read-only persistence check: active backend, schema version, row counts.
+
+    Never echoes the connection URL (it may carry a password)."""
+    from app.research.store import store as research_store
+
+    def _probe() -> dict:
+        return research_store().status()
+
+    try:
+        info = await asyncio.to_thread(_probe)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail={"backend": "postgresql" if settings.db_url.lower().startswith(
+                ("postgres://", "postgresql://")) else "sqlite",
+                "error": type(exc).__name__},
+        ) from exc
+    info["configured"] = bool(settings.db_url)
+    return info
 
 
 @app.get("/api/snapshot")

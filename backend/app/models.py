@@ -1090,6 +1090,11 @@ class FeedHealth(BaseModel):
     push_pct_today: float | None = None  # share of the session spent on push
     fallbacks_today: int = 0             # push -> rest transitions today
     note: str = ""
+    # Explicit provenance so a synthetic or dead feed can never read as live.
+    provider: str = ""               # configured QT_DATA_PROVIDER
+    source: str = "UNKNOWN"          # LIVE | SIMULATED | UNAVAILABLE | UNKNOWN
+    state: str = "UNKNOWN"           # CONNECTED | DEGRADED | DISCONNECTED | SIMULATED
+    checked_at: float | None = None  # local wall-clock time of this reading
 
 
 class LearningStats(BaseModel):
