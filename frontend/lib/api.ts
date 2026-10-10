@@ -5,6 +5,31 @@ export const API_BASE =
 export const WS_BASE =
   process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8000";
 
+// Live-arming token (QT_LIVE_ARM_TOKEN on the backend). Kept in this browser's
+// localStorage under "qt_live_token"; sent only on order / arming calls.
+function liveHeaders(): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  if (typeof window !== "undefined") {
+    const t = window.localStorage.getItem("qt_live_token");
+    if (t) h["X-QT-Live-Token"] = t;
+  }
+  return h;
+}
+
+export async function getKillSwitch() {
+  const res = await fetch(`${API_BASE}/api/kill-switch`);
+  return res.json() as Promise<{ engaged: boolean; reason: string; ts: number | null }>;
+}
+
+export async function setKillSwitch(engaged: boolean, reason = "") {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, {
+    method: "POST",
+    headers: liveHeaders(),
+    body: JSON.stringify({ engaged, reason }),
+  });
+  return res.json();
+}
+
 export interface OrderResult {
   ok: boolean;
   mode: string;
@@ -14,6 +39,8 @@ export interface OrderResult {
   fill_premium: number | null;
   order_id: string | null;
   message: string;
+  status?: string;
+  filled_lots?: number | null;
 }
 
 export async function buyOption(
@@ -24,7 +51,7 @@ export async function buyOption(
 ) {
   const res = await fetch(`${API_BASE}/api/buy`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify({ option_symbol, lots, confirm, instrument }),
   });
   return res.json() as Promise<{ result: OrderResult; position: unknown }>;
@@ -86,7 +113,7 @@ export async function fetchSignalScan() {
 export async function sellPosition(confirm = false, instrument?: string) {
   const res = await fetch(`${API_BASE}/api/sell`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify({ confirm, instrument }),
   });
   return res.json() as Promise<{ result: OrderResult; position: unknown }>;
@@ -194,7 +221,7 @@ export interface AutoBuyStatus {
 export async function setAutoBuy(on: boolean) {
   const res = await fetch(`${API_BASE}/api/auto-buy`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify({ on }),
   });
   return res.json() as Promise<AutoBuyStatus>;
@@ -225,7 +252,7 @@ export async function setAutoTrade(opts: {
 }) {
   const res = await fetch(`${API_BASE}/api/auto-trade`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify(opts),
   });
   return res.json() as Promise<AutoTradeConfig>;

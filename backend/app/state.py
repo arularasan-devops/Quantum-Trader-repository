@@ -63,6 +63,7 @@ from app.execution import (
 from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, universe_specs
 from app.market import tiers
 from app.market.provider import MarketDataProvider, build_provider
+from app.execution import live_control
 from app.market.tick_quality import feed_quality
 from app.models import (
     Alert,
@@ -499,6 +500,14 @@ class AppState:
     # ---------- trading actions (the user only buys / sells) ----------
     def buy(self, option_symbol: str, lots: int = 1, confirm: bool = False,
             manual: bool = True) -> OrderResult:
+        # An earlier live entry still unresolved at the broker blocks a second
+        # order; once it fills it is adopted as the position (no duplicate).
+        adopted = self._resolve_pending("_pending_order")
+        if adopted is not None and not adopted.ok:
+            return adopted
+        if adopted is not None:
+            option_symbol = adopted.option_symbol
+            lots = adopted.filled_lots or adopted.lots
         chain = self.provider.option_chain()
         q = next((x for x in chain if x.symbol == option_symbol), None)
         if q is None:
@@ -507,7 +516,7 @@ class AppState:
         # A hand-placed entry is checked against the engine's own verdict before
         # anything else. ``manual=False`` is the auto path, which already passed
         # the gates that produced the call it is acting on.
-        if manual:
+        if manual and adopted is None:
             refused = manual_guard.refusal(self._last_decision, self._feed_ready())
             if refused:
                 self._add_alert("MANUAL_REFUSED", f"Entry refused: {refused}",
@@ -518,7 +527,13 @@ class AppState:
                     message=refused,
                 )
 
-        can, reason = self.risk.can_open(time.time())
+        if adopted is None and live_control.kill_switch_engaged():
+            if manual:
+                self._add_alert("KILL_SWITCH", "Entry refused: kill switch engaged", "warning")
+            return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
+                               option_symbol=q.symbol, lots=lots,
+                               message="Kill switch engaged — new entries blocked.")
+        can, reason = (True, "") if adopted is not None else self.risk.can_open(time.time())
         if not can:
             self._add_alert("RISK_BLOCK", f"Trade blocked: {reason}", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
@@ -526,7 +541,10 @@ class AppState:
 
         entry = q.premium
         order_id = None
-        if self.is_live:
+        if adopted is not None:
+            entry = adopted.fill_premium or q.premium
+            order_id = adopted.order_id
+        elif self.is_live:
             if not confirm:
                 return OrderResult(ok=False, mode="live", side="BUY", option_symbol=q.symbol,
                                    lots=lots, message="Confirmation required for a live order.")
@@ -534,8 +552,12 @@ class AppState:
             if not res.ok:
                 self._add_alert("ORDER_REJECTED", f"BUY {q.symbol}: {res.message}", "critical")
                 return res
+            res = self._await_fill(res)
+            if not self._is_filled(res):
+                return self._unfilled("_pending_order", res, q.symbol, "BUY", lots)
             entry = res.fill_premium or q.premium
             order_id = res.order_id
+            lots = min(lots, res.filled_lots or lots)
 
         self.position = Position(
             option_symbol=q.symbol,
@@ -563,7 +585,66 @@ class AppState:
         mode = "LIVE" if self.is_live else "paper"
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
-                           lots=lots, fill_premium=entry, order_id=order_id, message="Entered")
+                           lots=lots, fill_premium=entry, order_id=order_id, message="Entered",
+                           status="FILLED", filled_lots=lots)
+
+    # ---------- broker order lifecycle (ack != fill) ----------
+    @staticmethod
+    def _is_filled(res: OrderResult) -> bool:
+        if res.status in ("FILLED", "PARTIAL"):
+            return bool(res.fill_premium) and (res.filled_lots is None or res.filled_lots > 0)
+        # Legacy providers that report no status but a fill price.
+        return not res.status and bool(res.fill_premium)
+
+    def _await_fill(self, res: OrderResult) -> OrderResult:
+        """Poll read-only order status until FILLED/REJECTED/CANCELLED or timeout."""
+        if not res.order_id or res.status in ("", "FILLED", "REJECTED", "CANCELLED"):
+            return res
+        deadline = time.time() + max(0.0, float(settings.order_fill_timeout_sec))
+        latest = res
+        while True:
+            st = self.provider.order_status(res.order_id)
+            if st is not None:
+                latest = st
+                if st.status in ("FILLED", "REJECTED", "CANCELLED"):
+                    return st
+            if time.time() >= deadline:
+                return latest
+            time.sleep(0.1)
+
+    def _unfilled(self, attr: str, res: OrderResult, symbol: str, side: str,
+                  lots: int) -> OrderResult:
+        if res.status in ("REJECTED", "CANCELLED"):
+            self._add_alert("ORDER_REJECTED", f"{side} {symbol}: {res.status} {res.message}",
+                            "critical")
+            return res.model_copy(update={"ok": False})
+        setattr(self, attr, {"order_id": res.order_id, "symbol": symbol, "side": side,
+                             "lots": lots})
+        self._add_alert("ORDER_PENDING", f"{side} {symbol} acknowledged ({res.order_id}) "
+                        "but not filled — no position change until it resolves", "critical")
+        return OrderResult(ok=False, mode="live", side=side, option_symbol=symbol, lots=lots,
+                           order_id=res.order_id, status=res.status or "ACKNOWLEDGED",
+                           message="Order acknowledged, not filled — awaiting broker fill; "
+                                   "no duplicate order will be sent.")
+
+    def _resolve_pending(self, attr: str) -> OrderResult | None:
+        """None = nothing pending; ok=False = still pending; ok=True = filled."""
+        pend = getattr(self, attr, None)
+        if not pend:
+            return None
+        st = self.provider.order_status(pend["order_id"])
+        if st is not None and self._is_filled(st):
+            setattr(self, attr, None)
+            return st.model_copy(update={"ok": True, "option_symbol": pend["symbol"]})
+        if st is not None and st.status in ("REJECTED", "CANCELLED"):
+            setattr(self, attr, None)
+            self._add_alert("ORDER_REJECTED", f"{pend['side']} {pend['symbol']}: {st.status}",
+                            "critical")
+            return None
+        return OrderResult(ok=False, mode="live", side=pend["side"], option_symbol=pend["symbol"],
+                           lots=pend["lots"], order_id=pend["order_id"],
+                           status=(st.status if st else "") or "ACKNOWLEDGED",
+                           message="Earlier order still pending at the broker — not sending another.")
 
     def sell(self, confirm: bool = False, lots: int | None = None) -> OrderResult:
         """Close the position. ``lots`` sells only part of it (scale-out), leaving
@@ -576,7 +657,14 @@ class AppState:
         partial = lots is not None and 0 < lots < held
         lots = lots if partial else held
         order_id = None
-        if self.is_live:
+        exit_fill = self._resolve_pending("_pending_exit")
+        if exit_fill is not None and not exit_fill.ok:
+            return exit_fill
+        if exit_fill is not None:
+            order_id = exit_fill.order_id
+            lots = min(held, exit_fill.filled_lots or lots)
+            partial = lots < held
+        elif self.is_live:
             if not confirm:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Confirmation required for a live order.")
@@ -584,7 +672,13 @@ class AppState:
             if not res.ok:
                 self._add_alert("ORDER_REJECTED", f"SELL {sym}: {res.message}", "critical")
                 return res
+            res = self._await_fill(res)
+            if not self._is_filled(res):
+                return self._unfilled("_pending_exit", res, sym, "SELL", lots)
             order_id = res.order_id
+            if res.filled_lots and res.filled_lots < lots:
+                lots = res.filled_lots
+                partial = lots < held
         # On a scale-out only the sold share of the position is realised; the
         # rest keeps running and is booked on the final exit.
         pnl = self.position.net_pnl * (lots / held if held else 1.0)
@@ -2083,7 +2177,7 @@ class AppState:
         # when flat). Otherwise use the global capital vs. all-instrument deployed.
         cost_per_lot = (decision.current_premium or 0.0) * lot_size
         if inst_capital is not None and inst_capital > 0:
-            budget = inst_capital
+            budget = min(inst_capital, settings.capital)
             used = deployed_self
         else:
             budget = settings.capital
@@ -2105,7 +2199,8 @@ class AppState:
                         # Deploy 50% of balance at the confidence gate, ramping to
                         # 100% at 100% confidence.
                         frac = 0.5 + 0.5 * conf_norm
-                        budget = live_cash * frac
+                        # Balance may only shrink the budget, never exceed capital.
+                        budget = min(settings.capital, live_cash * frac)
                 except Exception:
                     pass
         if cost_per_lot > 0 and budget > 0:

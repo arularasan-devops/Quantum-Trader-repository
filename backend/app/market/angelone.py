@@ -1820,11 +1820,46 @@ class AngelOneProvider(MarketDataProvider):
             return OrderResult(ok=False, mode="live", side=side, option_symbol=option_symbol,
                                lots=lots, message=f"Order error: {exc}")
         order_id = str(resp) if resp else None
-        q = self._quotes.get(inst.token)
-        fill = round(q["ltp"], 1) if q else None
+        # placeOrder returns an order id = an ACKNOWLEDGEMENT, not a fill. The
+        # fill price/quantity come from order_status(), never from the quote.
         return OrderResult(ok=bool(order_id), mode="live", side=side, option_symbol=option_symbol,
-                           lots=lots, fill_premium=fill, order_id=order_id,
-                           message="Order placed" if order_id else "Order rejected")
+                           lots=lots, fill_premium=None, order_id=order_id,
+                           status="ACKNOWLEDGED" if order_id else "REJECTED",
+                           message="Order acknowledged" if order_id else "Order rejected")
+
+    def order_status(self, order_id: str) -> OrderResult | None:
+        """Read-only: look the order up in the SmartAPI order book."""
+        if not order_id:
+            return None
+        try:
+            book = (self._smart.orderBook() or {}).get("data") or []
+        except Exception:  # pragma: no cover - live API
+            return None
+        row = next((r for r in book if str(r.get("orderid")) == str(order_id)), None)
+        if row is None:
+            return None
+        sym = str(row.get("tradingsymbol") or "")
+        inst = next((o for o in self._options if o.symbol == sym), None)
+        lot = max(1, int(inst.lot_size if inst else (_as_int(row.get("lotsize")) or 1)))
+        qty = _as_int(row.get("quantity")) or 0
+        filled = _as_int(row.get("filledshares")) or 0
+        raw = str(row.get("status") or "").lower()
+        if raw == "complete":
+            status = "FILLED"
+        elif raw == "rejected":
+            status = "REJECTED"
+        elif raw == "cancelled":
+            status = "PARTIAL" if filled > 0 else "CANCELLED"
+        else:
+            status = "PARTIAL" if filled > 0 else "OPEN"
+        avg = _to_float(row.get("averageprice"))
+        return OrderResult(
+            ok=status in ("FILLED", "PARTIAL"), mode="live",
+            side=str(row.get("transactiontype") or "").upper(), option_symbol=sym,
+            lots=max(1, qty // lot) if qty else 0, filled_lots=filled // lot,
+            fill_premium=round(avg, 2) if avg else None, order_id=str(order_id),
+            status=status, message=str(row.get("text") or row.get("status") or ""),
+        )
 
     # --------------------------------------------------------------- helpers
     def _time_to_expiry(self) -> float:

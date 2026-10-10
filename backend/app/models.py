@@ -65,6 +65,10 @@ class OrderResult(BaseModel):
     fill_premium: float | None = None
     order_id: str | None = None
     message: str = ""
+    # Broker lifecycle: ACKNOWLEDGED/OPEN (not a fill), PARTIAL, FILLED,
+    # REJECTED, CANCELLED. Paper fills are FILLED. Empty = legacy/unknown.
+    status: str = ""
+    filled_lots: int | None = None
 
 
 class Signal(str, Enum):
