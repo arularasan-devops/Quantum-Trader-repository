@@ -3,7 +3,10 @@ import { useEffect, useRef, useState } from "react";
 import { Snapshot } from "./types";
 import { API_BASE, WS_BASE } from "./api";
 
-export function useLiveData() {
+// `instrument` addresses a specific per-instrument stream on the server, so two
+// tabs on different instruments stay independent. Changing it tears down the
+// old socket and connects to the new instrument's stream.
+export function useLiveData(instrument?: string) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -11,15 +14,19 @@ export function useLiveData() {
   useEffect(() => {
     let closed = false;
     let retry: ReturnType<typeof setTimeout>;
+    const qs = instrument ? `?instrument=${encodeURIComponent(instrument)}` : "";
+
+    // clear the previous instrument's data while the new one loads
+    setSnap(null);
 
     // seed with a one-shot snapshot so the UI paints immediately
-    fetch(`${API_BASE}/api/snapshot`)
+    fetch(`${API_BASE}/api/snapshot${qs}`)
       .then((r) => r.json())
       .then((d) => !closed && setSnap(d))
       .catch(() => {});
 
     const connect = () => {
-      const ws = new WebSocket(`${WS_BASE}/ws`);
+      const ws = new WebSocket(`${WS_BASE}/ws${qs}`);
       wsRef.current = ws;
       ws.onopen = () => setConnected(true);
       ws.onmessage = (e) => {
@@ -40,7 +47,7 @@ export function useLiveData() {
       clearTimeout(retry);
       wsRef.current?.close();
     };
-  }, []);
+  }, [instrument]);
 
   return { snap, connected };
 }
