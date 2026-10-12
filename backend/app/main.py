@@ -31,11 +31,13 @@ from app.engine import weights as weights_store
 from app.engine.account_risk import account as account_risk
 from app.execution import futures_paper
 from app.execution import live_control
+from app.execution import order_ledger
 from app.market import instruments as _inst_mod
 from app.market.instruments import DEFAULT_INSTRUMENT
 from app.research.pairs import spec as pair_spec
 from app.research.phase17 import store as p17store
 from app.state import registry
+from app import storage as _storage_mod
 
 _log = logging.getLogger("quantum.api")
 
@@ -984,6 +986,40 @@ async def post_kill_switch(req: KillSwitchRequest,
     if not req.engaged:
         live_control.require_live_auth(x_qt_live_token)
     return live_control.set_kill_switch(req.engaged, req.reason)
+
+
+class OrderRecoveryRequest(BaseModel):
+    instrument: str
+    action: str  # adopt_position | confirm_flat | clear_pending
+    note: str = ""
+    which: str | None = None  # entry | exit (clear_pending only)
+
+
+@app.get("/api/order-recovery")
+async def get_order_recovery() -> dict:
+    """Read-only: live order/position recovery state and persistence health."""
+    return {
+        "instruments": [st.recovery_status() for st in registry.active()],
+        "persistence": order_ledger.status(),
+        "journal_mirror": dict(_storage_mod.journal_mirror_status),
+    }
+
+
+@app.post("/api/order-recovery")
+async def post_order_recovery(req: OrderRecoveryRequest,
+                              x_qt_live_token: str | None = Header(default=None)) -> dict:
+    """Operator decision after checking the broker. Requires the live-arm token.
+    Records an audit event; never sends, cancels or modifies a broker order."""
+    live_control.require_live_auth(x_qt_live_token)
+    name = (req.instrument or "").upper()
+    if name not in _inst_mod.REGISTRY:
+        raise HTTPException(404, f"Unknown instrument {req.instrument}")
+    try:
+        return registry.get(name).resolve_recovery(req.action, req.note, req.which)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @app.get("/api/db/status")

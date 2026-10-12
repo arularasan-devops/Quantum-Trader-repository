@@ -8,6 +8,8 @@ Tables (backend-agnostic DDL; works on SQLite and PostgreSQL):
 * ``trade_history``     — completed trades incl. MFE / MAE / slippage / brokerage
 * ``shadow_log``        — live recommendations vs. eventual outcome (no orders)
 * ``data_quality``      — data-validation issues found on import
+* ``order_events``      — live order audit events mirrored from ``order_events.jsonl``
+* ``trade_journal``     — mirror of the closed-trade journal in ``history.db``
 
 All numeric metrics are REAL captured/derived values — nothing here is synthetic.
 """
@@ -129,13 +131,51 @@ _DDL = [
         ts          BIGINT NOT NULL,
         kind        TEXT NOT NULL,
         detail      TEXT
+    )""",    # v3: live order audit trail (idempotent on event_id; the JSONL log under
+    # data_dir is the durable source, see app/execution/order_ledger.py).
+    """CREATE TABLE IF NOT EXISTS order_events (
+        event_id      TEXT PRIMARY KEY,
+        ts            DOUBLE PRECISION NOT NULL,
+        instrument    TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        order_id      TEXT,
+        side          TEXT,
+        option_symbol TEXT,
+        status        TEXT,
+        lots          INTEGER,
+        filled_lots   INTEGER,
+        inc_lots      INTEGER,
+        inc_avg_price DOUBLE PRECISION,
+        avg_price     DOUBLE PRECISION,
+        mode          TEXT,
+        detail        TEXT
+    )""",
+    # v3: closed-trade journal mirror (source_id = history.db trade_journal.id).
+    """CREATE TABLE IF NOT EXISTS trade_journal (
+        source_id       BIGINT PRIMARY KEY,
+        instrument      TEXT NOT NULL,
+        ts              BIGINT NOT NULL,
+        option_symbol   TEXT,
+        option_type     TEXT,
+        entry           DOUBLE PRECISION,
+        exit            DOUBLE PRECISION,
+        lots            INTEGER,
+        net_pnl         DOUBLE PRECISION,
+        win             BOOLEAN,
+        holding_minutes INTEGER,
+        mode            TEXT,
+        auto            BOOLEAN,
+        exit_reason     TEXT,
+        confidence      DOUBLE PRECISION,
+        note            TEXT,
+        context         TEXT
     )""",
 ]
 
 
 # Bump when a new additive migration is added to ``_migrate``. Recorded in
 # ``schema_migrations`` so operators can verify which schema a store is on.
-STORE_SCHEMA_VERSION = 2
+STORE_SCHEMA_VERSION = 3
 
 _SCHEMA_MIGRATIONS_DDL = """CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,
@@ -159,7 +199,8 @@ class ResearchStore:
         verb = "INSERT OR IGNORE INTO" if not self.db.is_postgres else "INSERT INTO"
         conflict = " ON CONFLICT (version) DO NOTHING" if self.db.is_postgres else ""
         for version, note in ((1, "base research tables"),
-                              (2, "mcx_options bid/ask/source + schema_migrations")):
+                              (2, "mcx_options bid/ask/source + schema_migrations"),
+                              (3, "order_events + trade_journal mirror")):
             self.db.execute(
                 f"{verb} schema_migrations (version, applied_at, note) VALUES (?,?,?)"
                 + conflict,
@@ -174,7 +215,8 @@ class ResearchStore:
         """Read-only health of the store: backend, schema version, row counts."""
         counts: dict[str, int] = {}
         for table in ("trade_history", "signal_snapshots", "shadow_log",
-                      "mcx_futures", "mcx_options", "data_quality"):
+                      "mcx_futures", "mcx_options", "data_quality",
+                      "order_events", "trade_journal"):
             rows = self.db.query(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = int(rows[0]["n"]) if rows else 0
         return {
@@ -329,6 +371,63 @@ class ResearchStore:
             ),
         )
         return tid
+
+    def _insert_ignore(self, table: str, key: str) -> tuple[str, str]:
+        if self.db.is_postgres:
+            return f"INSERT INTO {table}", f" ON CONFLICT ({key}) DO NOTHING"
+        return f"INSERT OR IGNORE INTO {table}", ""
+
+    # ---- live order audit trail (v3) ----
+    def insert_order_events(self, events: list[dict[str, Any]]) -> int:
+        """Idempotent: an event_id already stored is ignored, so a retried mirror
+        batch never duplicates rows."""
+        if not events:
+            return 0
+        verb, conflict = self._insert_ignore("order_events", "event_id")
+        known = {"event_id", "ts", "instrument", "kind", "order_id", "side",
+                 "option_symbol", "status", "lots", "filled_lots", "inc_lots",
+                 "inc_avg_price", "avg_price", "mode"}
+        rows = []
+        for e in events:
+            extra = {k: v for k, v in e.items() if k not in known}
+            rows.append((
+                str(e["event_id"]), float(e.get("ts") or 0.0), str(e.get("instrument") or ""),
+                str(e.get("kind") or ""), e.get("order_id"), e.get("side"),
+                e.get("option_symbol"), e.get("status"), e.get("lots"), e.get("filled_lots"),
+                e.get("inc_lots"), e.get("inc_avg_price"), e.get("avg_price"), e.get("mode"),
+                json.dumps(extra, default=str) if extra else None,
+            ))
+        self.db.executemany(
+            f"{verb} (event_id, ts, instrument, kind, order_id, side, option_symbol, "
+            "status, lots, filled_lots, inc_lots, inc_avg_price, avg_price, mode, detail) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" + conflict,
+            rows,
+        )
+        return len(rows)
+
+    # ---- closed-trade journal mirror (v3) ----
+    def max_journal_source_id(self) -> int:
+        row = self.db.query_one("SELECT MAX(source_id) AS m FROM trade_journal")
+        return int(row["m"] or 0) if row else 0
+
+    def insert_journal_rows(self, rows: list[dict[str, Any]]) -> int:
+        """Idempotent on ``source_id`` (the history.db row id)."""
+        if not rows:
+            return 0
+        verb, conflict = self._insert_ignore("trade_journal", "source_id")
+        self.db.executemany(
+            f"{verb} (source_id, instrument, ts, option_symbol, option_type, entry, exit, "
+            "lots, net_pnl, win, holding_minutes, mode, auto, exit_reason, confidence, "
+            "note, context) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" + conflict,
+            [(
+                int(r["id"]), r["instrument"], int(r["ts"]), r.get("option"),
+                r.get("option_type"), r.get("entry"), r.get("exit"), r.get("lots"),
+                r.get("net_pnl"), bool(r.get("win")), r.get("holding_minutes"),
+                r.get("mode"), bool(r.get("auto")), r.get("exit_reason"),
+                r.get("confidence"), r.get("note"), r.get("context"),
+            ) for r in rows],
+        )
+        return len(rows)
 
     def trades(self, instrument: str, source: str | None = None) -> list[dict]:
         if source:

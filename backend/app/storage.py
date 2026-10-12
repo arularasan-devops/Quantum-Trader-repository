@@ -8,6 +8,7 @@ when scaling out (see DEPLOYMENT.md).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -22,6 +23,16 @@ from app.models import Candle, OptionQuote
 # than only the bars newer than the last write. Bounds the cost of gap-closing on
 # the live path while still absorbing a backfill that arrives after a warm-up.
 _FULL_REWRITE_SEC = 300.0
+
+log = logging.getLogger(__name__)
+
+# PostgreSQL mirror of trade_journal. SQLite stays the durable source and the
+# read path for every existing API; the mirror is idempotent on the SQLite row
+# id and catches up (including pre-existing history) on the next call.
+_JOURNAL_MIRROR_BATCH = 500
+_JOURNAL_MIRROR_MAX_BATCHES = 20
+journal_mirror_status: dict = {"errors": 0, "last_error": None, "last_ok_ts": None,
+                               "mirrored_total": 0, "disabled": None}
 
 # How long a writer waits for a lock before giving up. Long, because the thing
 # on the other side is a live capture flushing a minute's rows, not a hung query.
@@ -311,6 +322,44 @@ class HistoryStore:
                 ),
             )
             self._db.commit()
+        self.mirror_journal()
+
+    def mirror_journal(self) -> dict:
+        """Copy journal rows not yet in the PostgreSQL research store. Never
+        raises; a failure is logged, counted in ``journal_mirror_status`` and
+        retried on the next call (rows stay safe in SQLite meanwhile)."""
+        try:
+            from app.research.store import store as research_store
+
+            rs = research_store()
+            if rs.backend != "postgresql":
+                journal_mirror_status["disabled"] = "research store is not PostgreSQL"
+                return journal_mirror_status
+            journal_mirror_status["disabled"] = None
+            cols = ["id", "instrument", "ts", "option", "option_type", "entry", "exit",
+                    "lots", "net_pnl", "win", "holding_minutes", "mode", "auto",
+                    "exit_reason", "confidence", "note", "context"]
+            last = rs.max_journal_source_id()
+            for _ in range(_JOURNAL_MIRROR_MAX_BATCHES):
+                with self._lock:
+                    rows = self._db.execute(
+                        f"SELECT {', '.join(cols)} FROM trade_journal WHERE id > ? "
+                        "ORDER BY id LIMIT ?", (last, _JOURNAL_MIRROR_BATCH),
+                    ).fetchall()
+                if not rows:
+                    break
+                rs.insert_journal_rows([dict(zip(cols, r)) for r in rows])
+                journal_mirror_status["mirrored_total"] += len(rows)
+                last = int(rows[-1][0])
+                if len(rows) < _JOURNAL_MIRROR_BATCH:
+                    break
+            journal_mirror_status["last_ok_ts"] = time.time()
+            journal_mirror_status["last_error"] = None
+        except Exception as exc:
+            journal_mirror_status["errors"] += 1
+            journal_mirror_status["last_error"] = str(exc)[:300]
+            log.warning("trade_journal PostgreSQL mirror failed (will retry): %s", exc)
+        return journal_mirror_status
 
     def journal(self, *, since: int | None = None, until: int | None = None,
                 limit: int | None = None, exclude_flow: bool = False,
