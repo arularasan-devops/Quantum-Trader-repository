@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from app import notify
 from app import storage
+from app.journal import hooks as journal_hooks
 from app.analysis import analyst
 from app.analysis import events as events_mod
 from app.analysis import exec_funnel
@@ -523,6 +524,7 @@ class AppState:
         self._entry_context = self._capture_context(entry)
         mode = "LIVE" if self.is_live else "paper"
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
+        journal_hooks.on_entry(self, q, lots, entry, manual)
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
                            lots=lots, fill_premium=entry, order_id=order_id, message="Entered")
 
@@ -648,6 +650,7 @@ class AppState:
             ctx.update(books)
         self._pending_exit_reason = None
         self.journal.append(trade_row)
+        journal_hooks.on_exit(self, trade_row, partial, lots)
         # Phase 23 — attach this closed trade to the hurdle-shadow row that
         # recorded the opportunity, so the three arms are scored on the engine's
         # own outcome rather than a simulated path. Record only.
@@ -1058,6 +1061,9 @@ class AppState:
                 float(self.position.entry_premium or 0.0),
                 int(self.position.quantity_lots or 0), now=now,
             )
+
+        # Journal v2 (record only): session, signal outcome, stop/target changes.
+        journal_hooks.after_tick(self, decision, chain, was_in_pos, now)
 
         # Phase 23 — the break-even hurdle shadow. It runs AFTER the auto-trader
         # has decided, records this BUY opportunity with the measured book, and
