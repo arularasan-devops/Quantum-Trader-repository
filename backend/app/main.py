@@ -1716,6 +1716,89 @@ async def journal(instrument: str | None = None) -> dict:
     return {"trades": st.journal, "today_profit": st.today_profit, "today_loss": st.today_loss}
 
 
+# ---- Journal v2 (sessions / signals / trade events / sizing; read-only API) ----
+def _jr_filters(**kw) -> dict:
+    out = {k: v for k, v in kw.items() if v not in (None, "")}
+    if "instrument" in out:
+        out["instrument"] = str(out["instrument"]).upper()
+    return out
+
+
+@app.get("/api/journal/v2/status")
+async def journal_v2_status() -> dict:
+    from app.journal import hooks as jr_hooks
+    from app.journal.store import store as jr_store
+
+    js = jr_store()
+    return {"backend": js.backend, "schema_version": js.schema_version(),
+            "counts": js.counts(), "write_errors": jr_hooks.status(),
+            "sim_starting_capital": settings.sim_starting_capital}
+
+
+@app.get("/api/journal/v2/trades")
+async def journal_v2_trades(instrument: str | None = None, mode: str | None = None,
+                            strategy: str | None = None, setup: str | None = None,
+                            regime: str | None = None, status: str | None = None,
+                            result: str | None = None, since: float | None = None,
+                            until: float | None = None, page: int = Query(1, ge=1),
+                            page_size: int = Query(50, ge=1, le=500)) -> dict:
+    from app.journal.store import store as jr_store
+
+    return jr_store().list_trades(_jr_filters(
+        instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
+        status=status, result=result, since=since, until=until), page, page_size)
+
+
+@app.get("/api/journal/v2/trades.csv")
+async def journal_v2_trades_csv(instrument: str | None = None, mode: str | None = None,
+                                strategy: str | None = None, setup: str | None = None,
+                                regime: str | None = None, status: str | None = None,
+                                result: str | None = None, since: float | None = None,
+                                until: float | None = None) -> PlainTextResponse:
+    from app.journal.store import store as jr_store
+
+    body = jr_store().trades_csv(_jr_filters(
+        instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
+        status=status, result=result, since=since, until=until))
+    return PlainTextResponse(body, media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="journal_trades.csv"'})
+
+
+@app.get("/api/journal/v2/trades/{trade_id}")
+async def journal_v2_trade(trade_id: str) -> dict:
+    from app.journal.store import store as jr_store
+
+    detail = jr_store().trade_detail(trade_id)
+    if detail is None:
+        raise HTTPException(404, "Unknown trade")
+    return detail
+
+
+@app.get("/api/journal/v2/sessions")
+async def journal_v2_sessions(instrument: str | None = None, mode: str | None = None,
+                              since: float | None = None, until: float | None = None,
+                              page: int = Query(1, ge=1),
+                              page_size: int = Query(50, ge=1, le=500)) -> dict:
+    from app.journal.store import store as jr_store
+
+    return jr_store().list_sessions(_jr_filters(
+        instrument=instrument, mode=mode, since=since, until=until), page, page_size)
+
+
+@app.get("/api/journal/v2/signals")
+async def journal_v2_signals(instrument: str | None = None, mode: str | None = None,
+                             outcome: str | None = None, signal: str | None = None,
+                             setup: str | None = None, regime: str | None = None,
+                             session_id: str | None = None, since: float | None = None,
+                             until: float | None = None, page: int = Query(1, ge=1),
+                             page_size: int = Query(50, ge=1, le=500)) -> dict:
+    from app.journal.store import store as jr_store
+
+    return jr_store().list_signals(_jr_filters(
+        instrument=instrument, mode=mode, outcome=outcome, signal=signal, setup=setup,
+        regime=regime, session_id=session_id, since=since, until=until), page, page_size)
+
+
 @app.get("/api/signal-stats")
 async def signal_stats(instrument: str | None = None, days: int = 7) -> dict:
     """Daily scoreboard of the frozen engine's BUY signals and their outcomes

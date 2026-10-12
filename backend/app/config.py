@@ -138,6 +138,13 @@ class Settings(BaseSettings):
     # --- Risk management / position sizing ---
     capital: float = 100000.0            # trading capital used for sizing
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
+    # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
+    # change the engine's actual quantity (see app/journal/sizing.py).
+    journal_v2_enabled: bool = True
+    sim_starting_capital: float = 500000.0      # QT_SIM_STARTING_CAPITAL
+    sizing_capital_fraction_pct: float = 10.0   # capital-based: % of equity per trade
+    sizing_aggressive_multiplier: float = 2.0   # aggressive = capital-based x this
+    sizing_risk_budget_pct: float = 1.0         # risk-budget: % of equity lost at stop
     # These three are ACCOUNT-WIDE and persisted across restarts (see
     # app/engine/account_risk.py). They used to be per-instrument and in-memory,
     # which made the cap meaningless: measured 13 Aug, the book lost Rs16,834
