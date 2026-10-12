@@ -300,7 +300,7 @@ class AppState:
         self._pending_order: dict | None = None
         self._pending_exit: dict | None = None
         self._ledger_position: dict | None = None
-        self._recovery: dict | None = None
+        self._order_recovery: dict | None = None
         self._persist_error: str | None = None
         self._last_order_poll = 0.0
         self._restore_live_ledger()
@@ -844,7 +844,7 @@ class AppState:
         """Throttled, read-only broker reconciliation from the tick loop. Applies
         confirmed fills only; never places, cancels or resubmits an order."""
         now = time.time()
-        busy = (self._pending_order or self._pending_exit or self._recovery
+        busy = (self._pending_order or self._pending_exit or self._order_recovery
                 or self._persist_error)
         if now - self._last_order_poll < (5.0 if busy else 30.0):
             return
@@ -856,7 +856,7 @@ class AppState:
         try:
             if self._persist_error:
                 self._retry_persistence()
-            if self._recovery:
+            if self._order_recovery:
                 self._reconcile_recovery()
                 return
             if self._pending_order:
@@ -884,7 +884,7 @@ class AppState:
                 "pending_entry": self._pending_order,
                 "pending_exit": self._pending_exit,
                 "position": self._ledger_position,
-                "recovery": dict(self._recovery) if self._recovery else None,
+                "recovery": dict(self._order_recovery) if self._order_recovery else None,
             })
             return True
         except order_ledger.LedgerError as exc:
@@ -925,8 +925,8 @@ class AppState:
             self._event("PERSISTENCE_RESTORED", note=prev)
 
     def _live_entry_block(self) -> str | None:
-        if self._recovery:
-            return (f"Order recovery required ({self._recovery.get('reason')}) — new live "
+        if self._order_recovery:
+            return (f"Order recovery required ({self._order_recovery.get('reason')}) — new live "
                     "entries blocked until reconciled via /api/order-recovery.")
         if self._persist_error:
             return (f"Order persistence failed ({self._persist_error}) — new live entries "
@@ -939,7 +939,7 @@ class AppState:
         try:
             saved = order_ledger.load(self._instrument)
         except order_ledger.LedgerError as exc:
-            self._recovery = {"reason": f"order ledger unreadable: {exc}"[:300],
+            self._order_recovery = {"reason": f"order ledger unreadable: {exc}"[:300],
                               "since": time.time(), "manual_only": True}
             self._add_alert("ORDER_RECOVERY", f"Order ledger unreadable: {exc} — new live "
                             "entries blocked", "critical")
@@ -952,12 +952,12 @@ class AppState:
         self._ledger_position = dict(pos) if pos else None
         prev = saved.get("recovery")
         if prev:
-            self._recovery = dict(prev)
+            self._order_recovery = dict(prev)
         self._enter_recovery("backend restarted with unresolved live order/position state")
 
     def _enter_recovery(self, reason: str) -> None:
-        if self._recovery is None:
-            self._recovery = {"reason": reason[:300], "since": time.time()}
+        if self._order_recovery is None:
+            self._order_recovery = {"reason": reason[:300], "since": time.time()}
         if self._ledger_position is not None:
             self._ledger_position["verified"] = False
         self._add_alert("ORDER_RECOVERY", f"Live order recovery required: {reason}. New live "
@@ -969,7 +969,7 @@ class AppState:
     def _apply_to_candidate(self, sign: int, inc: OrderResult) -> None:
         """Confirmed fills seen during recovery update the UNVERIFIED saved
         position (never ``self.position``) and the event log."""
-        rec = self._recovery if self._recovery is not None else {}
+        rec = self._order_recovery if self._order_recovery is not None else {}
         rec["fills_seen"] = True
         c = self._ledger_position
         n, px = int(inc.filled_lots or 0), float(inc.fill_premium)
@@ -998,7 +998,7 @@ class AppState:
         """Read-only order-book reconciliation of restored orders. Auto-clears
         only when every restored order ended with no fill and no position was
         saved; anything else waits for the operator."""
-        rec = self._recovery
+        rec = self._order_recovery
         for attr, sign in (("_pending_order", 1), ("_pending_exit", -1)):
             if getattr(self, attr):
                 inc = self._resolve_pending(attr)
@@ -1007,17 +1007,17 @@ class AppState:
         if (rec and self._ledger_position is None and not self._pending_order
                 and not self._pending_exit and not rec.get("fills_seen")
                 and not rec.get("manual_only") and not rec.get("conflicts")):
-            self._recovery = None
+            self._order_recovery = None
             self._event("RECOVERY_CLEARED", note="restored orders ended unfilled; "
                         "no saved position")
             self._persist_state()
 
     def recovery_status(self) -> dict:
-        rec = self._recovery or {}
+        rec = self._order_recovery or {}
         p = self.position
         return {
             "instrument": self._instrument,
-            "recovery_required": self._recovery is not None,
+            "recovery_required": self._order_recovery is not None,
             "reason": rec.get("reason"),
             "since": rec.get("since"),
             "conflicts": rec.get("conflicts") or [],
@@ -1046,16 +1046,16 @@ class AppState:
             self._event("OPERATOR_CLEARED_PENDING", pend, note=note)
             setattr(self, attr, None)
         elif action == "confirm_flat":
-            if self._recovery is None:
+            if self._order_recovery is None:
                 raise ValueError("No recovery in progress.")
             if self._pending_exit:
                 raise ValueError("Resolve the pending exit order first.")
             self._event("OPERATOR_CONFIRMED_FLAT", note=note,
                         saved_position=self._ledger_position)
             self._ledger_position = None
-            self._recovery.pop("conflicts", None)
+            self._order_recovery.pop("conflicts", None)
         elif action == "adopt_position":
-            if self._recovery is None:
+            if self._order_recovery is None:
                 raise ValueError("No recovery in progress.")
             c = self._ledger_position
             if not c or not c.get("lots") or not c.get("entry"):
@@ -1077,16 +1077,16 @@ class AppState:
             self._entry_context = {"recovered": True, "entry_time": opened,
                                    "order_ids": list(c.get("order_ids") or [])}
             c["verified"] = True
-            self._recovery.pop("conflicts", None)
+            self._order_recovery.pop("conflicts", None)
             self._event("OPERATOR_ADOPTED_POSITION", note=note, saved_position=c)
         else:
             raise ValueError("action must be adopt_position, confirm_flat or clear_pending.")
-        if (self._recovery is not None
+        if (self._order_recovery is not None
                 and (self._ledger_position is None or self._ledger_position.get("verified"))
-                and not self._recovery.get("conflicts")
+                and not self._order_recovery.get("conflicts")
                 and not any(pd and not pd.get("order_id")
                             for pd in (self._pending_order, self._pending_exit))):
-            self._recovery = None
+            self._order_recovery = None
             self._event("RECOVERY_CLEARED", note=note)
         if not self._persist_state():
             raise RuntimeError(f"Order ledger write failed: {self._persist_error}")
