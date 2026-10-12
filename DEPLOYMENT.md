@@ -109,8 +109,26 @@ always uses `postgres:5432` (never `localhost`).
    (0 PASS / 1 FAIL / 2 BLOCKED). It refuses to place orders.
 3. A dead or unauthenticated feed shows **DISCONNECTED**, never simulated prices.
 4. Live arming, live orders and kill-switch release require the
-   `X-QT-Live-Token` header = `QT_LIVE_ARM_TOKEN` (browser: set
-   `localStorage.qt_live_token`). Engage the kill switch any time:
+   `X-QT-Live-Token` header = `QT_LIVE_ARM_TOKEN`. The dashboard's kill-switch
+   panel asks for it in a password field and never stores it. Engage the kill
+   switch any time (dashboard button or):
    `curl -XPOST localhost:8000/api/kill-switch -H 'Content-Type: application/json' -d '{"engaged":true}'`.
 5. Real orders remain blocked by `REAL_MONEY_EXECUTION_ENABLED=False` in
    `backend/app/ai/safety.py`. Changing it is a deliberate, reviewed human decision.
+
+### Order recovery after a restart (operator)
+Saved live order/position state is restored as **unverified**, and new live
+entries stay blocked until you reconcile it with the broker.
+
+```bash
+curl -s localhost:8000/api/order-recovery | python -m json.tool   # state + persistence health
+# after checking Angel One order book / positions yourself:
+curl -s -XPOST localhost:8000/api/order-recovery -H 'Content-Type: application/json' \
+  -H "X-QT-Live-Token: $QT_LIVE_ARM_TOKEN" \
+  -d '{"instrument":"CRUDEOIL","action":"adopt_position","note":"broker shows 2 lots @ 10.50"}'
+# other actions: "confirm_flat"  |  "clear_pending" with "which":"entry"|"exit"
+```
+Files (in the `backend-data` volume): `live_orders.json` (current state),
+`order_events.jsonl` (audit log), `order_events.pg_cursor` (mirror progress).
+If `live_orders.json` is unreadable, live entries stay blocked. Move the file
+aside only after reconciling with the broker.

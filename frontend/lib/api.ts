@@ -5,20 +5,73 @@ export const API_BASE =
 export const WS_BASE =
   process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8000";
 
-// Live-arming token (QT_LIVE_ARM_TOKEN on the backend). Kept in this browser's
-// localStorage under "qt_live_token"; sent only on order / arming calls.
-function liveHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (typeof window !== "undefined") {
-    const t = window.localStorage.getItem("qt_live_token");
-    if (t) h["X-QT-Live-Token"] = t;
+// Live-arm token (X-QT-Live-Token). Held in memory only: never written to
+// localStorage/sessionStorage/cookies, never put in a URL, never logged. It is
+// gone after a page reload by design. Sent only on order / arming calls.
+let liveToken: string | null = null;
+
+export function setLiveToken(token: string | null) {
+  liveToken = token && token.trim() ? token.trim() : null;
+}
+
+if (typeof window !== "undefined") {
+  // Remove the token an earlier build kept in persistent browser storage.
+  try {
+    window.localStorage.removeItem("qt_live_token");
+  } catch {
+    /* storage unavailable */
   }
+}
+
+function liveHeaders(token?: string): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const t = token ?? liveToken;
+  if (t) h["X-QT-Live-Token"] = t;
   return h;
 }
 
-export async function getKillSwitch() {
-  const res = await fetch(`${API_BASE}/api/kill-switch`);
-  return res.json() as Promise<{ engaged: boolean; reason: string; ts: number | null }>;
+async function errorDetail(res: Response): Promise<string> {
+  try {
+    const j = await res.json();
+    const d = j?.detail ?? j;
+    return typeof d === "string" ? d : JSON.stringify(d);
+  } catch {
+    return res.statusText || "request failed";
+  }
+}
+
+export interface KillSwitchState {
+  engaged: boolean;
+  reason: string;
+  ts: number | null;
+}
+
+export async function getKillSwitch(): Promise<KillSwitchState> {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Kill-switch status failed (${res.status}): ${await errorDetail(res)}`);
+  return res.json();
+}
+
+/** Engage: no token needed — anyone may stop new entries. */
+export async function engageKillSwitch(reason = ""): Promise<KillSwitchState> {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ engaged: true, reason }),
+  });
+  if (!res.ok) throw new Error(`Engage failed (${res.status}): ${await errorDetail(res)}`);
+  return res.json();
+}
+
+/** Release: requires the live-arm token, passed once in a header and not kept. */
+export async function releaseKillSwitch(token: string, reason = ""): Promise<KillSwitchState> {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, {
+    method: "POST",
+    headers: liveHeaders(token),
+    body: JSON.stringify({ engaged: false, reason }),
+  });
+  if (!res.ok) throw new Error(`Release failed (${res.status}): ${await errorDetail(res)}`);
+  return res.json();
 }
 
 export async function setKillSwitch(engaged: boolean, reason = "") {
