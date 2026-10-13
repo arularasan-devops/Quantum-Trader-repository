@@ -774,6 +774,7 @@ class AppState:
         snap_ind.news_bull_pct = news_session["bull_pct"]
         snap_ind.news_bear_pct = news_session["bear_pct"]
         market_status = eng.classify_market(snap_ind, high_impact is not None)
+        self._last_market_status = str(getattr(market_status, "value", market_status) or "")
 
         # update open position marks
         in_pos = bool(self.position.option_symbol)
@@ -1738,6 +1739,26 @@ class AppState:
                 reason="confidence below the auto-entry floor",
             )
             return
+        if settings.auto_trade_strategy_gate:
+            trig = (decision.entry_trigger or "").upper()
+            regime = (getattr(self, "_last_market_status", "") or "").upper()
+            allowed_t = {t.upper() for t in settings.auto_trade_allowed_triggers}
+            allowed_r = {r.upper() for r in settings.auto_trade_allowed_regimes}
+            if trig not in allowed_t or regime not in allowed_r:
+                blocker = "STRATEGY_TRIGGER" if trig not in allowed_t else "STRATEGY_REGIME"
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: strategy needs {'/'.join(sorted(allowed_t))} in "
+                    f"{'/'.join(sorted(allowed_r))} (got {trig or 'none'} in {regime or 'unknown'})"
+                )
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "SIGNAL", blocker, instrument=self._instrument, option=opt,
+                    value=f"{trig or 'none'}/{regime or 'unknown'}",
+                    threshold=f"{sorted(allowed_t)}/{sorted(allowed_r)}",
+                    where="state.py:_auto_trade",
+                    reason="not a pullback entry in a trending market",
+                )
+                return
         # Confidence CEILING (default 100 = off). Measured three sessions running,
         # the score inverts at the top end: 13 Aug, >=95% produced 8 trades, 2
         # wins, -Rs10,712, while <80% lost a tenth of that. The knob exists so
