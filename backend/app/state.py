@@ -1425,8 +1425,7 @@ class AppState:
         # Stabilise the recommendation so it is concrete/actionable, not flickering.
         decision = self._stabilize(raw_decision, in_pos, now)
         self._annotate_averaging(decision, in_pos)
-        if not in_pos:
-            self._block_closed_market(decision, now)
+        self._block_closed_market(decision, now, in_pos)
 
         # Risk Management v2 (feature-flagged, reversible): refine the premium stop
         # with a Greeks-aware model and run the Pre-Trade Validator. Runs AFTER the
@@ -1918,15 +1917,19 @@ class AppState:
         self._mark_plan(c, now)
         return c
 
-    def _block_closed_market(self, c: Decision, now: float) -> None:
-        """A real feed keeps streaming frozen quotes after the bell; never turn
-        them into a fresh BUY (or an auto-entry) outside exchange hours."""
+    def _session_open(self, now: float) -> tuple[bool, str]:
         if settings.hours_ignored():
-            return
-        is_open, note = settings.market_session(now, get_spec(self._instrument).exchange)
+            return True, ""
+        return settings.market_session(now, get_spec(self._instrument).exchange)
+
+    def _block_closed_market(self, c: Decision, now: float, in_pos: bool) -> None:
+        """A real feed keeps streaming frozen quotes after the bell; never turn
+        them into a fresh BUY (or an auto-entry) outside exchange hours. A held
+        position keeps its own HOLD/EXIT signal; only the market BUY is dropped."""
+        is_open, note = self._session_open(now)
         if is_open or not (c.signal == Signal.BUY or c.market_signal == Signal.BUY):
             return
-        if c.signal == Signal.BUY:
+        if c.signal == Signal.BUY and not in_pos:
             c.signal = Signal.WAIT
         if c.market_signal == Signal.BUY:
             c.market_signal = Signal.WAIT
@@ -3210,6 +3213,7 @@ class AppState:
             and z.lots
             and not in_pos
             and self._z2h_last_key != z.option_symbol
+            and self._session_open(now)[0]
         ):
             live = self._auto_live_armed()
             if not (self.is_live and not settings.auto_trade_allow_live):
