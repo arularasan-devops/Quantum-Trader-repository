@@ -29,12 +29,15 @@ export default function BuySignalsPanel() {
   const [rows, setRows] = useState<SignalRow[]>([]);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const pageSize = 100;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
 
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
-        const r = await fetch(`${API_BASE}/api/journal/v2/signals?signal=BUY&page_size=200`);
+        const r = await fetch(`${API_BASE}/api/journal/v2/signals?signal=BUY&page=${page}&page_size=${pageSize}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();
         if (!alive) return;
@@ -51,17 +54,22 @@ export default function BuySignalsPanel() {
       alive = false;
       clearInterval(id);
     };
-  }, []);
+  }, [page]);
 
   return (
-    <section style={{ marginTop: 24 }}>
+    <section style={{ marginTop: 24, flexShrink: 0, maxHeight: "45vh", display: "flex", flexDirection: "column" }}>
       <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>
         Buy signals ({total}) · strategy: PULLBACK in TRENDING
-        <a href={`${API_BASE}/api/journal/v2/signals?signal=BUY&page_size=500`}
-           style={{ marginLeft: 12, fontSize: 12 }} target="_blank" rel="noreferrer">JSON</a>
+        <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}
+                style={{ marginLeft: 12, fontSize: 12 }}>Prev</button>
+        <span style={{ margin: "0 6px", fontSize: 12 }}>page {page}/{pages}</span>
+        <button onClick={() => setPage((p) => Math.min(pages, p + 1))} disabled={page >= pages}
+                style={{ fontSize: 12 }}>Next</button>
+        <a href={`${API_BASE}/api/journal/v2/trades.csv`}
+           style={{ marginLeft: 12, fontSize: 12 }} target="_blank" rel="noreferrer">Trades CSV</a>
       </h3>
       {error && <div style={{ color: "#ef4444", fontSize: 12 }}>Signals unavailable: {error}</div>}
-      <div style={{ overflowX: "auto" }}>
+      <div style={{ overflow: "auto", minHeight: 0, flex: 1 }}>
         <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ textAlign: "left", opacity: 0.7 }}>

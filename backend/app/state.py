@@ -2038,7 +2038,14 @@ class AppState:
             if settings.auto_trade_risk_balanced_lots and settings.auto_trade_safe_sizing:
                 cap = max(cap, settings.auto_trade_balanced_max_lots)
             if settings.auto_trade_safe_sizing and decision.current_premium and decision.stop_loss is not None:
-                safe = self.risk.suggested_lots(decision.current_premium, decision.stop_loss, lot_size)
+                # Size against the stop that will actually be applied after fill: a
+                # per-instrument fixed-point stop overrides the decision stop there,
+                # so use whichever is wider to keep a stop-out within the risk budget.
+                sizing_stop = decision.stop_loss
+                fixed_pts = settings.auto_trade_stop_points.get(self._instrument)
+                if fixed_pts and fixed_pts > 0:
+                    sizing_stop = min(sizing_stop, max(0.05, decision.current_premium - float(fixed_pts)))
+                safe = self.risk.suggested_lots(decision.current_premium, sizing_stop, lot_size)
                 lots = max(1, min(cap, safe))
             else:
                 lots = cap
