@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     # --- Risk management / position sizing ---
     # Single strategy-capital source of truth (QT_CAPITAL). Runtime API changes
     # may only lower it; broker balance never raises it (execution/live_control).
-    capital: float = 500000.0            # trading capital used for sizing
+    capital: float = 500000.0            # trading capital used for sizing (₹5L)
     # Shared secret required (X-QT-Live-Token) to arm anything that can reach a
     # broker. Empty = live arming refused. Never commit a real value.
     live_arm_token: str = ""
@@ -146,6 +146,13 @@ class Settings(BaseSettings):
     # is treated as pending (no position opened, no duplicate order).
     order_fill_timeout_sec: float = 5.0
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
+    # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
+    # change the engine's actual quantity (see app/journal/sizing.py).
+    journal_v2_enabled: bool = True
+    sim_starting_capital: float = 500000.0      # QT_SIM_STARTING_CAPITAL
+    sizing_capital_fraction_pct: float = 10.0   # capital-based: % of equity per trade
+    sizing_aggressive_multiplier: float = 2.0   # aggressive = capital-based x this
+    sizing_risk_budget_pct: float = 1.0         # risk-budget: % of equity lost at stop
     # These three are ACCOUNT-WIDE and persisted across restarts (see
     # app/engine/account_risk.py). They used to be per-instrument and in-memory,
     # which made the cap meaningless: measured 13 Aug, the book lost Rs16,834
@@ -166,7 +173,7 @@ class Settings(BaseSettings):
     # it refuses to run whenever trade_mode is 'live'. Safety caps reuse the risk
     # limits above (max_daily_loss, max_trades_per_day, max_consecutive_losses).
     auto_trade_enabled: bool = False
-    auto_trade_min_confidence: float = 90.0   # only auto-buy at/above this %
+    auto_trade_min_confidence: float = 80.0   # only auto-buy at/above this %
     auto_trade_max_lots: int = 1              # hard upper cap on lots per auto entry
     # Multi-instrument concurrency: hold positions in up to N DIFFERENT instruments
     # at once (each instrument still gets one position). New entries are additionally
@@ -178,6 +185,12 @@ class Settings(BaseSettings):
     #  * no-chase: skip when the move looks already-extended / trap-like, using the
     #    engine's own buy-trap probability and premium-health read.
     auto_trade_momentum_entry: bool = False
+    # Strategy gate (trade_journal analysis, 17 Aug-29 Sep paper): only PULLBACK
+    # entries in a TRENDING regime were profitable; every other trigger/regime lost.
+    # Auto-buy fires only when BOTH hold; everything else is recorded as SKIPPED.
+    auto_trade_strategy_gate: bool = True
+    auto_trade_allowed_triggers: list[str] = ["PULLBACK"]
+    auto_trade_allowed_regimes: list[str] = ["TRENDING"]
     auto_trade_no_chase: bool = True
     auto_trade_no_chase_trap_prob: float = 60.0   # skip entry when buy_trap_prob >= this
     # Safe (risk-based) position sizing: size each auto entry from capital and
@@ -193,7 +206,7 @@ class Settings(BaseSettings):
     # risk-based sizer equalise the rupee risk across instruments, still bounded
     # by the capital guard and the ceiling below. Default OFF: it increases
     # position size, so it should be switched on deliberately.
-    auto_trade_risk_balanced_lots: bool = False
+    auto_trade_risk_balanced_lots: bool = True
     auto_trade_balanced_max_lots: int = 10    # hard ceiling when balanced sizing is on
     # Per-instrument overrides for capital budget and lots. Keyed by instrument
     # name (e.g. "NIFTY", "CRUDEOIL"). When an instrument has an entry here it

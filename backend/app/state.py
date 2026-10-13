@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from app import notify
 from app import storage
+from app.journal import hooks as journal_hooks
 from app.analysis import analyst
 from app.analysis import events as events_mod
 from app.analysis import exec_funnel
@@ -626,6 +627,7 @@ class AppState:
         self._entry_context = self._capture_context(entry)
         mode = "LIVE" if self.is_live else "paper"
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
+        journal_hooks.on_entry(self, q, lots, entry, manual)
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
                            lots=lots, fill_premium=entry, order_id=order_id, message="Entered",
                            status="FILLED", filled_lots=lots)
@@ -1235,6 +1237,7 @@ class AppState:
             ctx.update(books)
         self._pending_exit_reason = None
         self.journal.append(trade_row)
+        journal_hooks.on_exit(self, trade_row, partial, lots)
         # Phase 23 — attach this closed trade to the hurdle-shadow row that
         # recorded the opportunity, so the three arms are scored on the engine's
         # own outcome rather than a simulated path. Record only.
@@ -1361,6 +1364,7 @@ class AppState:
         snap_ind.news_bull_pct = news_session["bull_pct"]
         snap_ind.news_bear_pct = news_session["bear_pct"]
         market_status = eng.classify_market(snap_ind, high_impact is not None)
+        self._last_market_status = str(getattr(market_status, "value", market_status) or "")
 
         # update open position marks
         in_pos = bool(self.position.option_symbol)
@@ -1648,6 +1652,9 @@ class AppState:
                 float(self.position.entry_premium or 0.0),
                 int(self.position.quantity_lots or 0), now=now,
             )
+
+        # Journal v2 (record only): session, signal outcome, stop/target changes.
+        journal_hooks.after_tick(self, decision, chain, was_in_pos, now)
 
         # Phase 23 — the break-even hurdle shadow. It runs AFTER the auto-trader
         # has decided, records this BUY opportunity with the measured book, and
@@ -2322,6 +2329,26 @@ class AppState:
                 reason="confidence below the auto-entry floor",
             )
             return
+        if settings.auto_trade_strategy_gate:
+            trig = (decision.entry_trigger or "").upper()
+            regime = (getattr(self, "_last_market_status", "") or "").upper()
+            allowed_t = {t.upper() for t in settings.auto_trade_allowed_triggers}
+            allowed_r = {r.upper() for r in settings.auto_trade_allowed_regimes}
+            if trig not in allowed_t or regime not in allowed_r:
+                blocker = "STRATEGY_TRIGGER" if trig not in allowed_t else "STRATEGY_REGIME"
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: strategy needs {'/'.join(sorted(allowed_t))} in "
+                    f"{'/'.join(sorted(allowed_r))} (got {trig or 'none'} in {regime or 'unknown'})"
+                )
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "SIGNAL", blocker, instrument=self._instrument, option=opt,
+                    value=f"{trig or 'none'}/{regime or 'unknown'}",
+                    threshold=f"{sorted(allowed_t)}/{sorted(allowed_r)}",
+                    where="state.py:_auto_trade",
+                    reason="not a pullback entry in a trending market",
+                )
+                return
         # Confidence CEILING (default 100 = off). Measured three sessions running,
         # the score inverts at the top end: 13 Aug, >=95% produced 8 trades, 2
         # wins, -Rs10,712, while <80% lost a tenth of that. The knob exists so
@@ -2601,7 +2628,14 @@ class AppState:
             if settings.auto_trade_risk_balanced_lots and settings.auto_trade_safe_sizing:
                 cap = max(cap, settings.auto_trade_balanced_max_lots)
             if settings.auto_trade_safe_sizing and decision.current_premium and decision.stop_loss is not None:
-                safe = self.risk.suggested_lots(decision.current_premium, decision.stop_loss, lot_size)
+                # Size against the stop that will actually be applied after fill: a
+                # per-instrument fixed-point stop overrides the decision stop there,
+                # so use whichever is wider to keep a stop-out within the risk budget.
+                sizing_stop = decision.stop_loss
+                fixed_pts = settings.auto_trade_stop_points.get(self._instrument)
+                if fixed_pts and fixed_pts > 0:
+                    sizing_stop = min(sizing_stop, max(0.05, decision.current_premium - float(fixed_pts)))
+                safe = self.risk.suggested_lots(decision.current_premium, sizing_stop, lot_size)
                 lots = max(1, min(cap, safe))
             else:
                 lots = cap

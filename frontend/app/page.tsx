@@ -42,6 +42,7 @@ import FlowBoard from "@/components/FlowBoard";
 import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
 import JournalBoard from "@/components/JournalBoard";
+import BuySignalsPanel from "@/components/BuySignalsPanel";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
 import TopMovers from "@/components/TopMovers";
@@ -542,7 +543,10 @@ export default function Page() {
       ) : view === "journal" ? (
         /* Complete trade journal — the full persisted record of every closed
            paper/live trade with reason, confidence, P&L and analyst note. */
-        <JournalBoard />
+        <>
+          <JournalBoard />
+          <BuySignalsPanel />
+        </>
       ) : view === "decision" ? (
         /* Clean, decision-first dashboard: should I trade, which option, entry,
            stop, targets, hold time, risk, opportunity, why. */
