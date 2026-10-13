@@ -1373,7 +1373,8 @@ class Settings(BaseSettings):
         open_min, close_min = oh * 60 + om, ch * 60 + cm
         cur = ist.hour * 60 + ist.minute
         is_day = ist.weekday() in self._parse_days()
-        is_open = is_day and open_min <= cur <= close_min
+        # The close bell is exclusive: 15:30:00 is already shut.
+        is_open = is_day and open_min <= cur < close_min
         if is_open:
             return True, f"Market OPEN · {ist:%a %H:%M} IST"
         if not is_day:

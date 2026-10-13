@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
-from types import SimpleNamespace
 
 from app import state as app_state
 from app.config import settings
@@ -25,8 +24,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
-def at(hh: int, mm: int) -> float:
-    return dt.datetime(2026, 8, 11, hh, mm, tzinfo=IST).timestamp()  # a Tuesday
+def at(hh: int, mm: int, ss: int = 0) -> float:
+    return dt.datetime(2026, 8, 11, hh, mm, ss, tzinfo=IST).timestamp()  # a Tuesday
 
 
 def buy() -> Decision:
@@ -36,7 +35,13 @@ def buy() -> Decision:
 
 cls = next(c for c in vars(app_state).values()
            if isinstance(c, type) and hasattr(c, "_block_closed_market"))
-block = cls._block_closed_market
+
+
+def mk(instrument: str):
+    obj = cls.__new__(cls)
+    obj._instrument = instrument
+    return obj
+
 
 prev = (settings.data_provider, settings.ignore_market_hours)
 try:
@@ -44,25 +49,40 @@ try:
     settings.data_provider = "simulated"
     check("simulator keeps the 24/7 demo", settings.hours_ignored() is True)
     d = buy()
-    block(SimpleNamespace(_instrument="NIFTY"), d, at(20, 0))
+    mk("NIFTY")._block_closed_market(d, at(20, 0), False)
     check("simulator BUY untouched after hours", d.signal == Signal.BUY)
 
     settings.data_provider = "angelone"
     check("angelone ignores QT_IGNORE_MARKET_HOURS", settings.hours_ignored() is False)
     d = buy()
-    block(SimpleNamespace(_instrument="NIFTY"), d, at(20, 0))
+    mk("NIFTY")._block_closed_market(d, at(20, 0), False)
     check("NSE BUY after 15:30 becomes WAIT",
           d.signal == Signal.WAIT and d.market_signal == Signal.WAIT, d.reasons[0])
     check("reason names the closed market", "CLOSED" in d.reasons[0])
     d = buy()
-    block(SimpleNamespace(_instrument="NIFTY"), d, at(11, 0))
+    mk("NIFTY")._block_closed_market(d, at(11, 0), False)
     check("NSE BUY in session untouched", d.signal == Signal.BUY)
     d = buy()
-    block(SimpleNamespace(_instrument="CRUDEOIL"), d, at(20, 0))
+    mk("CRUDEOIL")._block_closed_market(d, at(20, 0), False)
     check("MCX BUY at 20:00 untouched (MCX open to 23:30)", d.signal == Signal.BUY)
     d = buy()
-    block(SimpleNamespace(_instrument="CRUDEOIL"), d, at(23, 45))
+    mk("CRUDEOIL")._block_closed_market(d, at(23, 45), False)
     check("MCX BUY after 23:30 becomes WAIT", d.signal == Signal.WAIT)
+    d = buy()
+    mk("NIFTY")._block_closed_market(d, at(15, 30, 40), False)
+    check("NSE BUY during the 15:30 bell minute becomes WAIT", d.signal == Signal.WAIT)
+    d = buy()
+    mk("NIFTY")._block_closed_market(d, at(15, 29, 59), False)
+    check("NSE BUY at 15:29:59 untouched", d.signal == Signal.BUY)
+    d = buy()
+    d.signal = Signal.HOLD
+    mk("NIFTY")._block_closed_market(d, at(16, 0), True)
+    check("held position keeps HOLD, market BUY dropped after close",
+          d.signal == Signal.HOLD and d.market_signal == Signal.WAIT)
+    check("expiry sleeve entry gate shut after NSE close",
+          mk("NIFTY")._session_open(at(16, 0))[0] is False)
+    check("expiry sleeve entry gate open in session",
+          mk("NIFTY")._session_open(at(11, 0))[0] is True)
 finally:
     settings.data_provider, settings.ignore_market_hours = prev
 
