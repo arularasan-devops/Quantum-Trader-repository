@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 COPY --chown=appuser:appgroup app/ ./app/
 # Pre-create the data dir so a mounted named volume inherits appuser ownership.
-RUN mkdir -p /app/data && chown appuser:appgroup /app/data
+# The SmartAPI SDK writes its own logs to ./logs (relative to /app) on login.
+RUN mkdir -p /app/data /app/logs && chown appuser:appgroup /app/data /app/logs
 USER appuser
 
 EXPOSE 8000

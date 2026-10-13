@@ -740,7 +740,8 @@ def _login_with(creds: dict) -> object:
         from SmartApi import SmartConnect
     except ImportError as exc:  # pragma: no cover - depends on optional dep
         raise RuntimeError(
-            "Angel One SDK not installed. Run: pip install smartapi-python pyotp"
+            f"Angel One SDK not importable ({exc}). Install backend/requirements.txt "
+            "(smartapi-python, pyotp, logzero, websocket-client)."
         ) from exc
 
     smart = SmartConnect(api_key=creds["key"], timeout=_REST_TIMEOUT_SEC)
@@ -805,6 +806,13 @@ class _Shard:
 
 _shards: list[_Shard] | None = None
 _shards_lock = threading.Lock()
+# After every key fails, refuse further login attempts until this time, so
+# per-tick callers don't hammer Angel's login API (risking an account lockout).
+_LOGIN_RETRY_BASE_SEC = 30.0
+_LOGIN_RETRY_MAX_SEC = 300.0
+_login_retry_at = 0.0
+_login_failures = 0
+_login_last_error = ""
 
 
 def _get_shards() -> list[_Shard]:
@@ -813,6 +821,12 @@ def _get_shards() -> list[_Shard]:
     global _shards
     with _shards_lock:
         if _shards is None:
+            global _login_retry_at, _login_failures, _login_last_error
+            if time.time() < _login_retry_at:
+                raise RuntimeError(
+                    f"Angel One login failed for all configured keys "
+                    f"(retry in {int(_login_retry_at - time.time())}s): {_login_last_error}"
+                )
             built: list[_Shard] = []
             creds_list = _credential_sets()
             if not creds_list:
@@ -821,13 +835,29 @@ def _get_shards() -> list[_Shard]:
                     "SMARTAPI_CLIENT_CODE, SMARTAPI_PIN, SMARTAPI_TOTP_SECRET "
                     "(see .env.example)."
                 )
+            errors: list[str] = []
             for i, creds in enumerate(creds_list):
                 try:
                     built.append(_Shard(creds))
                 except Exception as exc:
-                    _log.warning("Angel shard %d login failed, skipping: %s", i + 1, exc)
+                    msg = str(exc)
+                    for secret in creds.values():  # scrub raw credential values
+                        if secret and len(str(secret)) >= 3:
+                            msg = msg.replace(str(secret), "***")
+                    msg = _redact_secrets(msg)
+                    errors.append(f"key {i + 1}: {msg}")
+                    _log.warning("Angel shard %d login failed, skipping: %s", i + 1, msg)
             if not built:
-                raise RuntimeError("Angel One login failed for all configured keys.")
+                _login_failures += 1
+                delay = min(_LOGIN_RETRY_MAX_SEC,
+                            _LOGIN_RETRY_BASE_SEC * 2 ** min(_login_failures - 1, 4))
+                _login_retry_at = time.time() + delay
+                _login_last_error = "; ".join(errors)
+                _log.error("Angel One login failed for all keys; next attempt in %ds", int(delay))
+                raise RuntimeError(
+                    f"Angel One login failed for all configured keys: {_login_last_error}"
+                )
+            _login_failures, _login_retry_at, _login_last_error = 0, 0.0, ""
             _shards = built
         return _shards
 

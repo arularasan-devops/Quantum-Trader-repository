@@ -10,6 +10,9 @@ httpx==0.28.1
 # Live Angel One (SmartAPI) feed — only needed when QT_DATA_PROVIDER=angelone.
 smartapi-python==1.5.5
 pyotp==2.9.0
+# smartapi-python imports these but does not declare them as dependencies.
+logzero==1.7.0
+websocket-client==1.8.0
 
 # Live Groww feed — only needed when QT_ENABLE_GROWW=true (NSE/BSE equity + index
 # options). Angel keeps MCX commodities; Groww offloads the NSE/BSE names onto an
