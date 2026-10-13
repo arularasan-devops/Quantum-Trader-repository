@@ -13,8 +13,6 @@ import sqlite3
 import threading
 import time
 
-from app.analysis import books
-from app.analysis import option_costs
 from app.config import settings
 from app.models import Candle, OptionQuote
 
@@ -23,27 +21,13 @@ from app.models import Candle, OptionQuote
 # the live path while still absorbing a backfill that arrives after a warm-up.
 _FULL_REWRITE_SEC = 300.0
 
-# How long a writer waits for a lock before giving up. Long, because the thing
-# on the other side is a live capture flushing a minute's rows, not a hung query.
-_BUSY_TIMEOUT_SEC = 60.0
-
 
 class HistoryStore:
     def __init__(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._lock = threading.Lock()
         # check_same_thread=False: the tick loop runs in an executor thread.
-        self._db = sqlite3.connect(
-            path, check_same_thread=False, timeout=_BUSY_TIMEOUT_SEC)
-        # WAL and a wait, for the same reason the Phase 35 store needs them: this
-        # store is opened at import time, so ANY second process that imports the
-        # app — a CLI, a smoke run — raced the running app for it and died on
-        # ``database is locked`` before its first line of work. On the default
-        # rollback journal that is not a timeout, it is an immediate refusal.
-        if path != ":memory:":
-            self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute(
-            f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_SEC * 1000)}")
+        self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute(
             """CREATE TABLE IF NOT EXISTS candles (
                    instrument TEXT NOT NULL,
@@ -210,18 +194,6 @@ class HistoryStore:
             self._db.commit()
         self._last_chain_ts[instrument] = ts
 
-    def last_chain_ts(self, instrument: str) -> int | None:
-        """Timestamp of the newest recorded chain snapshot, or None if this
-        instrument has never had one stored. Read from the table rather than the
-        in-memory throttle map, so it survives a restart and reports what is
-        actually on disk."""
-        with self._lock:
-            row = self._db.execute(
-                "SELECT MAX(ts) FROM chain_snapshots WHERE instrument=?",
-                (instrument,),
-            ).fetchone()
-        return int(row[0]) if row and row[0] is not None else None
-
     def candles(self, instrument: str, limit: int = 600) -> list[Candle]:
         with self._lock:
             rows = self._db.execute(
@@ -313,17 +285,11 @@ class HistoryStore:
             self._db.commit()
 
     def journal(self, *, since: int | None = None, until: int | None = None,
-                limit: int | None = None, exclude_flow: bool = False,
-                only_flow: bool = False) -> list[dict]:
+                limit: int | None = None, exclude_flow: bool = False) -> list[dict]:
         """Return the complete trade journal (all instruments), newest-first,
-        optionally bounded to a [since, until) unix-time window.
-
-        ``exclude_flow`` omits the Flow book so the board shows only real
-        Signal/Auto-Buy trades; ``only_flow`` returns nothing else, which is how
-        Flow stays readable in its own right instead of being deleted. Every row
-        carries a ``book`` either way, so a caller can always see which book a
-        number came from.
-        """
+        optionally bounded to a [since, until) unix-time window. When
+        ``exclude_flow`` is set, Candle-Flow paper legs are omitted so the board
+        shows only real Signal/Auto-Buy trades."""
         clauses = []
         params: list[int] = []
         if since is not None:
@@ -332,17 +298,8 @@ class HistoryStore:
         if until is not None:
             clauses.append("ts < ?")
             params.append(int(until))
-        # SQL narrows on the markers a row can be recognised by before LIMIT is
-        # applied (so the requested number of rows still comes back); the parsed
-        # classification below is authoritative.
         if exclude_flow:
             clauses.append("COALESCE(note, '') NOT LIKE 'Candle-Flow%'")
-            clauses.append("COALESCE(context, '') NOT LIKE '%\"engine\": \"flow\"%'")
-        if only_flow:
-            clauses.append(
-                "(COALESCE(note, '') LIKE 'Candle-Flow%' "
-                "OR COALESCE(context, '') LIKE '%\"engine\": \"flow\"%')"
-            )
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         # ``context`` is pulled only to surface the entry trigger (PULLBACK /
         # REVERSAL / IGNITION / MOMENTUM); the raw JSON stays out of the result
@@ -387,46 +344,8 @@ class HistoryStore:
                 "cost_rupees",
                 "return_on_capital_pct",
                 "lot_size",
-                # Charges itemised at exit, and the recorded book. Absent on
-                # every row written before they existed, which is exactly what
-                # ``cost_model`` below is for.
-                "brokerage",
-                "statutory",
-                "brokerage_per_order",
-                "entry_statutory",
-                "exit_statutory",
-                "cost_status",
-                "entry_bid",
-                "entry_ask",
-                "entry_spread",
-                "entry_spread_pct",
-                "exit_bid",
-                "exit_ask",
-                "exit_spread",
-                "exit_spread_pct",
-                "spread_cost_rupees",
-                "entry_book_quality",
-                "exit_book_quality",
-                "entry_book_age_sec",
-                "exit_book_age_sec",
             ):
                 d[field] = parsed.get(field) if isinstance(parsed, dict) else None
-            # ``total`` inside the context is the charge total; named here so it
-            # cannot be read as the trade total.
-            d["total_costs"] = parsed.get("total") if isinstance(parsed, dict) else None
-            # A row that does not name its cost model was priced by the old one,
-            # which charged brokerage per LOT: a 39-lot leg carried 40x the true
-            # brokerage, so 34 rows read as losses while the option had risen.
-            # The stored P&L is left exactly as it was written — labelled, not
-            # rewritten, because silently repricing history would destroy the
-            # only record of what the system actually reported at the time.
-            model = parsed.get("cost_model") if isinstance(parsed, dict) else None
-            d["cost_model"] = model or option_costs.COST_MODEL_OLD
-            d["book"] = books.classify(d, d.get("note"), parsed)
-            if exclude_flow and d["book"] == books.FLOW:
-                continue
-            if only_flow and d["book"] != books.FLOW:
-                continue
             out.append(d)
         return out
 

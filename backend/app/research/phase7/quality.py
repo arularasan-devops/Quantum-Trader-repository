@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from app.models import Candle
 
 from .dataset import (
+    IST,
     REAL,
     SIM,
     UNKNOWN,

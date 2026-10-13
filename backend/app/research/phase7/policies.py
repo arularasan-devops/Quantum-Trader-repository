@@ -25,12 +25,7 @@ COST_PER_ROUNDTRIP_OPTIONS = 120.0
 COST_PER_ROUNDTRIP_FUTURES = 1200.0
 
 ENTRY_POLICIES = ("CONTROL", "PULLBACK", "VWAP_RETEST", "EMA9_RETEST",
-                  "EMA20_RETEST", "PREV_MID", "BREAKOUT_RETEST", "ENTRY_QUALITY",
-                  "SWING_RETEST", "FVG_RETEST", "NEXT_CANDLE_CONFIRM")
-# NEXT_CANDLE_CONFIRM waits for the next bar to confirm the setup instead of
-# waiting for a cheaper price, so it can pay MORE than the signal price. It is
-# scored on the same footing as the retests precisely so that cost is visible.
-CONFIRMATION_POLICIES = ("NEXT_CANDLE_CONFIRM",)
+                  "EMA20_RETEST", "PREV_MID", "BREAKOUT_RETEST", "ENTRY_QUALITY")
 EXIT_POLICIES = ("A_BASELINE", "B_FIXED_2PCT", "B_FIXED_3PCT", "B_FIXED_5PCT",
                  "B_FIXED_7PCT", "C_TRAIL_30", "C_TRAIL_50", "D_MOMENTUM_FAIL",
                  "E_TIMEOUT_10", "E_STAGNATION", "F_HYBRID_HALF")
@@ -77,17 +72,10 @@ def _entry_trigger(ev: BuyEvent, name: str) -> float | None:
         return ev.entry - 0.2 * max(0.01, ev.entry - ev.stop)
     if name == "ENTRY_QUALITY":
         return ev.entry - 0.1 * max(0.01, ev.entry - ev.stop)
-    if name == "SWING_RETEST":
-        level = ev.swing_low if ev.side == "CE" else ev.swing_high
-    elif name == "FVG_RETEST":
-        level = ev.fvg_bull if ev.side == "CE" else ev.fvg_bear
-    else:
-        level = {"VWAP_RETEST": ev.vwap, "EMA9_RETEST": ev.ema9,
-                 "EMA20_RETEST": ev.ema20, "PREV_MID": ev.prev_mid,
-                 "BREAKOUT_RETEST": ev.breakout_level}.get(name)
-    if not level:
-        # No such level in the window (no swing pivot yet, no unfilled gap): the
-        # policy declines rather than aiming at a substitute level.
+    level = {"VWAP_RETEST": ev.vwap, "EMA9_RETEST": ev.ema9,
+             "EMA20_RETEST": ev.ema20, "PREV_MID": ev.prev_mid,
+             "BREAKOUT_RETEST": ev.breakout_level}.get(name)
+    if level is None:
         return None
     move = ev.spot - level if ev.side == "CE" else level - ev.spot
     if move <= 0:
@@ -110,14 +98,6 @@ def apply_entry(ev: BuyEvent, name: str) -> tuple[bool, float, int, int]:
         return False, 0.0, 0, 0
     if name == "CONTROL":
         return True, ev.entry, ev.ts, 0
-    if name == "NEXT_CANDLE_CONFIRM":
-        # The post's rule for reversal candles: take the setup only if the next
-        # bar confirms it. Reads one quote after the signal and pays that quote —
-        # no lookahead, and no cheaper price assumed.
-        ts, px = path.quotes[0]
-        if px <= ev.entry:
-            return False, 0.0, 0, 0
-        return True, px, ts, 1
     limit = _entry_trigger(ev, name)
     if limit is None:
         return False, 0.0, 0, 0
@@ -270,40 +250,10 @@ def median(xs: list[float]) -> float | None:
     return round(ys[mid] if len(ys) % 2 else (ys[mid - 1] + ys[mid]) / 2.0, 3)
 
 
-def opportunity_cost(events: list[BuyEvent], fills: list[Fill],
-                     exit_policy: str = "A_BASELINE") -> dict:
-    """Part 4 — what one entry policy gave up on the signals it declined.
-
-    A policy that waits looks better on the trades it filled and pays nothing for
-    the ones it never entered, so every declined signal is charged here at what
-    the immediate entry actually made and the excursion it actually reached.
-    """
-    declined = [ev for ev, f in zip(events, fills) if not f.entered]
-    control = [simulate(ev, "CONTROL", exit_policy) for ev in declined]
-    taken = [f for f in control if f.entered]
-    rs = [f.r for f in taken]
-    return {
-        "declined": len(declined),
-        "declined_priceable": len(taken),
-        "missed_winners": sum(1 for r in rs if r > 0),
-        "missed_median_mfe_r": median([f.mfe_r for f in taken]),
-        "control_expectancy_on_declined_r": (
-            round(sum(rs) / len(rs), 3) if rs else None),
-        "note": ("the declined signals priced as the immediate entry would have "
-                 "experienced them; a positive control expectancy here is the "
-                 "cost of the policy's patience, not a saving"),
-    }
-
-
 def entry_study(events: list[BuyEvent], exit_policy: str = "A_BASELINE") -> dict:
-    study: dict[str, dict] = {}
-    for name in ENTRY_POLICIES:
-        fills = [simulate(ev, name, exit_policy) for ev in events]
-        block = summarise(fills, len(events))
-        block["opportunity_cost"] = opportunity_cost(events, fills, exit_policy)
-        block["pays_up_for_confirmation"] = name in CONFIRMATION_POLICIES
-        study[name] = block
-    return study
+    return {name: summarise([simulate(ev, name, exit_policy) for ev in events],
+                            len(events))
+            for name in ENTRY_POLICIES}
 
 
 def exit_study(events: list[BuyEvent], entry_policy: str = "CONTROL") -> dict:

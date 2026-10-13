@@ -13,28 +13,15 @@ from datetime import datetime, timezone
 
 from app import notify
 from app import storage
-from app.journal import hooks as journal_hooks
 from app.analysis import analyst
 from app.analysis import events as events_mod
 from app.analysis import exec_funnel
-from app.analysis import fill_book
-from app.analysis import futures_feed_audit
-from app.analysis import futures_outcomes
 from app.analysis import intelligence as intel
 from app.analysis import news as news_mod
-from app.analysis import option_costs
 from app.analysis import opportunity
 from app.analysis import performance as perf
 from app.analysis import rss_news
-from app.analysis import (
-    futures_signal,
-    missed,
-    shadow_book,
-    signal_journal,
-    signal_tracker,
-    signal_visibility,
-)
-from app.analysis import plan_validity
+from app.analysis import missed, signal_tracker
 from app.analysis import structure as st
 from app.config import settings
 from app.engine import account_risk
@@ -54,7 +41,6 @@ from app.execution import (
     flow,
     flow_tracker,
     futures_paper,
-    manual_guard,
     momentum_outcomes,
     scalp,
     scalp_tracker,
@@ -62,7 +48,6 @@ from app.execution import (
     zero_to_hero,
 )
 from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, universe_specs
-from app.market import tiers
 from app.market.provider import MarketDataProvider, build_provider
 from app.market.tick_quality import feed_quality
 from app.models import (
@@ -74,7 +59,6 @@ from app.models import (
     Decision,
     EventGuard,
     FeedHealth,
-    FuturesSignalCard,
     IndicatorSnapshot,
     Intelligence,
     InstrumentOption,
@@ -89,22 +73,12 @@ from app.models import (
     ZeroToHero,
 )
 from app.research import capture as research_capture
-from app.research.pairs import capture as pair_capture
-from app.research.phase17 import service as phase17
-from app.research.phase18 import service as phase18
-from app.research.phase19 import service as phase19
-from app.research.phase22 import service as phase22
-from app.research.phase23 import service as phase23
 
 
 # How many trailing bars are re-offered to the history store on every pass. 60
 # one-minute bars covers any realistic gap between two scans of the same
 # instrument, including a scan cycle that has fallen well behind its interval.
 _CANDLE_TAIL = 60
-
-# Trailing bars re-offered to the frozen pair capture. Same reasoning as
-# _CANDLE_TAIL, kept separate so changing one never silently changes the other.
-_PAIR_TAIL = 30
 
 
 def _mark_stage(instrument: str, stage: str) -> None:
@@ -182,10 +156,6 @@ class AppState:
         self._last_status: MarketStatus | None = None
         self._last_indicators: IndicatorSnapshot | None = None
         self._entry_context: dict = {}
-        # Top-of-book at entry and the latest one seen while the leg is open, so
-        # the closed row can carry a real spread instead of an assumed one.
-        self._entry_book: dict | None = None
-        self._exit_book: dict | None = None
         # --- Early Momentum leg tracking (advisory) ---
         # Anchors the current directional leg (swing low/high) and remembers the
         # premium at which the Early Momentum engine FIRST flagged it, so the
@@ -213,14 +183,6 @@ class AppState:
         self._committed_at: float = 0.0
         self._pending_signal: Signal | None = None
         self._pending_since: float = 0.0
-        # When the committed levels were last computed, and which version of
-        # them is on screen. The signal is held across ticks; the plan is not
-        # allowed to silently outlive the premium it was built from.
-        self._plan_at: float = 0.0
-        self._futures_signal: FuturesSignalCard | None = None
-        self._plan_version: int = 1
-        # dedup key so one suppressed plan writes ONE funnel row, not one a tick
-        self._plan_block_key: str | None = None
         self._alert_seen: dict[str, int] = {}
         # --- shadow mode (Phase 2): observe the frozen engine live, place NO
         # orders, and score each recommendation against the actual later move ---
@@ -278,22 +240,6 @@ class AppState:
         self._providers[instrument] = provider
         return provider
 
-    def _feed_ready(self) -> bool:
-        """Whether the prices behind the current plan are current enough to act on.
-
-        Read from the same freshness the board shows. A REAL feed that has never
-        reported an age is treated as not ready, because "unknown age" is what a
-        warming feed looks like — and the two entries taken in that state had no
-        market data behind them at all. A simulated feed has no age to report and
-        cannot be stale, since it generates the price it is asked for.
-        """
-        health = self._feed_health()
-        ages = [a for a in (health.underlying_age_sec, health.option_age_sec)
-                if isinstance(a, (int, float))]
-        if not ages:
-            return health.mode == "simulated"
-        return max(ages) <= float(health.stale_after_sec)
-
     def _feed_health(self) -> FeedHealth:
         """Freshness of the prices behind this snapshot.
 
@@ -326,9 +272,6 @@ class AppState:
             # reset the stabilised signal so the new instrument starts clean
             self._committed = None
             self._pending_signal = None
-            self._plan_at = 0.0
-            self._plan_version = 1
-            self._plan_block_key = None
         return name
 
     # ---------- trading properties ----------
@@ -459,26 +402,11 @@ class AppState:
         }
 
     # ---------- trading actions (the user only buys / sells) ----------
-    def buy(self, option_symbol: str, lots: int = 1, confirm: bool = False,
-            manual: bool = True) -> OrderResult:
+    def buy(self, option_symbol: str, lots: int = 1, confirm: bool = False) -> OrderResult:
         chain = self.provider.option_chain()
         q = next((x for x in chain if x.symbol == option_symbol), None)
         if q is None:
             raise ValueError(f"Unknown option {option_symbol}")
-
-        # A hand-placed entry is checked against the engine's own verdict before
-        # anything else. ``manual=False`` is the auto path, which already passed
-        # the gates that produced the call it is acting on.
-        if manual:
-            refused = manual_guard.refusal(self._last_decision, self._feed_ready())
-            if refused:
-                self._add_alert("MANUAL_REFUSED", f"Entry refused: {refused}",
-                                "warning")
-                return OrderResult(
-                    ok=False, mode="live" if self.is_live else "paper",
-                    side="BUY", option_symbol=q.symbol, lots=lots,
-                    message=refused,
-                )
 
         can, reason = self.risk.can_open(time.time())
         if not can:
@@ -511,11 +439,6 @@ class AppState:
             trough_premium=entry,
         )
         self._entry_time = int(time.time())
-        # Top-of-book at the fill, when the feed carried one. Recorded, never
-        # modelled: an unrecorded spread is what let a 5-minute round trip look
-        # profitable on paper.
-        self._entry_book = fill_book.book(q.bid, q.ask, self._entry_time)
-        self._exit_book = None
         self.risk.record_entry()
         # capture the factors driving this entry so the learner can score them on exit
         otype = q.option_type
@@ -524,7 +447,6 @@ class AppState:
         self._entry_context = self._capture_context(entry)
         mode = "LIVE" if self.is_live else "paper"
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
-        journal_hooks.on_entry(self, q, lots, entry, manual)
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
                            lots=lots, fill_premium=entry, order_id=order_id, message="Entered")
 
@@ -622,20 +544,6 @@ class AppState:
         trade_row["return_on_capital_pct"] = (
             round(pnl / premium_paid * 100.0, 2) if premium_paid > 0 else None
         )
-        # Charges itemised on the row: brokerage is per ORDER, so the columns can
-        # be checked against a contract note instead of being taken on trust.
-        exit_prem = self.position.current_premium
-        charges_now = option_costs.charges(
-            entry_prem, exit_prem, spec_now.lot_size * lots
-        )
-        trade_row.update(charges_now.as_dict())
-        # Top-of-book at both ends, or COST_STATUS UNKNOWN. Never a modelled
-        # spread on a trade record.
-        books = fill_book.fill_record(
-            self._entry_book, self._exit_book, spec_now.lot_size * lots,
-            entry_ts=entry_time, exit_ts=trade_row["time"],
-        )
-        trade_row.update(books)
         if isinstance(ctx, dict):
             ctx.update(
                 {
@@ -646,18 +554,8 @@ class AppState:
                     "lot_size": spec_now.lot_size,
                 }
             )
-            ctx.update(charges_now.as_dict())
-            ctx.update(books)
         self._pending_exit_reason = None
         self.journal.append(trade_row)
-        journal_hooks.on_exit(self, trade_row, partial, lots)
-        # Phase 23 — attach this closed trade to the hurdle-shadow row that
-        # recorded the opportunity, so the three arms are scored on the engine's
-        # own outcome rather than a simulated path. Record only.
-        try:
-            phase23.resolve(self._instrument, trade_row)
-        except Exception:
-            pass
         # Durable, cross-instrument record for the Account tab + monthly reports
         # (the in-memory journal is lost on restart).
         try:
@@ -774,7 +672,6 @@ class AppState:
         snap_ind.news_bull_pct = news_session["bull_pct"]
         snap_ind.news_bear_pct = news_session["bear_pct"]
         market_status = eng.classify_market(snap_ind, high_impact is not None)
-        self._last_market_status = str(getattr(market_status, "value", market_status) or "")
 
         # update open position marks
         in_pos = bool(self.position.option_symbol)
@@ -783,7 +680,7 @@ class AppState:
             q = next((x for x in chain if x.symbol == self.position.option_symbol), None)
             if q is not None:
                 pos_type = q.option_type
-                self._mark_position(q.premium, q)
+                self._mark_position(q.premium)
 
         _mark_stage(self._instrument, "process")
         raw_decision, breakdown = eng.decide(
@@ -795,14 +692,6 @@ class AppState:
         self._last_breakdown = breakdown
         _mark_stage(self._instrument, "decision")
 
-        # Which tier this instrument is in decides whether the EXPENSIVE capture
-        # runs — chain snapshots and research snapshots, the two costs that
-        # starved the feed. Candles are always stored. An open position is always
-        # captured regardless of tier: a held trade must never lose its history
-        # because of a feed-routing setting. With no deep list configured every
-        # instrument is DEEP, so this is a no-op on an unconfigured install.
-        deep_capture = tiers.is_deep(self._instrument) or bool(in_pos)
-
         # persist real captured history for the backtest / self-learning
         if settings.store_history and candles:
             # The recent TAIL, not just the newest bar: an instrument is only
@@ -810,8 +699,7 @@ class AppState:
             # lost every minute in between (38% of Crude's one-minute history in
             # the recorded session). Re-writing an already-stored bar is a no-op.
             storage.store.record_candles(self._instrument, candles[-_CANDLE_TAIL:])
-            if deep_capture:
-                storage.store.record_chain(self._instrument, now, chain)
+            storage.store.record_chain(self._instrument, now, chain)
 
         # Auto-capture each COMPLETED bar (futures + option chain) into the
         # research store so the backtest/analytics run on REAL history with no
@@ -820,7 +708,7 @@ class AppState:
         # record a bar once (when it finalises). Paper mode is fine — this only
         # records data, it never places an order.
         real_feed = settings.data_provider.lower() not in ("simulated", "sim", "demo")
-        if settings.research_autocapture and real_feed and deep_capture and len(candles) >= 2:
+        if settings.research_autocapture and real_feed and len(candles) >= 2:
             completed = candles[-2]
             ts = int(completed.time)
             if ts != self._last_capture_ts:
@@ -916,50 +804,6 @@ class AppState:
                 int(now),
             )
 
-        # FUTURES research signal (Phase 11A ext., Part 23) — its own vehicle,
-        # its own validation, its own dashboard card. RESEARCH ONLY: it is not an
-        # option signal with the strike removed, it never replaces the option
-        # call, and it has no order route of any kind. Published for comparison
-        # against the option plan on the same market event.
-        # Phase 12A §1-§3: the futures plan reads the FRESHEST series — REST
-        # history extended by the ticks already on the socket — and its age comes
-        # from that series. The production option engine keeps reading ``candles``
-        # above, unchanged, so no BUY is computed from anything new. The 90s
-        # freshness refusal inside futures_signal is untouched.
-        fut_candles = self.provider.futures_candles_live(300) or candles
-        fut_trace = self.provider.futures_feed_trace()
-        futures_feed_audit.observe(self._instrument, fut_trace, now)
-        self._futures_signal = futures_signal.evaluate(
-            self._instrument,
-            fut_candles,
-            price,
-            snap_ind,
-            market_status,
-            contract=self.provider.futures_contract(),
-            chain=self.provider.futures_contract_chain(),
-            feed_age_sec=(now - fut_candles[-1].time) if fut_candles else None,
-            feed_source=str(fut_trace.get("source") or "") or None,
-            minutes_to_close=settings.minutes_to_close(now),
-            now=now,
-        )
-        signal_visibility.observe_futures(self._instrument, self._futures_signal, now)
-        signal_journal.observe_futures(self._instrument, self._futures_signal, now)
-        # Phase 12 §12 — measure what those research plans actually did, in index
-        # points. Observation only: this call cannot place, size for or propose an
-        # order, and the futures paper tool above is a separate module.
-        futures_outcomes.observe(self._instrument, self._futures_signal, price, now)
-        # Phase 19 §6 — the same plan, given a costed paper lifecycle: entry at an
-        # executable side, exit at the opposite one, resolved to T1/T2/T3, stop,
-        # timeout or the close. A second observer of a plan that already exists;
-        # it does not evaluate, change, size or gate the futures signal, has no
-        # order route of any kind, and swallows its own failures.
-        self._observe_phase19_futures(
-            fut_candles[-1].close if fut_candles else price,
-            (now - fut_candles[-1].time) if fut_candles else None,
-            market_status,
-            now,
-        )
-
         # Validation Mode: remember the current decision context so buy() can
         # freeze it at entry (and the performance module can analyse it later).
         self._last_decision = decision
@@ -969,72 +813,9 @@ class AppState:
         if settings.shadow_mode:
             self._shadow_step(now, price, decision)
 
-        # Signal identity + visibility (Phase 11A ext.). Runs after every layer
-        # that can still change the decision, so the ids and the recorded stages
-        # describe the call that is actually published. It stamps
-        # global_signal_id/episode_id onto the decision and records generation,
-        # classification, the plan, plan validation and publication — so a call
-        # that never reaches the dashboard has a stage and a reason instead of
-        # simply being absent. Measurement only.
-        signal_visibility.observe_option(
-            self._instrument, decision, signal_journal.board_key(decision), now
-        )
-
         # Observe + log the frozen engine's BUY signals and resolve them against
         # real option prices (Target / Stop). Pure observability — no orders.
         signal_tracker.observe(self._instrument, decision, chain, now)
-
-        # Signal Board Journal — write down what the board actually said on this
-        # tick (BUY, WAIT or NO_TRADE), with the market state and gate trace it
-        # was computed on, then follow each recorded BUY to a resolution.
-        # Measurement only: it runs after the decision exists, it writes files
-        # nothing in the trading path reads, and it places no order.
-        exp_iso, mins_to_exp = self._expiry_context(now)
-        # §15 — the same labels, on the card. Display only: it runs after the
-        # decision is final and nothing downstream reads what it writes.
-        signal_journal.attach_badges(
-            self._instrument, decision, chain, snap_ind, price, now
-        )
-        signal_journal.observe(
-            self._instrument, decision, chain, snap_ind, price, market_status,
-            candles, now, expiry=exp_iso, minutes_to_expiry=mins_to_exp,
-        )
-
-        # Phase 17 vehicle evidence. Runs on the SAME chain object the decision
-        # was computed on, at the decision instant, which is the whole point: the
-        # previous attempt polled separately and matched 48 of 3,448 legs. It
-        # returns an id nothing here reads, it places no order, and it swallows
-        # its own failures (counted in its health endpoint) so a research bug
-        # cannot break a tick.
-        self._observe_phase17(
-            decision, chain, price, snap_ind, market_status, candles,
-            now, exp_iso, mins_to_exp,
-        )
-
-        # Phase 18 — the closing auction window, 15:10-15:30 IST. A second
-        # observer of the same tick, and nothing more: it is paper-only by
-        # construction, it reads no production field it could change, and the
-        # value it returns is an id kept for logging. Outside the window it does
-        # nothing at all.
-        self._observe_phase18(
-            chain, price, snap_ind, market_status, candles,
-            now, exp_iso, mins_to_exp,
-        )
-
-        # Frozen pair capture. A fourth observer of the same tick, and the only
-        # one whose configuration cannot change: it records this instrument's
-        # futures book at THIS bar, pairs BANKNIFTY with NIFTY only when both
-        # reported the same bar timestamp, and paper-trades the one frozen
-        # relative-value rule. Capture and paper only — no order, no gate, and
-        # its failures stay inside its own health counter.
-        self._observe_pair_capture(candles, price, now)
-
-        # Phase 22 — the CORE A+ PAPER board. A third observer of the same
-        # tick: it grades this decision against the frozen pullback definition,
-        # picks a vehicle only where a two-sided book exists, and keeps a paper
-        # position. It places no order, returns nothing this tick reads and
-        # swallows its own failures into its health endpoint.
-        self._observe_phase22(decision, chain, price, market_status, candles)
 
         # Hold every WAIT to account: follow the leg the engine refused and
         # record what it did, tagged with the gate that refused it. Measurement
@@ -1049,50 +830,8 @@ class AppState:
 
         # Optional: paper auto-trader (simulated fills only; hard-guarded off in
         # live mode). Auto-enters on a BUY >= gate, auto-exits at Target 1 / stop.
-        was_in_pos = in_pos
-        # Inside this block every refusal reported to the execution funnel is
-        # attributed to THIS signal in the lifecycle ledger, so each gate keeps
-        # one definition and one report instead of two that can disagree.
-        with signal_visibility.execution_context(self._instrument, decision):
-            self._auto_trade(decision, in_pos, now)
+        self._auto_trade(decision, in_pos, now)
         in_pos = bool(self.position.option_symbol)
-        if in_pos and not was_in_pos:
-            signal_visibility.mark_filled(
-                self._instrument, decision,
-                float(self.position.entry_premium or 0.0),
-                int(self.position.quantity_lots or 0), now=now,
-            )
-
-        # Journal v2 (record only): session, signal outcome, stop/target changes.
-        journal_hooks.after_tick(self, decision, chain, was_in_pos, now)
-
-        # Phase 23 — the break-even hurdle shadow. It runs AFTER the auto-trader
-        # has decided, records this BUY opportunity with the measured book, and
-        # keeps three parallel arms (live engine, <=5%, <=3%). Record only: it
-        # cannot refuse an order, it changes no gate, and the live auto-buy path
-        # above is untouched.
-        self._observe_phase23(
-            decision, chain, now,
-            engine_bought=bool(in_pos and not was_in_pos),
-            in_position_before=was_in_pos,
-        )
-
-        # Shadow book — the SAME call, taken unconditionally in a separate
-        # ungated paper ledger, with the gate that refused the gated book
-        # recorded beside it. It runs after the gated path has had its turn, so
-        # what it records is what actually happened rather than what would have.
-        # Measurement only: its own capital pot, its own file, no order path, and
-        # nothing in the trading path reads it back.
-        shadow_book.observe(
-            self._instrument, decision, chain, now,
-            gated_taken=bool(
-                in_pos and not was_in_pos
-                and self.position.option_symbol == decision.recommended_option
-            ),
-            gated_in_position=was_in_pos,
-            tick_started=now,
-        )
-        shadow_book.follow(self._instrument, chain, now)
 
         # Optional: zero-to-hero expiry sleeve (speculative, isolated budget).
         # Advisory always; auto-enters a tiny punt only when armed + slot free.
@@ -1230,7 +969,6 @@ class AppState:
             intelligence=intelligence,
             selected_option_candles=sel_candles,
             futures_candles=candles[-240:],
-            futures_signal=self._futures_signal,
         )
 
     # ---------- signal stability ----------
@@ -1265,43 +1003,18 @@ class AppState:
     def _commit(self, raw: Decision, now: float) -> Decision:
         self._committed = raw.model_copy(deep=True)
         self._committed_at = now
-        self._plan_at = now
-        self._plan_version = 1
+        self._pending_signal = None
         return self._decorate(now)
 
     def _refresh(self, raw: Decision, now: float) -> Decision:
         """Signal unchanged: keep the frozen plan (entry/stop/targets/option) but
-        refresh the live premium and lightweight, non-jittery fields.
-
-        Holding the plan is what stops the levels flickering every tick, but the
-        premium underneath it keeps moving: a target committed at 9.7 is not a
-        target once the premium is 13.7. When the held plan can no longer be
-        entered, this adopts the freshly-computed levels for the SAME leg, and if
-        those are unusable too the call is marked stale rather than left on
-        screen as an actionable BUY. Levels are never invented here — they are
-        either the committed ones or this tick's engine output.
-        """
+        refresh the live premium and lightweight, non-jittery fields."""
         c = self._committed
         assert c is not None
         if c.recommended_option:
             q = next((x for x in self.provider.option_chain() if x.symbol == c.recommended_option), None)
             if q is not None:
                 c.current_premium = q.premium
-        if plan_validity.unusable(c.current_premium, c.stop_loss, c.target1) and (
-            c.recommended_option
-            and raw.recommended_option == c.recommended_option
-            and not plan_validity.unusable(raw.current_premium, raw.stop_loss, raw.target1)
-        ):
-            # This tick produced a usable plan for the leg already on screen.
-            c.entry_range = raw.entry_range
-            c.stop_loss = raw.stop_loss
-            c.target1, c.target2, c.target3 = raw.target1, raw.target2, raw.target3
-            c.underlying_stop = raw.underlying_stop
-            c.do_not_buy_above = raw.do_not_buy_above
-            c.emergency_exit = raw.emergency_exit
-            c.expected_holding_minutes = raw.expected_holding_minutes
-            self._plan_at = now
-            self._plan_version += 1
         c.recovery_probability = raw.recovery_probability
         # The position-independent market scan and the reversal/flip hints are
         # re-evaluated every tick, so keep them live even while the main signal
@@ -1323,70 +1036,7 @@ class AppState:
         c.signal_age_seconds = age
         c.locked = True
         c.next_review_seconds = max(0, int(settings.signal_min_hold_seconds - age))
-        self._mark_plan(c, now)
         return c
-
-    def _mark_plan(self, c: Decision, now: float) -> None:
-        """Stamp plan freshness on the decision and suppress an unenterable BUY.
-
-        A held plan whose target is no longer above the live premium (or whose
-        stop is no longer below it) is not a trade. It stays visible with its
-        levels and its reason, but it stops being printed as BUY, and the
-        suppression is recorded in the funnel so the call cannot disappear
-        without an explanation.
-        """
-        c.plan_version = self._plan_version
-        c.plan_age_seconds = max(0, int(now - self._plan_at)) if self._plan_at else 0
-        c.plan_premium = c.current_premium
-        had_levels = c.stop_loss is not None and c.target1 is not None
-        called_buy = c.signal in (Signal.BUY, Signal.HOLD) or c.market_signal == Signal.BUY
-        if not called_buy and not had_levels:
-            # WAIT / AVOID / NO_TRADE: the engine is not offering a trade, so
-            # there is no plan to judge. Say that rather than call it invalid.
-            c.plan_state = "NO_PLAN"
-            c.plan_invalid_reason = None
-            c.plan_actionable = False
-            return
-        why = plan_validity.unusable(c.current_premium, c.stop_loss, c.target1)
-        if why is None:
-            c.plan_state = "REFRESHED" if self._plan_version > 1 else "FRESH"
-            c.plan_invalid_reason = None
-            c.plan_actionable = True
-            return
-        c.plan_invalid_reason = why
-        c.plan_actionable = False
-        # A plan that was usable when committed and is not any more is STALE; one
-        # that never described an enterable trade is INVALID.
-        c.plan_state = "STALE" if self._plan_version > 1 or had_levels else "INVALID"
-        # Only a FRESH entry is suppressed. An open position keeps its own signal
-        # (HOLD/EXIT) and its own managed stop — a premium that has run past the
-        # printed target is normal there and is the exit layer's business.
-        if self.position.option_symbol or not (
-            c.signal == Signal.BUY or c.market_signal == Signal.BUY
-        ):
-            return
-        blocker = "PLAN_STALE" if c.plan_state == "STALE" else "PLAN_INVALID"
-        if c.signal == Signal.BUY:
-            c.signal = Signal.WAIT
-        if c.market_signal == Signal.BUY:
-            c.market_signal = Signal.WAIT
-        c.reasons = [
-            f"WAIT — the printed plan cannot be entered at ₹{c.current_premium} "
-            f"({plan_validity.describe(why)}); not showing this as a BUY",
-            *c.reasons,
-        ][:6]
-        key = f"{c.recommended_option}|{blocker}|{self._plan_version}"
-        if self._plan_block_key != key:
-            self._plan_block_key = key
-            exec_funnel.blocked(
-                stage="VALIDATION", blocker=blocker,
-                instrument=self._instrument, option=c.recommended_option,
-                value=c.current_premium,
-                threshold=(c.target1 if why == plan_validity.NO_UPSIDE
-                           else c.stop_loss),
-                where="state.py:_mark_plan",
-                reason=plan_validity.describe(why),
-            )
 
     def _shadow_step(self, now: int, price: float, decision: Decision) -> None:
         """Log the frozen engine's recommendation (NO order) once per candle and
@@ -1739,26 +1389,6 @@ class AppState:
                 reason="confidence below the auto-entry floor",
             )
             return
-        if settings.auto_trade_strategy_gate:
-            trig = (decision.entry_trigger or "").upper()
-            regime = (getattr(self, "_last_market_status", "") or "").upper()
-            allowed_t = {t.upper() for t in settings.auto_trade_allowed_triggers}
-            allowed_r = {r.upper() for r in settings.auto_trade_allowed_regimes}
-            if trig not in allowed_t or regime not in allowed_r:
-                blocker = "STRATEGY_TRIGGER" if trig not in allowed_t else "STRATEGY_REGIME"
-                self._auto_last_action = (
-                    f"AUTO SKIP {opt}: strategy needs {'/'.join(sorted(allowed_t))} in "
-                    f"{'/'.join(sorted(allowed_r))} (got {trig or 'none'} in {regime or 'unknown'})"
-                )
-                self._auto_last_action_ts = now
-                exec_funnel.blocked(
-                    "SIGNAL", blocker, instrument=self._instrument, option=opt,
-                    value=f"{trig or 'none'}/{regime or 'unknown'}",
-                    threshold=f"{sorted(allowed_t)}/{sorted(allowed_r)}",
-                    where="state.py:_auto_trade",
-                    reason="not a pullback entry in a trending market",
-                )
-                return
         # Confidence CEILING (default 100 = off). Measured three sessions running,
         # the score inverts at the top end: 13 Aug, >=95% produced 8 trades, 2
         # wins, -Rs10,712, while <80% lost a tenth of that. The knob exists so
@@ -2038,14 +1668,7 @@ class AppState:
             if settings.auto_trade_risk_balanced_lots and settings.auto_trade_safe_sizing:
                 cap = max(cap, settings.auto_trade_balanced_max_lots)
             if settings.auto_trade_safe_sizing and decision.current_premium and decision.stop_loss is not None:
-                # Size against the stop that will actually be applied after fill: a
-                # per-instrument fixed-point stop overrides the decision stop there,
-                # so use whichever is wider to keep a stop-out within the risk budget.
-                sizing_stop = decision.stop_loss
-                fixed_pts = settings.auto_trade_stop_points.get(self._instrument)
-                if fixed_pts and fixed_pts > 0:
-                    sizing_stop = min(sizing_stop, max(0.05, decision.current_premium - float(fixed_pts)))
-                safe = self.risk.suggested_lots(decision.current_premium, sizing_stop, lot_size)
+                safe = self.risk.suggested_lots(decision.current_premium, decision.stop_loss, lot_size)
                 lots = max(1, min(cap, safe))
             else:
                 lots = cap
@@ -2125,8 +1748,7 @@ class AppState:
 
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")
-        res = self.buy(decision.recommended_option, lots=lots, confirm=live,
-                       manual=False)
+        res = self.buy(decision.recommended_option, lots=lots, confirm=live)
         self._auto_last_key = key
         if not res.ok:
             exec_funnel.blocked(
@@ -2293,279 +1915,6 @@ class AppState:
             return ist.date() == exp
         return settings.days_to_expiry <= settings.zero_to_hero_expiry_days_fallback
 
-    def _expiry_context(self, now: int) -> tuple[str | None, int | None]:
-        """The nearest expiry date and minutes remaining to it, for the journal.
-
-        The real calendar date when the feed quotes one; otherwise the configured
-        days-to-expiry, with the date left unstated rather than fabricated.
-        """
-        import datetime as _dt
-
-        try:
-            exp = self.provider.nearest_expiry()
-        except Exception:
-            exp = None
-        if exp is None:
-            return None, int(settings.days_to_expiry * 24 * 60)
-        ist = _dt.datetime.utcfromtimestamp(now) + _dt.timedelta(hours=5, minutes=30)
-        # 15:30 IST on the expiry date is the last minute the contract trades.
-        close = _dt.datetime.combine(exp, _dt.time(15, 30))
-        return exp.isoformat(), int((close - ist).total_seconds() // 60)
-
-    # -------------------------------------------------- Phase 17 (research only)
-    def _observe_phase17(
-        self,
-        decision: Decision,
-        chain: list[OptionQuote],
-        price: float | None,
-        snap_ind: IndicatorSnapshot,
-        market_status: str,
-        candles: list[Candle],
-        now: int,
-        expiry_iso: str | None,
-        minutes_to_expiry: int | None,
-    ) -> None:
-        """Hand the decision-instant chain to the Phase 17 evidence layer.
-
-        Deliberately returns nothing. The option age reported by the feed becomes
-        the quote age, so a REST-poll session is recorded as DEGRADED rather than
-        silently presented as an exact match.
-
-        The futures book is read HERE, on the same tick and from the same quote
-        refresh as ``chain``, and handed down with the option legs. That is the
-        whole of Phase 21 §1: the futures leg is only a comparison if it was
-        quoted at the same signal, so it cannot be fetched later by the report.
-        """
-        try:
-            health = self._feed_health()
-            age_ms = (
-                None if health.option_age_sec is None
-                else float(health.option_age_sec) * 1000.0
-            )
-            dte = (
-                None if minutes_to_expiry is None
-                else max(0, int((minutes_to_expiry + 1439) // 1440))
-            )
-            try:
-                futures_book = self.provider.futures_book()
-            except Exception:
-                # A provider that cannot quote its contract leaves the leg
-                # MISSING with a reason; it does not cost the option row.
-                futures_book = None
-            phase17.observe(
-                self._instrument, decision, chain,
-                spot=price, ind=snap_ind, status=market_status,
-                candles=candles, signal_ts=float(now),
-                expiry=expiry_iso, days_to_expiry=dte,
-                source=health.mode, quote_age_ms=age_ms,
-                futures_book=futures_book,
-            )
-        except Exception as exc:  # research must never break a live tick
-            self._capture_error = str(exc)
-
-    # ------------------------------------------- Phase 22 (core setup, paper)
-    def _observe_phase22(
-        self,
-        decision: Decision,
-        chain: list[OptionQuote],
-        price: float | None,
-        market_status: str,
-        candles: list[Candle],
-    ) -> None:
-        """Grade this decision against the frozen Phase 22 setup. Paper only.
-
-        The futures book is read on this same tick, as the Phase 17 hook does,
-        so a futures leg is a comparison at the signal rather than a price
-        fetched later by a report.
-        """
-        try:
-            futures_book = self.provider.futures_book()
-        except Exception:
-            futures_book = None
-        phase22.observe(
-            self._instrument, decision, chain,
-            regime=str(market_status), candles=candles, spot=price,
-            lot_size=get_spec(self._instrument).lot_size,
-            futures_book=futures_book,
-        )
-
-    # ------------------------------------------- frozen pair capture (research)
-    def _observe_pair_capture(self, candles: list, price: float | None,
-                              now: int) -> None:
-        """Record this instrument's futures book for the frozen pair study.
-
-        The book and the near/next contract chain are read HERE, at the instant
-        the series is read, for the same reason Phase 21 reads the futures book
-        on the tick: a price fetched later by a report is not a synchronized
-        observation and cannot answer whether the relationship was executable at
-        the instant.
-
-        The observation is stamped with the LAST CLOSED CANDLE's time, not with
-        wall clock. The two instruments are polled seconds apart, so a wall-clock
-        stamp would never repeat across legs and nothing would ever pair; the bar
-        time is the feed's own clock and is identical on both legs for the same
-        minute. When no candle exists there is no bar to stamp, so nothing is
-        recorded rather than being recorded against a made-up instant.
-
-        The series used is the RESEARCH one (``futures_candles_live``), which is
-        REST history extended by the WebSocket-built tail. The production
-        indicator series is deliberately left alone. This matters for measured
-        cost: when REST history is rate-limited (AB1021) a leg's newest REST bar
-        can be many minutes old, and stamping a book quoted now onto that old
-        bar would be a false synchronization -- while the socket knows the
-        current minute and quotes the book for it, which is a real one.
-        """
-        try:
-            series = self.provider.futures_candles_live(limit=_PAIR_TAIL)
-        except Exception:
-            series = candles
-        bar_ts = int(series[-1].time) if series else None
-        if bar_ts is None:
-            # Passed on rather than dropped: an empty series is itself the
-            # finding (no REST history and no socket tick), and it is the one
-            # cause of thin coverage that leaves no trace in the stored rows.
-            pair_capture.observe_leg(self._instrument, None, price,
-                                     now=time.time())
-            return
-        try:
-            book = self.provider.futures_book()
-        except Exception:
-            book = None
-        try:
-            chain = self.provider.futures_book_chain()
-        except Exception:
-            chain = []
-        # The recent TAIL as well, for the same reason the history store keeps
-        # one: an instrument is re-read only when the scan reaches it and the
-        # REST history is rate-limited, so each leg misses minutes -- and the
-        # two legs miss different ones, which leaves them sharing almost no
-        # timestamps. The tail carries the feed's own closes for those bars;
-        # they are stored without a book, because a spread cannot be recovered
-        # after the instant it was quoted.
-        history = [(int(c.time), float(c.close)) for c in series[-_PAIR_TAIL:-1]]
-        pair_capture.observe_leg(
-            self._instrument, bar_ts, price,
-            futures_book=book, contract_books=chain,
-            history=history, now=time.time(),
-        )
-
-    def capture_pair_leg(self) -> None:
-        """Record this leg for the frozen pair study WITHOUT running the engine.
-
-        The tick is the wrong and only clock the capture had: an instrument is
-        ticked when the scan reaches it, so a leg competing with a large universe
-        for the historical budget is read a handful of times an hour, and a pair
-        needs BOTH legs on the same minute. This entry point reads only what the
-        socket has already pushed (cached quote book, WS-extended candle tail),
-        makes no broker request, and evaluates no signal -- so the two legs can
-        be sampled on a steady cadence without changing when a production
-        decision is computed or which instruments the scanner prioritises.
-        """
-        try:
-            price = self.provider.futures_price()
-        except Exception:
-            price = None
-        self._observe_pair_capture([], price, int(time.time()))
-
-    # ------------------------------------------- Phase 23 (hurdle paper shadow)
-    def _observe_phase23(
-        self,
-        decision: Decision,
-        chain: list[OptionQuote],
-        now: int,
-        *,
-        engine_bought: bool,
-        in_position_before: bool,
-    ) -> None:
-        """Record this auto BUY opportunity with the measured book. Record only.
-
-        Options only — the futures book is deliberately outside this experiment,
-        because its measured hurdle was already negligible and its losses were
-        directional. Failures are swallowed into the Phase 23 health counter: a
-        research row is never worth a live tick.
-        """
-        phase23.observe(
-            self._instrument, decision, chain,
-            lot_size=get_spec(self._instrument).lot_size,
-            lots=int(self.position.quantity_lots or 0) or 1,
-            engine_bought=engine_bought,
-            engine_fill=(float(self.position.entry_premium)
-                         if engine_bought and self.position.entry_premium
-                         else None),
-            in_position_before=in_position_before,
-            now=now,
-        )
-
-    # -------------------------------------------------- Phase 18 (CAS research)
-    def _observe_phase18(
-        self,
-        chain: list[OptionQuote],
-        price: float | None,
-        snap_ind: IndicatorSnapshot,
-        market_status: str,
-        candles: list[Candle],
-        now: int,
-        expiry_iso: str | None,
-        minutes_to_expiry: int | None,
-    ) -> None:
-        """Hand the same decision-instant chain to the CAS evidence layer.
-
-        Separate from :meth:`_observe_phase17` on purpose: CAS is a different
-        regime with its own window, its own scoring and its own paper book, and
-        keeping the two hooks apart means either can be switched off without
-        touching the other. Returns nothing, as the Phase 17 hook does.
-        """
-        try:
-            health = self._feed_health()
-            age_ms = (
-                None if health.option_age_sec is None
-                else float(health.option_age_sec) * 1000.0
-            )
-            dte = (
-                None if minutes_to_expiry is None
-                else max(0, int((minutes_to_expiry + 1439) // 1440))
-            )
-            phase18.observe(
-                self._instrument, chain,
-                spot=price, ind=snap_ind, candles=candles,
-                htf_trend=snap_ind.trend, tick_ts=float(now),
-                expiry=expiry_iso, days_to_expiry=dte,
-                source=health.mode, quote_age_ms=age_ms,
-                market_open=str(market_status).upper() == "OPEN",
-            )
-        except Exception as exc:  # research must never break a live tick
-            self._capture_error = str(exc)
-
-    # ------------------------------------------- Phase 19 (futures paper book)
-    def _observe_phase19_futures(
-        self,
-        fut_price: float | None,
-        feed_age_sec: float | None,
-        market_status: str,
-        now: int,
-    ) -> None:
-        """Step the futures paper book, and flatten it at the close.
-
-        The close matters: without it an open trade would be carried to the next
-        session and resolved against a price it could never have traded at, which
-        is the most flattering error a paper book can make.
-        """
-        try:
-            if str(market_status).upper() != "OPEN":
-                phase19.close_futures_session(
-                    self._instrument, fut_price, now=float(now)
-                )
-                return
-            phase19.observe_futures(
-                self._instrument,
-                self._futures_signal,
-                fut_price,
-                now=float(now),
-                feed_age_sec=feed_age_sec,
-            )
-        except Exception as exc:  # research must never break a live tick
-            self._capture_error = str(exc)
-
     def _z2h_reset_if_new_day(self, now: int) -> None:
         import datetime as _dt
 
@@ -2606,8 +1955,7 @@ class AppState:
         ):
             live = self._auto_live_armed()
             if not (self.is_live and not settings.auto_trade_allow_live):
-                res = self.buy(z.option_symbol, lots=z.lots, confirm=live,
-                               manual=False)
+                res = self.buy(z.option_symbol, lots=z.lots, confirm=live)
                 self._z2h_last_key = z.option_symbol
                 if res.ok:
                     self._z2h_spent_day += (z.cost or 0.0)
@@ -2863,8 +2211,7 @@ class AppState:
         legs to its own file, and records whether the frozen engine later agreed
         on the same side (for comparison). NEVER mutates the frozen engine or any
         other advisory result."""
-        fl = flow.detect(candles, chain, snap_ind, spot, self._flow_state,
-                         instrument=self._instrument)
+        fl = flow.detect(candles, chain, snap_ind, spot, self._flow_state)
 
         frozen_same_side = bool(
             decision.signal == Signal.BUY
@@ -2915,31 +2262,19 @@ class AppState:
                 "only within your risk limit; averaging doubles exposure and is not risk-free."
             )
 
-    def _mark_position(self, premium: float,
-                       quote: OptionQuote | None = None) -> None:
+    def _mark_position(self, premium: float) -> None:
         p = self.position
         p.current_premium = premium
-        if quote is not None:
-            # Latest valid top-of-book behind this mark. The exit row is written
-            # from the last mark, so this is the book at the exit premium.
-            latest = fill_book.book(quote.bid, quote.ask, int(time.time()))
-            if latest is not None:
-                self._exit_book = latest
         # track MFE/MAE excursions (research capture only — never a trade trigger)
         if p.peak_premium is None or premium > p.peak_premium:
             p.peak_premium = premium
         if p.trough_premium is None or premium < p.trough_premium:
             p.trough_premium = premium
         lot_size = get_spec(self._instrument).lot_size
-        qty = lot_size * p.quantity_lots
-        gross = (premium - (p.entry_premium or premium)) * qty
-        ch = option_costs.charges(p.entry_premium, premium, qty)
-        p.brokerage = ch.brokerage
-        p.statutory_charges = ch.statutory
-        p.total_costs = ch.total
-        p.cost_model = ch.model
+        gross = (premium - (p.entry_premium or premium)) * lot_size * p.quantity_lots
+        p.brokerage = settings.brokerage_per_lot * p.quantity_lots * 2
         p.pnl = round(gross, 1)
-        p.net_pnl = round(gross - ch.total, 1)
+        p.net_pnl = round(gross - p.brokerage, 1)
         if p.entry_premium:
             p.pnl_pct = round((premium - p.entry_premium) / p.entry_premium * 100, 2)
         if self._entry_time:

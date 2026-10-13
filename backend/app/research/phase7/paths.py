@@ -20,7 +20,6 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 from app.analysis import indicators as ind_lib
-from app.analysis import structure
 from app.engine.decision import classify_market, compute_indicators, decide
 from app.market.instruments import REGISTRY
 from app.models import Candle, OptionType, Signal
@@ -133,13 +132,6 @@ class BuyEvent:
     breakout_level: float
     chain_age_sec: int | None
     data_flag: str
-    # Retest levels added for the 13A entry comparison. Defaulted so an event
-    # built without them (older smokes, hand-built fixtures) simply declines the
-    # policies that need them.
-    swing_low: float = 0.0
-    swing_high: float = 0.0
-    fvg_bull: float = 0.0
-    fvg_bear: float = 0.0
     path: OptionPath | None = None
     chase: dict = field(default_factory=dict)
 
@@ -170,12 +162,7 @@ def walk(series: ChainSeries, symbol: str, after: int, entry: float, stop: float
     return path
 
 
-def _levels(window: list[Candle]) -> dict[str, float]:
-    """Every retest level an entry policy may aim at, read from the window only.
-
-    A level that does not exist in the window is returned as 0.0 and the policy
-    that wants it declines the signal rather than falling back to another level.
-    """
+def _levels(window: list[Candle]) -> tuple[float, float, float, float, float]:
     closes = [c.close for c in window]
     highs = [c.high for c in window]
     lows = [c.low for c in window]
@@ -186,19 +173,7 @@ def _levels(window: list[Candle]) -> dict[str, float]:
                         np.array(vols)) or closes[-1]
     prev_mid = (window[-2].high + window[-2].low) / 2.0 if len(window) > 1 else closes[-1]
     breakout = max(highs[-20:-1]) if len(highs) > 20 else max(highs[:-1] or highs)
-    swing_highs, swing_lows = structure.swing_points(np.array(highs), np.array(lows))
-    bull, bear = structure.fair_value_gap(np.array(highs), np.array(lows))
-    return {
-        "vwap": float(vwap),
-        "ema9": float(ema9),
-        "ema20": float(ema20),
-        "prev_mid": float(prev_mid),
-        "breakout_level": float(breakout),
-        "swing_low": float(swing_lows[-1][1]) if swing_lows else 0.0,
-        "swing_high": float(swing_highs[-1][1]) if swing_highs else 0.0,
-        "fvg_bull": 0.0 if bull is None else float(bull),
-        "fvg_bear": 0.0 if bear is None else float(bear),
-    }
+    return float(vwap), float(ema9), float(ema20), float(prev_mid), float(breakout)
 
 
 def reconstruct(instrument: str, candles: list[Candle], real: ChainSeries,
@@ -239,7 +214,7 @@ def reconstruct(instrument: str, candles: list[Candle], real: ChainSeries,
         if entry <= 0 or not symbol or dec.stop_loss is None or dec.target1 is None:
             stats["buys_without_leg_quote"] += 1
             continue
-        levels = _levels(ctx)
+        vwap, ema9, ema20, prev_mid, breakout = _levels(ctx)
         strike = 0.0
         leg_delta = 0.0
         leg = snap.get(symbol)
@@ -256,7 +231,8 @@ def reconstruct(instrument: str, candles: list[Candle], real: ChainSeries,
             trade_score=float(dec.trade_score or 0.0),
             regime=status.value if hasattr(status, "value") else str(status),
             atr=float(indi.atr or 0.0), leg_delta=leg_delta,
-            **levels,
+            vwap=vwap, ema9=ema9, ema20=ema20, prev_mid=prev_mid,
+            breakout_level=breakout,
             chain_age_sec=real.age_at(bar.time),
             data_flag=stale_flag(real.age_at(bar.time), 0, fresh_ms),
         )

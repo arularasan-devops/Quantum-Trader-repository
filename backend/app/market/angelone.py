@@ -32,9 +32,7 @@ import time
 import httpx
 
 from app.ai import safety
-from app.analysis import futures_feed_audit
 from app.config import settings
-from app.engine.account_risk import ist_minutes
 from app.market import options
 from app.market.provider import MarketDataProvider
 from app.market.tick_quality import feed_quality
@@ -168,38 +166,6 @@ _WS_MODE_SNAP_QUOTE = 3
 # stale and fall back to REST polling for that tick (self-healing).
 _WS_STALE_SECONDS = 8.0
 
-# The watchdog may only conclude "dead" while some exchange is actually
-# trading. A socket that receives nothing at 05:35 IST is not a broken socket —
-# every exchange is shut — and rebuilding it then re-logs in and re-dials Angel
-# for hours with nothing to receive, which is how the feed gets throttled and
-# the JWT churned before the open. A lead-in is kept so the socket is up and
-# subscribed before the first tick of the session rather than at it.
-_WS_SESSION_LEAD_MIN = 20
-_WS_SESSION_TRAIL_MIN = 10
-
-
-def _exchange_session_live(now: float) -> bool:
-    """True when at least one exchange the stream serves is inside its session.
-
-    Deliberately independent of ``settings.ignore_market_hours``: that flag
-    relaxes the *engine* for the 24/7 simulator, while this is the real
-    exchange clock, and Angel's socket does not care what our demo mode says.
-    """
-    def _mins(raw: str, fallback: int) -> int:
-        try:
-            h, m = (int(x) for x in str(raw).split(":"))
-        except (AttributeError, TypeError, ValueError):
-            return fallback
-        return h * 60 + m
-    # Widest of the equity and MCX windows, so an NFO tick is never missed
-    # because the MCX clock was used, or the reverse.
-    opens = min(_mins(settings.equity_open_ist, 555),
-                _mins(settings.market_open_ist, 540))
-    closes = max(_mins(settings.equity_close_ist, 930),
-                 _mins(settings.market_close_ist, 1410))
-    minute = ist_minutes(now)
-    return (opens - _WS_SESSION_LEAD_MIN) <= minute <= (closes + _WS_SESSION_TRAIL_MIN)
-
 # --- shared, process-wide caches -------------------------------------------
 # The scrip master is a ~15-20 MB JSON listing every tradable contract. It is
 # the same for every instrument, so downloading + parsing it on *each*
@@ -225,22 +191,6 @@ _HIST_JITTER = 0.75        # random spread (s) added to spacing to de-sync shard
 # seconds, which is what stalled the scan (37s per tick, one instrument updating).
 # Beyond this budget a non-blocking fetch defers to a later pass instead.
 _HIST_NONBLOCKING_MAX_WAIT = 0.5
-# Longest a BLOCKING first fetch may spend waiting for its slot inside one tick.
-# This used to be unbounded: reserve() returned the next free slot however far
-# away it was, and the rate-limit cooldown reaches 90s, so a first fetch could
-# sleep the better part of two minutes with the tick loop inside it. The stall
-# witness caught exactly that — CRUDEOIL held the loop for 108.8s and all the
-# other instruments lost those minutes with it. A first fetch that cannot be
-# served inside the budget defers to the next pass; the instrument keeps
-# reporting that it has no candles rather than being handed any.
-_HIST_BLOCKING_BUDGET_SEC = 6.0
-# How many passes an instrument may use the blocking path before it drops to the
-# non-blocking one. The blocking path exists so a *rate-limited* instrument
-# still gets its first batch. An instrument failing for any other reason — a
-# connect timeout to the broker, a token it has no permission for — never
-# acquires the cache that would take it off this path, so without a cap it pays
-# the full budget on every tick for the whole session.
-_HIST_BLOCKING_PASSES = 3
 
 
 class _HistLimiter:
@@ -256,34 +206,6 @@ class _HistLimiter:
         self._last_call = 0.0
         self._cooldown_until = 0.0
         self._consecutive_trips = 0
-        # Phase 12A §2: the audit has to answer "why is a bar old" with the key's
-        # own accounting, not a guess. A deferral is a refresh that never made a
-        # call because the key's budget was busy; a trip is a broker rate-limit.
-        self._calls = 0
-        self._deferrals = 0
-        self._trips = 0
-        self._successes = 0
-
-    def stats(self) -> dict:
-        with self._lock:
-            return {
-                "calls": self._calls,
-                "deferrals": self._deferrals,
-                "rate_limits": self._trips,
-                "successes": self._successes,
-                "cooldown_remaining_sec": round(
-                    max(0.0, self._cooldown_until - time.time()), 1),
-                "consecutive_rate_limits": self._consecutive_trips,
-                "min_interval_sec": _HIST_MIN_INTERVAL,
-            }
-
-    def note_deferral(self) -> None:
-        with self._lock:
-            self._deferrals += 1
-
-    def note_call(self) -> None:
-        with self._lock:
-            self._calls += 1
 
     def try_reserve(self, max_wait: float) -> float | None:
         """Reserve a slot only if it is reachable within ``max_wait``.
@@ -300,10 +222,17 @@ class _HistLimiter:
             self._last_call = earliest
             return max(0.0, earliest - now)
 
+    def reserve(self) -> float:
+        with self._lock:
+            now = time.time()
+            spacing = _HIST_MIN_INTERVAL + random.uniform(0.0, _HIST_JITTER)
+            earliest = max(now, self._last_call + spacing, self._cooldown_until)
+            self._last_call = earliest
+            return max(0.0, earliest - now)
+
     def trip_cooldown(self) -> None:
         with self._lock:
             self._consecutive_trips += 1
-            self._trips += 1
             backoff = _HIST_COOLDOWN * (2 ** (self._consecutive_trips - 1))
             backoff = min(backoff, _HIST_COOLDOWN_MAX)
             backoff += random.uniform(0.0, _HIST_JITTER * 2)
@@ -312,7 +241,6 @@ class _HistLimiter:
     def note_success(self) -> None:
         with self._lock:
             self._consecutive_trips = 0
-            self._successes += 1
 
 
 def _is_rate_limited(text: str) -> bool:
@@ -338,26 +266,20 @@ def _historical_candles(shard: "_Shard", params: dict, *, blocking: bool) -> tup
     with backoff so a rate-limited instrument still gets its initial candles.
     For routine refreshes (cached data already present) it makes a single
     attempt and never blocks the tick.
-
-    Both paths are bounded, so the longest this can hold a tick is a constant
-    that can be stated — its slot budget plus the REST timeout per attempt —
-    rather than a function of how far the cooldown has grown.
     """
     smart = shard.smart
     limiter = shard.hist
     attempts = 2 if blocking else 1
-    budget = _HIST_BLOCKING_BUDGET_SEC if blocking else _HIST_NONBLOCKING_MAX_WAIT
-    deadline = time.time() + budget
     for _ in range(attempts):
-        wait = limiter.try_reserve(max(0.0, deadline - time.time()))
-        if wait is None:
-            limiter.note_deferral()
-            return [], (
-                f"deferred: historical budget busy, no slot within {budget:.1f}s"
-            )
+        if blocking:
+            wait = limiter.reserve()
+        else:
+            slot = limiter.try_reserve(_HIST_NONBLOCKING_MAX_WAIT)
+            if slot is None:
+                return [], "deferred: historical budget busy"
+            wait = slot
         if wait > 0:
             time.sleep(wait)
-        limiter.note_call()
         try:
             resp = smart.getCandleData(params)
         except Exception as exc:
@@ -385,57 +307,6 @@ def _get_scrip_master() -> list:
             if _scrip_master_cache is None:
                 _scrip_master_cache = httpx.get(SCRIP_MASTER_URL, timeout=60.0).json()
     return _scrip_master_cache
-
-
-class _TickBars:
-    """Builds 1-minute OHLC bars for ONE token out of WebSocket ticks.
-
-    The 1-minute historical endpoint is the slowest thing in the feed: every
-    instrument on an Angel key shares one budget with ``_HIST_MIN_INTERVAL``
-    spacing, so a routine refresh is frequently deferred and the newest bar an
-    instrument holds can be many minutes old even while its socket is pushing
-    every second. Bars assembled from the ticks that are already arriving cost
-    no REST budget at all, so the tail of the series is as fresh as the socket.
-
-    REST history stays authoritative for everything it covers; these bars only
-    ever extend the series past the last REST bar.
-    """
-
-    __slots__ = ("_bars", "_keep")
-
-    def __init__(self, keep_minutes: int = 45) -> None:
-        self._bars: dict[int, list[float]] = {}  # minute start -> [o,h,l,c,vol,cum]
-        self._keep = keep_minutes
-
-    def add(self, ts: float, ltp: float, cum_volume: float | None = None) -> None:
-        if ltp <= 0:
-            return
-        minute = int(ts // 60) * 60
-        bar = self._bars.get(minute)
-        if bar is None:
-            self._bars[minute] = [ltp, ltp, ltp, ltp, 0.0, cum_volume or 0.0]
-        else:
-            bar[1] = max(bar[1], ltp)
-            bar[2] = min(bar[2], ltp)
-            bar[3] = ltp
-            # Angel streams a cumulative day volume; the per-bar figure is its
-            # increase inside the minute (0 if the counter resets or is absent).
-            if cum_volume is not None and bar[5] and cum_volume >= bar[5]:
-                bar[4] = cum_volume - bar[5]
-        if len(self._bars) > self._keep:
-            for old in sorted(self._bars)[: len(self._bars) - self._keep]:
-                self._bars.pop(old, None)
-
-    def bars_after(self, minute_start: int) -> list[Candle]:
-        """Closed and in-progress bars strictly newer than ``minute_start``."""
-        out: list[Candle] = []
-        for minute in sorted(m for m in self._bars if m > minute_start):
-            o, h, low, c, vol, _cum = self._bars[minute]
-            out.append(Candle(time=minute, open=o, high=h, low=low, close=c, volume=vol))
-        return out
-
-    def last_tick_minute(self) -> int | None:
-        return max(self._bars) if self._bars else None
 
 
 class _Instrument:
@@ -467,10 +338,7 @@ class _LiveStream:
     def __init__(self, smart, relogin=None) -> None:
         self._routes: dict[str, object] = {}       # token -> on_tick callback
         self._token_exch: dict[str, int] = {}       # token -> exchange code
-        # Ordered per provider: the FIRST token is that instrument's futures
-        # contract, which is what the cap below must never cut.
-        self._provider_tokens: dict[int, list[str]] = {}
-        self._union_wanted = 0                       # tokens wanted before the cap
+        self._provider_tokens: dict[int, set[str]] = {}  # provider id -> tokens
         self._subscribed: set[str] = set()          # tokens live on the socket
         self._connected = False
         self._last_tick_at = 0.0
@@ -510,14 +378,6 @@ class _LiveStream:
         sws.on_data = self._on_data
         sws.on_error = self._on_error
         sws.on_close = self._on_close
-        # websocket-client >= 1.0 calls on_close(wsapp, status_code, msg), while
-        # SmartApi 1.5.5 still declares ``_on_close(self, wsapp)``. Every close
-        # therefore raises inside the SDK's own callback and OUR on_close never
-        # runs, so a dropped socket looks connected until the watchdog notices
-        # the silence. Rebinding the SDK's private hook on THIS INSTANCE (it is
-        # read as ``self._on_close`` when connect() wires the callbacks) fixes
-        # the arity without editing the vendored package.
-        sws._on_close = lambda wsapp, *_ignored: sws.on_close(wsapp)
         self._sws = sws
         self._built_at = time.time()
         self._thread = threading.Thread(target=sws.connect, daemon=True)
@@ -542,12 +402,6 @@ class _LiveStream:
             if healthy:
                 dead_since = 0.0
                 self._reconnects = 0
-                continue
-            if not _exchange_session_live(now):
-                # Silence outside session hours proves nothing about the socket,
-                # so the dead-clock is not allowed to run: rebuilding here only
-                # burns logins against a shut exchange.
-                dead_since = 0.0
                 continue
             if dead_since == 0.0:
                 dead_since = now
@@ -591,11 +445,7 @@ class _LiveStream:
         _log.info("angel websocket connected (%d drop(s), %d rebuild(s) so far)", self._drops, self._rebuilds)
         with self._lock:
             self._subscribed = set()
-            # The capped union, not every routed token: a large universe routes
-            # thousands of option tokens, and asking the socket for all of them
-            # gets the whole request rejected -- which reads afterwards as a
-            # connected, subscribed socket that never ticks.
-            self._apply(self._desired_union())
+            self._apply(set(self._routes.keys()))
 
     def _on_close(self, _wsapp) -> None:
         self._connected = False
@@ -641,59 +491,24 @@ class _LiveStream:
             "seq": message.get("sequence_number"),
             "bid": _best_price(message.get("best_5_buy_data"), paise=True),
             "ask": _best_price(message.get("best_5_sell_data"), paise=True),
-            "bid_size": _best_size(message.get("best_5_buy_data")),
-            "ask_size": _best_size(message.get("best_5_sell_data")),
         })
 
     def set_provider_tokens(self, key: int, exch_code: int, tokens: list[str], cb) -> None:
         """Register/replace one instrument's token set and re-diff the union."""
         with self._lock:
-            self._provider_tokens[key] = list(tokens)
+            self._provider_tokens[key] = set(tokens)
             for t in tokens:
                 self._routes[t] = cb
                 self._token_exch[t] = exch_code
-            desired = self._desired_union()
+            # Union across every registered instrument, capped so we never blow
+            # Angel's per-socket token ceiling (overflow instruments fall back to
+            # REST polling automatically via their staleness check).
+            union: list[str] = []
+            for toks in self._provider_tokens.values():
+                union.extend(toks)
+            desired = set(union[:_MAX_WS_TOKENS])
             if self._connected:
                 self._apply(desired)
-
-    def _desired_union(self) -> set[str]:
-        """Every instrument's futures token first, extra strikes only after.
-
-        The cap is a real per-socket ceiling, so something has to be left off a
-        large universe. It used to be whatever fell past the cut of a list
-        flattened instrument by instrument -- which took whole instruments'
-        FUTURES tokens while each provider still reported itself subscribed,
-        because a provider only checks its own wish list. That is the measured
-        symptom: one NIFTY tick in a session, and a futures bar that only moved
-        when a rate-limited REST refresh landed. The futures token is the one
-        every price, bar and decision for an instrument depends on, so it is
-        taken for all instruments before any instrument's option strikes.
-        """
-        ordered: list[str] = []
-        seen: set[str] = set()
-        for toks in self._provider_tokens.values():
-            if toks and toks[0] not in seen:
-                seen.add(toks[0])
-                ordered.append(toks[0])
-        for toks in self._provider_tokens.values():
-            for t in toks[1:]:
-                if t not in seen:
-                    seen.add(t)
-                    ordered.append(t)
-        self._union_wanted = len(ordered)
-        return set(ordered[:_MAX_WS_TOKENS])
-
-    def is_subscribed(self, token: str) -> bool:
-        """Is this token live on the SOCKET (not merely wanted by a provider)?"""
-        return token in self._subscribed
-
-    def subscription_counts(self) -> dict:
-        return {
-            "wanted": self._union_wanted,
-            "on_socket": len(self._subscribed),
-            "cap": _MAX_WS_TOKENS,
-            "dropped_by_cap": max(0, self._union_wanted - _MAX_WS_TOKENS),
-        }
 
     def _apply(self, desired: set[str]) -> None:
         add = desired - self._subscribed
@@ -740,8 +555,7 @@ def _login_with(creds: dict) -> object:
         from SmartApi import SmartConnect
     except ImportError as exc:  # pragma: no cover - depends on optional dep
         raise RuntimeError(
-            f"Angel One SDK not importable ({exc}). Install backend/requirements.txt "
-            "(smartapi-python, pyotp, logzero, websocket-client)."
+            "Angel One SDK not installed. Run: pip install smartapi-python pyotp"
         ) from exc
 
     smart = SmartConnect(api_key=creds["key"], timeout=_REST_TIMEOUT_SEC)
@@ -806,13 +620,6 @@ class _Shard:
 
 _shards: list[_Shard] | None = None
 _shards_lock = threading.Lock()
-# After every key fails, refuse further login attempts until this time, so
-# per-tick callers don't hammer Angel's login API (risking an account lockout).
-_LOGIN_RETRY_BASE_SEC = 30.0
-_LOGIN_RETRY_MAX_SEC = 300.0
-_login_retry_at = 0.0
-_login_failures = 0
-_login_last_error = ""
 
 
 def _get_shards() -> list[_Shard]:
@@ -821,12 +628,6 @@ def _get_shards() -> list[_Shard]:
     global _shards
     with _shards_lock:
         if _shards is None:
-            global _login_retry_at, _login_failures, _login_last_error
-            if time.time() < _login_retry_at:
-                raise RuntimeError(
-                    f"Angel One login failed for all configured keys "
-                    f"(retry in {int(_login_retry_at - time.time())}s): {_login_last_error}"
-                )
             built: list[_Shard] = []
             creds_list = _credential_sets()
             if not creds_list:
@@ -835,29 +636,13 @@ def _get_shards() -> list[_Shard]:
                     "SMARTAPI_CLIENT_CODE, SMARTAPI_PIN, SMARTAPI_TOTP_SECRET "
                     "(see .env.example)."
                 )
-            errors: list[str] = []
             for i, creds in enumerate(creds_list):
                 try:
                     built.append(_Shard(creds))
                 except Exception as exc:
-                    msg = str(exc)
-                    for secret in creds.values():  # scrub raw credential values
-                        if secret and len(str(secret)) >= 3:
-                            msg = msg.replace(str(secret), "***")
-                    msg = _redact_secrets(msg)
-                    errors.append(f"key {i + 1}: {msg}")
-                    _log.warning("Angel shard %d login failed, skipping: %s", i + 1, msg)
+                    _log.warning("Angel shard %d login failed, skipping: %s", i + 1, exc)
             if not built:
-                _login_failures += 1
-                delay = min(_LOGIN_RETRY_MAX_SEC,
-                            _LOGIN_RETRY_BASE_SEC * 2 ** min(_login_failures - 1, 4))
-                _login_retry_at = time.time() + delay
-                _login_last_error = "; ".join(errors)
-                _log.error("Angel One login failed for all keys; next attempt in %ds", int(delay))
-                raise RuntimeError(
-                    f"Angel One login failed for all configured keys: {_login_last_error}"
-                )
-            _login_failures, _login_retry_at, _login_last_error = 0, 0.0, ""
+                raise RuntimeError("Angel One login failed for all configured keys.")
             _shards = built
         return _shards
 
@@ -983,23 +768,6 @@ def _best_price(levels: object, *, paise: bool) -> float | None:
     return round(p / 100.0, 4) if paise else p
 
 
-def _best_size(levels: object) -> int | None:
-    """Quantity resting at the top of a best-5 / depth list, or None.
-
-    Unlike the price there is no paise/rupee ambiguity — a quantity is a
-    quantity on both transports. Absent or non-positive stays None: a book that
-    quotes a price without a size is a book whose size was not published, and a
-    zero there would read as "nothing resting", which is a different claim.
-    """
-    if not isinstance(levels, list) or not levels:
-        return None
-    first = levels[0]
-    if not isinstance(first, dict):
-        return None
-    qty = _as_int(first.get("quantity") or first.get("qty"))
-    return qty if qty and qty > 0 else None
-
-
 def _to_float(v: object) -> float | None:
     if v is None or v == "":
         return None
@@ -1122,15 +890,12 @@ class AngelOneProvider(MarketDataProvider):
         # This instrument is assigned to one Angel key (shard); all its live
         # data (login session, WebSocket, historical rate limiter) comes from it.
         self._shard = _shard_for(self._root)
-        with _assign_lock:
-            self._shard_index = _assignment.get(self._root, 0)
         self._smart = self._shard.smart
         # Per-instrument option strike spacing (falls back to the global default
         # only when no spec is supplied).
         self._strike_step = spec.strike_step if spec else settings.strike_step
 
         self._future: _Instrument | None = None
-        self._futures_chain: list[_Instrument] = []
         self._options: list[_Instrument] = []  # nearest-expiry option instruments
         self._by_token: dict[str, _Instrument] = {}
         self._load_instruments()
@@ -1143,15 +908,6 @@ class AngelOneProvider(MarketDataProvider):
         self._last_quote_at = 0.0
         self._last_fut_candles_at = 0.0
         self._candle_diag: str = ""
-        # Phase 12A: WebSocket-built tail for the futures series, plus the
-        # timestamps the feed audit needs to say WHERE a bar's age came from.
-        self._fut_tick_bars = _TickBars()
-        self._fut_candles_cached_at = 0.0    # when REST history last landed
-        self._fut_candles_source = "NONE"    # WS | REST | NONE (newest bar)
-        self._fut_rest_attempts = 0
-        self._fut_rest_ok = 0
-        self._fut_rest_deferred = 0
-        self._fut_ticks = 0
 
         # Real-time push feed (falls back to REST polling if it can't start).
         self._stream: _LiveStream | None = None
@@ -1200,34 +956,19 @@ class AngelOneProvider(MarketDataProvider):
             return
         prev = self._quotes.get(token) or {}
         bid, ask = meta.get("bid"), meta.get("ask")
-        bid_size, ask_size = meta.get("bid_size"), meta.get("ask_size")
-        now = time.time()
-        fresh_book = bid is not None or ask is not None
         self._quotes[token] = {
             "ltp": ltp, "oi": oi, "volume": vol,
             "bid": bid if bid is not None else prev.get("bid"),
             "ask": ask if ask is not None else prev.get("ask"),
-            # Carried with their own side's price, so a size can never describe
-            # a book the price did not come from.
-            "bid_size": bid_size if bid is not None else prev.get("bid_size"),
-            "ask_size": ask_size if ask is not None else prev.get("ask_size"),
-            # A tick without depth keeps the previous book (unchanged), so the
-            # instant that book arrived travels with it. Research reads this to
-            # refuse a carried-forward book as an executable price.
-            "book_ts": now if fresh_book else prev.get("book_ts"),
             "high": prev.get("high"), "low": prev.get("low"),
             "open": prev.get("open"), "prev_close": prev.get("prev_close"),
             "tick_verdict": verdict,
         }
+        now = time.time()
         self._last_ws_tick = now
         self._token_tick_at[token] = now
         if self._future and token == self._future.token:
             self._spot = ltp
-            # Extend the futures series from the push feed. This costs no REST
-            # budget, so the newest bar stays as fresh as the socket even while
-            # the shared historical budget defers this instrument's refresh.
-            self._fut_tick_bars.add(now, ltp, float(vol) if vol else None)
-            self._fut_ticks += 1
 
     def _sync_subscription(self) -> None:
         if self._stream is None or not self._future:
@@ -1275,11 +1016,6 @@ class AngelOneProvider(MarketDataProvider):
                 f"in the scrip master."
             )
         self._future = fut_future[0]
-        # The whole forward chain, nearest first. The quoted contract stays the
-        # near month (the feed and the subscription are built on it); the futures
-        # RESEARCH engine reads this to roll its plan off a contract that is
-        # about to expire. Kept as instruments so lot size travels with it.
-        self._futures_chain = fut_future
 
         opt_expiries = sorted({o.expiry for o in options_all if o.expiry >= today})
         if not opt_expiries:
@@ -1305,20 +1041,8 @@ class AngelOneProvider(MarketDataProvider):
         lo, hi = atm - n * step, atm + n * step
         return [o.token for o in self._options if lo <= o.strike <= hi]
 
-    def _next_future(self) -> "_Instrument | None":
-        """The contract after the quoted one, or None when only one exists."""
-        if len(self._futures_chain) < 2:
-            return None
-        return self._futures_chain[1]
-
     def _refresh_quotes(self) -> None:
         tokens = [self._future.token] + self._atm_option_tokens() if self._future else []
-        # The next expiry rides along on the SAME quote call (one extra token,
-        # no extra request) purely so the near/next basis can be measured at one
-        # instant. Nothing reads it for a signal or an order.
-        nxt = self._next_future() if settings.pair_next_expiry_capture else None
-        if nxt is not None and nxt.token not in tokens:
-            tokens.append(nxt.token)
         if not tokens:
             return
         # Angel's /quote FULL endpoint accepts at most ~50 tokens per request;
@@ -1360,13 +1084,6 @@ class AngelOneProvider(MarketDataProvider):
                     # REST depth is quoted in rupees, unlike the socket's paise.
                     "bid": _best_price(depth.get("buy"), paise=False),
                     "ask": _best_price(depth.get("sell"), paise=False),
-                    "bid_size": _best_size(depth.get("buy")),
-                    "ask_size": _best_size(depth.get("sell")),
-                    # This poll IS the book's instant when it carried depth.
-                    "book_ts": (
-                        time.time() if depth.get("buy") or depth.get("sell")
-                        else None
-                    ),
                 }
         if self._future and self._future.token in self._quotes:
             self._spot = self._quotes[self._future.token]["ltp"] or self._spot
@@ -1388,28 +1105,13 @@ class AngelOneProvider(MarketDataProvider):
         # Block-with-backoff only until this instrument has its FIRST batch of
         # candles; after that keep serving the cache and refresh non-blocking so
         # a transient AB1021 never wipes out a working chart.
-        #
-        # Bounded in passes too: an instrument failing for a reason a retry
-        # cannot fix — a connect timeout to the broker, a token it has no
-        # permission for — never acquires the cache that takes it off this path,
-        # so it would pay the blocking budget on every tick for the whole
-        # session. After the first few passes it refreshes non-blocking like any
-        # other instrument and keeps reporting that it has no candles.
-        blocking = (
-            not self._fut_candles
-            and self._fut_rest_attempts < _HIST_BLOCKING_PASSES
-        )
-        self._fut_rest_attempts += 1
+        blocking = not self._fut_candles
         rows, diag = _historical_candles(self._shard, params, blocking=blocking)
         candles = _to_candles(rows)
         if candles:
             self._fut_candles = candles
-            self._fut_candles_cached_at = time.time()
-            self._fut_rest_ok += 1
             self._candle_diag = ""
-        elif diag.startswith("deferred"):
-            self._fut_rest_deferred += 1
-        if not candles and not self._fut_candles:
+        elif not self._fut_candles:
             # No cached data yet — surface WHY (rate-limit / token / permission),
             # never a silently-blank instrument. No credentials are ever logged.
             self._candle_diag = f"{self._root}/{self._exchange}: {diag}"
@@ -1527,100 +1229,8 @@ class AngelOneProvider(MarketDataProvider):
             return round(self._fut_candles[-1].close, 1)
         return 0.0
 
-    def _merged_fut_candles(self) -> list[Candle]:
-        """REST history, extended with WebSocket-built bars past its last bar.
-
-        REST stays authoritative for every minute it covers; the push feed only
-        supplies the tail it has not delivered yet. With no REST history at all
-        the series stays empty rather than handing indicators a stub built from a
-        handful of ticks.
-
-        Deliberately NOT what ``futures_candles`` returns: that series feeds the
-        production option engine's indicators, and a fix to feed plumbing must
-        not quietly change what a production BUY is computed from. Only the
-        futures research path and the feed audit read this one.
-        """
-        rest = self._fut_candles
-        if not rest:
-            self._fut_candles_source = "NONE"
-            return []
-        if not settings.futures_ws_bars:
-            self._fut_candles_source = "REST"
-            return rest
-        tail = self._fut_tick_bars.bars_after(rest[-1].time)
-        self._fut_candles_source = "WS" if tail else "REST"
-        return rest + tail if tail else rest
-
     def futures_candles(self, limit: int = 240) -> list[Candle]:
         return self._fut_candles[-limit:]
-
-    def futures_candles_live(self, limit: int = 240) -> list[Candle]:
-        return self._merged_fut_candles()[-limit:]
-
-    def futures_feed_trace(self) -> dict:
-        """Phase 12A §1-§2: where the newest futures bar came from and how old
-        each hop in the path is. Read-only diagnostics; no gate reads this."""
-        now = time.time()
-        fut = self._future
-        series = self._merged_fut_candles()
-        bar_ts = series[-1].time if series else None
-        rest_ts = self._fut_candles[-1].time if self._fut_candles else None
-        tick_at = self._token_tick_at.get(fut.token) if fut else None
-        wanted = bool(fut and fut.token in self._subscribed_tokens)
-        # Asked from the SOCKET, not from this provider's wish list: the union of
-        # every instrument's tokens is capped, so a token this provider wants can
-        # be absent from the socket -- which is precisely the state that reads as
-        # "subscribed but not ticking".
-        on_socket = bool(
-            fut and self._stream is not None and self._stream.is_subscribed(fut.token))
-        if self._stream is None:
-            sub_state = "NO_SOCKET"
-        elif not self._stream.connected():
-            sub_state = "SOCKET_DOWN"
-        elif on_socket:
-            sub_state = "SUBSCRIBED"
-        elif wanted:
-            sub_state = "WANTED_BUT_NOT_ON_SOCKET"
-        else:
-            sub_state = "NOT_SUBSCRIBED"
-        age = round(now - bar_ts, 1) if bar_ts else None
-        dte = (fut.expiry - dt.date.today()).days if fut else None
-        return {
-            "symbol": fut.symbol if fut else None,
-            "root": self._root,
-            "token": fut.token if fut else None,
-            "exchange": self._exchange,
-            "expiry": fut.expiry.isoformat() if fut else None,
-            "dte": dte,
-            "subscription_state": sub_state,
-            "shard_index": self._shard_index,
-            "ws_connected": bool(self._stream and self._stream.connected()),
-            "ws_tokens_subscribed": len(self._subscribed_tokens),
-            "ws_socket_tokens": (
-                self._stream.subscription_counts() if self._stream else None),
-            "last_tick_at": round(tick_at, 3) if tick_at else None,
-            "tick_age_sec": round(now - tick_at, 1) if tick_at else None,
-            "exchange_bar_ts": bar_ts,
-            "rest_bar_ts": rest_ts,
-            "rest_bar_age_sec": round(now - rest_ts, 1) if rest_ts else None,
-            "cache_ts": round(self._fut_candles_cached_at, 3) or None,
-            "cache_age_sec": (
-                round(now - self._fut_candles_cached_at, 1)
-                if self._fut_candles_cached_at else None
-            ),
-            "processing_ts": round(now, 3),
-            "source": self._fut_candles_source,
-            "age_seconds": age,
-            "freshness": futures_feed_audit.state(age),
-            "ticks": self._fut_ticks,
-            "bars": len(series),
-            "ws_bars_in_tail": len(series) - len(self._fut_candles),
-            "rest_attempts": self._fut_rest_attempts,
-            "rest_ok": self._fut_rest_ok,
-            "rest_deferred": self._fut_rest_deferred,
-            "hist_budget": self._shard.hist.stats(),
-            "diag": self._candle_diag or None,
-        }
 
     def day_ohlc(self, symbol: str | None = None) -> dict | None:
         # Official exchange day OHLC captured from the FULL /quote feed, so the
@@ -1672,10 +1282,6 @@ class AngelOneProvider(MarketDataProvider):
                 volume=q["volume"],
                 bid=q.get("bid"),
                 ask=q.get("ask"),
-                bid_size=q.get("bid_size"),
-                ask_size=q.get("ask_size"),
-                book_ts=q.get("book_ts"),
-                lot_size=int(inst.lot_size or 0) or None,
             ))
         return chain
 
@@ -1715,97 +1321,6 @@ class AngelOneProvider(MarketDataProvider):
 
     def nearest_expiry(self) -> "dt.date | None":
         return self._options[0].expiry if self._options else None
-
-    def futures_contract(self) -> dict | None:
-        fut = self._future
-        if fut is None:
-            return None
-        return {
-            "symbol": fut.symbol,
-            "expiry": fut.expiry.isoformat() if fut.expiry else None,
-            "lot_size": int(fut.lot_size or 0) or None,
-            "exchange": self._exchange,
-        }
-
-    def futures_book(self) -> dict | None:
-        """The near-month futures book as last quoted, with its own age.
-
-        The depth is already in ``_quotes`` for the futures token — it is fetched
-        on the same FULL quote call as the option strikes and has been going
-        unused. ``bid``/``ask`` are omitted when the feed did not carry depth on
-        the last refresh, so a research row can say the spread was UNMEASURED
-        instead of charging zero for it.
-        """
-        fut = self._future
-        if fut is None:
-            return None
-        q = self._quotes.get(fut.token) or {}
-        now = time.time()
-        bid, ask = q.get("bid"), q.get("ask")
-        return {
-            "symbol": fut.symbol,
-            "expiry": fut.expiry.isoformat() if fut.expiry else None,
-            "days_to_expiry": (fut.expiry - dt.date.today()).days if fut.expiry else None,
-            "lot_size": int(fut.lot_size or 0) or None,
-            "exchange": self._exchange,
-            "ltp": _to_float(q.get("ltp")) or None,
-            "bid": bid if isinstance(bid, (int, float)) and float(bid) > 0 else None,
-            "ask": ask if isinstance(ask, (int, float)) and float(ask) > 0 else None,
-            "bid_size": _as_int(q.get("bid_size")),
-            "ask_size": _as_int(q.get("ask_size")),
-            "oi": q.get("oi"),
-            "volume": q.get("volume"),
-            "feed_age_sec": self._token_age(fut.token, now),
-            "quote_ts": round(now, 3),
-            "book_ts": q.get("book_ts"),
-            "source": self.feed_mode(),
-        }
-
-    def futures_book_chain(self) -> list[dict]:
-        """Near and next contract books, both as last quoted, nearest first.
-
-        The next contract is only present when it was quoted on the same refresh
-        as the near one (see :meth:`_refresh_quotes`); otherwise the caller gets
-        the near contract alone rather than a second contract priced at another
-        instant, which would not be a basis.
-        """
-        near = self.futures_book()
-        if near is None:
-            return []
-        out = [near]
-        nxt = self._next_future()
-        q = self._quotes.get(nxt.token) if nxt is not None else None
-        if nxt is not None and q:
-            now = time.time()
-            bid, ask = q.get("bid"), q.get("ask")
-            out.append({
-                "symbol": nxt.symbol,
-                "expiry": nxt.expiry.isoformat() if nxt.expiry else None,
-                "days_to_expiry": ((nxt.expiry - dt.date.today()).days
-                                   if nxt.expiry else None),
-                "lot_size": int(nxt.lot_size or 0) or None,
-                "exchange": self._exchange,
-                "ltp": _to_float(q.get("ltp")) or None,
-                "bid": bid if isinstance(bid, (int, float)) and float(bid) > 0 else None,
-                "ask": ask if isinstance(ask, (int, float)) and float(ask) > 0 else None,
-                "bid_size": _as_int(q.get("bid_size")),
-                "ask_size": _as_int(q.get("ask_size")),
-                "oi": q.get("oi"),
-                "volume": q.get("volume"),
-                "feed_age_sec": self._token_age(nxt.token, now),
-                "quote_ts": round(now, 3),
-                "book_ts": q.get("book_ts"),
-                "source": self.feed_mode(),
-            })
-        return out
-
-    def futures_contract_chain(self) -> list[dict]:
-        return [{
-            "symbol": f.symbol,
-            "expiry": f.expiry.isoformat() if f.expiry else None,
-            "lot_size": int(f.lot_size or 0) or None,
-            "exchange": self._exchange,
-        } for f in self._futures_chain]
 
     # ------------------------------------------------------------- trading
     def supports_trading(self) -> bool:

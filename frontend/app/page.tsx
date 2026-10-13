@@ -36,13 +36,13 @@ import ReasonsCard from "@/components/ReasonsCard";
 import TradeMeterCard from "@/components/TradeMeterCard";
 import NewsFeed from "@/components/NewsFeed";
 import MarketContext from "@/components/MarketContext";
+import DecisionDashboard from "@/components/DecisionDashboard";
 import ProDashboard from "@/components/ProDashboard";
 import MomentumBoard from "@/components/MomentumBoard";
 import FlowBoard from "@/components/FlowBoard";
 import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
 import JournalBoard from "@/components/JournalBoard";
-import BuySignalsPanel from "@/components/BuySignalsPanel";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
 import TopMovers from "@/components/TopMovers";
@@ -266,7 +266,7 @@ export default function Page() {
   return (
     <div
       className="h-screen w-screen p-3 flex flex-col gap-3 overflow-hidden"
-      style={{ "--accent": t.accent, "--accent-dim": t.accentDim } as React.CSSProperties}
+      style={{ ["--accent" as any]: t.accent, ["--accent-dim" as any]: t.accentDim }}
     >
       {view !== "decision" && <Alerts alerts={snap.alerts} />}
 
@@ -543,10 +543,7 @@ export default function Page() {
       ) : view === "journal" ? (
         /* Complete trade journal — the full persisted record of every closed
            paper/live trade with reason, confidence, P&L and analyst note. */
-        <>
-          <JournalBoard />
-          <BuySignalsPanel />
-        </>
+        <JournalBoard />
       ) : view === "decision" ? (
         /* Clean, decision-first dashboard: should I trade, which option, entry,
            stop, targets, hold time, risk, opportunity, why. */
