@@ -50,7 +50,8 @@ _SECRET_PATTERNS = [
     (_re.compile(r"(['\"]?Authorization['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+"), r"\1***REDACTED***"),
     (_re.compile(r"(eyJ[A-Za-z0-9._\-]{10,})"), "***REDACTED_JWT***"),
     (_re.compile(r"(['\"]?X-PrivateKey['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+"), r"\1***REDACTED***"),
-    (_re.compile(r"(['\"]?(?:api[_-]?key|token|refreshToken|feedToken|jwtToken|password|pin)['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+", _re.IGNORECASE), r"\1***REDACTED***"),
+    (_re.compile(r"(['\"]?(?:api[_-]?key|token|refreshToken|feedToken|jwtToken|password|pin)['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+", _re.IGNORECASE), r"\1***REDACTED***"),    # The SDK's request-error log also prints the login body and client headers.
+    (_re.compile(r"(['\"]?(?:clientcode|totp|X-ClientPublicIP|X-ClientLocalIP|X-MACAddress)['\"]?\s*[:=]\s*['\"]?)[^'\",}\s]+", _re.IGNORECASE), r"\1***REDACTED***"),
 ]
 
 
@@ -139,6 +140,9 @@ _QUOTE_TOKEN_CHUNK = 45
 # or exit must never wait that long on a network that has already gone quiet.
 # Losing one poll is recoverable; blocking the loop is not.
 _REST_TIMEOUT_SEC = 4
+# Login is a one-off at boot/re-auth, not on the tick path; 4s timed out on a
+# slow link and left the feed down until the next backoff retry.
+_LOGIN_TIMEOUT_SEC = 15
 # Angel allows only a few concurrent WebSocket connections per account, so ALL
 # instruments share ONE stream (below), and that single socket is capped to a
 # safe number of subscribed tokens.
@@ -744,9 +748,12 @@ def _login_with(creds: dict) -> object:
             "(smartapi-python, pyotp, logzero, websocket-client)."
         ) from exc
 
-    smart = SmartConnect(api_key=creds["key"], timeout=_REST_TIMEOUT_SEC)
+    smart = SmartConnect(api_key=creds["key"], timeout=_LOGIN_TIMEOUT_SEC)
     totp = pyotp.TOTP(creds["totp"]).now()
-    session = smart.generateSession(creds["client"], creds["pin"], totp)
+    try:
+        session = smart.generateSession(creds["client"], creds["pin"], totp)
+    finally:
+        smart.timeout = _REST_TIMEOUT_SEC
     if not session or not session.get("status"):
         raise RuntimeError(f"Angel One login failed: {session}")
     try:
