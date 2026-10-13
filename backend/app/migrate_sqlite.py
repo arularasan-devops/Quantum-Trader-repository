@@ -17,8 +17,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 BATCH = 5000
@@ -48,6 +50,25 @@ def find_sqlite(paths: list[str]) -> list[Path]:
         else:
             print(f"skip (not a SQLite file): {p}")
     return out
+
+
+def _open_ro(path: Path) -> tuple[sqlite3.Connection, str | None]:
+    """Open read-only; if that fails (e.g. WAL file on a read-only mount), read a temp copy."""
+    try:
+        # A WAL file means even a read-only open may touch -shm; read a copy instead.
+        if Path(str(path) + "-wal").exists():
+            raise sqlite3.OperationalError("WAL present")
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return conn, None
+    except sqlite3.OperationalError:
+        tmp = tempfile.mkdtemp(prefix="qt_mig_")
+        for suffix in ("", "-wal", "-shm"):
+            side = Path(str(path) + suffix)
+            if side.exists():
+                shutil.copy2(side, Path(tmp) / (path.name + suffix))
+        print(f"  (read via temporary copy: {path.name})")
+        return sqlite3.connect(Path(tmp) / path.name), tmp
 
 
 def _affinity(decl: str) -> str:
@@ -124,39 +145,60 @@ def migrate(paths: list[str], pg_url: str, dry: bool = False) -> int:
         from app.research.db import Database
         JournalStore(Database(pg_url))
     with psycopg.connect(pg_url) as pg:
+        failed: list[str] = []
         for f in files:
-            src = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
-            schema = "legacy_" + re.sub(r"[^a-z0-9_]", "_", f.stem.lower())
             print(f"\n== {f}")
-            tables = [r[0] for r in src.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-            for t in tables:
-                with pg.cursor() as cur:
-                    if t.startswith("jr_") and (dry or _pg_table_exists(cur, "public", t)):
-                        names = [c[1] for c in src.execute(f"PRAGMA table_info({_q(t)})")]
-                        if not dry:
-                            cur.execute("SELECT column_name FROM information_schema.columns "
-                                        "WHERE table_schema='public' AND table_name=%s", (t,))
-                            have = {r[0] for r in cur.fetchall()}
-                            names = [c for c in names if c in have]
-                        n, ins = _copy(src, cur, t, _q(t), names, names, "", False, dry)
-                        dest = f"public.{t}"
-                    else:
-                        cols = _pg_columns(src, t)
-                        fq = f"{_q(schema)}.{_q(t)}"
-                        if not dry:
-                            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)}")
-                            cur.execute(
-                                f"CREATE TABLE IF NOT EXISTS {fq} (_row_hash TEXT PRIMARY KEY, "
-                                + ", ".join(f"{_q(c)} {ty}" for c, ty in cols) + ")")
-                        names = [c for c, _ in cols]
-                        n, ins = _copy(src, cur, t, fq, names, names, "(_row_hash)", True, dry)
-                        dest = f"{schema}.{t}"
-                if not dry:
-                    pg.commit()
-                print(f"  {t}: {n} source rows -> {dest}" + ("" if dry else f" (+{ins} new)"))
-            src.close()
+            try:
+                src, tmp = _open_ro(f)
+            except (sqlite3.Error, OSError) as exc:
+                print(f"  FAILED to open: {exc}")
+                failed.append(str(f))
+                continue
+            try:
+                _migrate_file(src, f, pg, dry)
+            except Exception as exc:  # noqa: BLE001 - report and continue with other files
+                pg.rollback()
+                print(f"  FAILED: {type(exc).__name__}: {exc}")
+                failed.append(str(f))
+            finally:
+                src.close()
+                if tmp:
+                    shutil.rmtree(tmp, ignore_errors=True)
+    if failed:
+        print("\nFAILED files:\n  " + "\n  ".join(failed))
+        return 1
     return 0
+
+
+def _migrate_file(src: sqlite3.Connection, f: Path, pg, dry: bool) -> None:
+    schema = "legacy_" + re.sub(r"[^a-z0-9_]", "_", f.stem.lower())
+    tables = [r[0] for r in src.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    for t in tables:
+        with pg.cursor() as cur:
+            if t.startswith("jr_") and (dry or _pg_table_exists(cur, "public", t)):
+                names = [c[1] for c in src.execute(f"PRAGMA table_info({_q(t)})")]
+                if not dry:
+                    cur.execute("SELECT column_name FROM information_schema.columns "
+                                "WHERE table_schema='public' AND table_name=%s", (t,))
+                    have = {r[0] for r in cur.fetchall()}
+                    names = [c for c in names if c in have]
+                n, ins = _copy(src, cur, t, _q(t), names, names, "", False, dry)
+                dest = f"public.{t}"
+            else:
+                cols = _pg_columns(src, t)
+                fq = f"{_q(schema)}.{_q(t)}"
+                if not dry:
+                    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)}")
+                    cur.execute(
+                        f"CREATE TABLE IF NOT EXISTS {fq} (_row_hash TEXT PRIMARY KEY, "
+                        + ", ".join(f"{_q(c)} {ty}" for c, ty in cols) + ")")
+                names = [c for c, _ in cols]
+                n, ins = _copy(src, cur, t, fq, names, names, "(_row_hash)", True, dry)
+                dest = f"{schema}.{t}"
+        if not dry:
+            pg.commit()
+        print(f"  {t}: {n} source rows -> {dest}" + ("" if dry else f" (+{ins} new)"))
 
 
 def main(argv: list[str] | None = None) -> int:
