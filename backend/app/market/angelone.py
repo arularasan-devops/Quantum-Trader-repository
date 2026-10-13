@@ -840,13 +840,17 @@ def _get_shards() -> list[_Shard]:
                 try:
                     built.append(_Shard(creds))
                 except Exception as exc:
-                    msg = _redact_secrets(str(exc))
+                    msg = str(exc)
+                    for secret in creds.values():  # scrub raw credential values
+                        if secret and len(str(secret)) >= 3:
+                            msg = msg.replace(str(secret), "***")
+                    msg = _redact_secrets(msg)
                     errors.append(f"key {i + 1}: {msg}")
                     _log.warning("Angel shard %d login failed, skipping: %s", i + 1, msg)
             if not built:
                 _login_failures += 1
                 delay = min(_LOGIN_RETRY_MAX_SEC,
-                            _LOGIN_RETRY_BASE_SEC * 2 ** (_login_failures - 1))
+                            _LOGIN_RETRY_BASE_SEC * 2 ** min(_login_failures - 1, 4))
                 _login_retry_at = time.time() + delay
                 _login_last_error = "; ".join(errors)
                 _log.error("Angel One login failed for all keys; next attempt in %ds", int(delay))
