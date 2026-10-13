@@ -102,14 +102,14 @@ def _record_signal(st, d, chain, was_in_pos: bool, now: float, sid: str) -> None
             outcome, reason = "SKIPPED", "already in a position"
         elif not feed_ok:
             outcome, reason = "NOT_EXECUTABLE", "feed not ready (stale or disconnected)"
-        elif q is None or q.bid is None or q.ask is None:
-            outcome, reason = "NOT_EXECUTABLE", "no executable two-sided quote"
         else:
             blk = exec_funnel.last_block(st.instrument, since=now - 1.0,
                                          option=d.recommended_option or "")
             if blk:
                 outcome = "REJECTED" if blk.get("stage") == "ACCEPTED" else "SKIPPED"
                 reason = f"{blk.get('primary_blocker')}: {blk.get('reason') or ''}".strip()
+            elif q is None or q.bid is None or q.ask is None:
+                outcome, reason = "NOT_EXECUTABLE", "no executable two-sided quote"
             elif not settings.auto_trade_enabled:
                 outcome, reason = "SKIPPED", "auto-trader off"
             else:
