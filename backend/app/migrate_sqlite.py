@@ -113,7 +113,8 @@ def _pg_table_exists(cur, schema: str, table: str) -> bool:
 
 
 def _copy(src, cur, table: str, fq: str, src_cols: list[str], dst_cols: list[str],
-          conflict: str, with_hash: bool, dry: bool) -> tuple[int, int]:
+          conflict: str, with_hash: bool, dry: bool,
+          bool_cols: frozenset[int] = frozenset()) -> tuple[int, int]:
     n_src = src.execute(f"SELECT COUNT(*) FROM {_q(table)}").fetchone()[0]
     if dry:
         return n_src, 0
@@ -126,6 +127,9 @@ def _copy(src, cur, table: str, fq: str, src_cols: list[str], dst_cols: list[str
         chunk = rows.fetchmany(BATCH)
         if not chunk:
             break
+        if bool_cols:  # SQLite stores booleans as 0/1
+            chunk = [tuple(bool(v) if i in bool_cols and v is not None else v
+                           for i, v in enumerate(r)) for r in chunk]
         if with_hash:
             chunk = [(_row_hash(tuple(r)), *r) for r in chunk]
         cur.executemany(sql, [tuple(r) for r in chunk])
@@ -179,11 +183,12 @@ def _migrate_file(src: sqlite3.Connection, f: Path, pg, dry: bool) -> None:
             if t.startswith("jr_") and (dry or _pg_table_exists(cur, "public", t)):
                 names = [c[1] for c in src.execute(f"PRAGMA table_info({_q(t)})")]
                 if not dry:
-                    cur.execute("SELECT column_name FROM information_schema.columns "
+                    cur.execute("SELECT column_name, data_type FROM information_schema.columns "
                                 "WHERE table_schema='public' AND table_name=%s", (t,))
-                    have = {r[0] for r in cur.fetchall()}
+                    have = dict(cur.fetchall())
                     names = [c for c in names if c in have]
-                n, ins = _copy(src, cur, t, _q(t), names, names, "", False, dry)
+                bools = frozenset(i for i, c in enumerate(names) if not dry and have[c] == "boolean")
+                n, ins = _copy(src, cur, t, _q(t), names, names, "", False, dry, bools)
                 dest = f"public.{t}"
             else:
                 cols = _pg_columns(src, t)
