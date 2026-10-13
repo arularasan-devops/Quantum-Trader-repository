@@ -5,6 +5,84 @@ export const API_BASE =
 export const WS_BASE =
   process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8000";
 
+// Live-arm token (X-QT-Live-Token). Held in memory only: never written to
+// localStorage/sessionStorage/cookies, never put in a URL, never logged. It is
+// gone after a page reload by design. Sent only on order / arming calls.
+let liveToken: string | null = null;
+
+export function setLiveToken(token: string | null) {
+  liveToken = token && token.trim() ? token.trim() : null;
+}
+
+if (typeof window !== "undefined") {
+  // Remove the token an earlier build kept in persistent browser storage.
+  try {
+    window.localStorage.removeItem("qt_live_token");
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function liveHeaders(token?: string): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const t = token ?? liveToken;
+  if (t) h["X-QT-Live-Token"] = t;
+  return h;
+}
+
+async function errorDetail(res: Response): Promise<string> {
+  try {
+    const j = await res.json();
+    const d = j?.detail ?? j;
+    return typeof d === "string" ? d : JSON.stringify(d);
+  } catch {
+    return res.statusText || "request failed";
+  }
+}
+
+export interface KillSwitchState {
+  engaged: boolean;
+  reason: string;
+  ts: number | null;
+}
+
+export async function getKillSwitch(): Promise<KillSwitchState> {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Kill-switch status failed (${res.status}): ${await errorDetail(res)}`);
+  return res.json();
+}
+
+/** Engage: no token needed — anyone may stop new entries. */
+export async function engageKillSwitch(reason = ""): Promise<KillSwitchState> {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ engaged: true, reason }),
+  });
+  if (!res.ok) throw new Error(`Engage failed (${res.status}): ${await errorDetail(res)}`);
+  return res.json();
+}
+
+/** Release: requires the live-arm token, passed once in a header and not kept. */
+export async function releaseKillSwitch(token: string, reason = ""): Promise<KillSwitchState> {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, {
+    method: "POST",
+    headers: liveHeaders(token),
+    body: JSON.stringify({ engaged: false, reason }),
+  });
+  if (!res.ok) throw new Error(`Release failed (${res.status}): ${await errorDetail(res)}`);
+  return res.json();
+}
+
+export async function setKillSwitch(engaged: boolean, reason = "") {
+  const res = await fetch(`${API_BASE}/api/kill-switch`, {
+    method: "POST",
+    headers: liveHeaders(),
+    body: JSON.stringify({ engaged, reason }),
+  });
+  return res.json();
+}
+
 export interface OrderResult {
   ok: boolean;
   mode: string;
@@ -14,6 +92,8 @@ export interface OrderResult {
   fill_premium: number | null;
   order_id: string | null;
   message: string;
+  status?: string;
+  filled_lots?: number | null;
 }
 
 export async function buyOption(
@@ -24,7 +104,7 @@ export async function buyOption(
 ) {
   const res = await fetch(`${API_BASE}/api/buy`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify({ option_symbol, lots, confirm, instrument }),
   });
   return res.json() as Promise<{ result: OrderResult; position: unknown }>;
@@ -86,7 +166,7 @@ export async function fetchSignalScan() {
 export async function sellPosition(confirm = false, instrument?: string) {
   const res = await fetch(`${API_BASE}/api/sell`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify({ confirm, instrument }),
   });
   return res.json() as Promise<{ result: OrderResult; position: unknown }>;
@@ -194,7 +274,7 @@ export interface AutoBuyStatus {
 export async function setAutoBuy(on: boolean) {
   const res = await fetch(`${API_BASE}/api/auto-buy`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify({ on }),
   });
   return res.json() as Promise<AutoBuyStatus>;
@@ -225,7 +305,7 @@ export async function setAutoTrade(opts: {
 }) {
   const res = await fetch(`${API_BASE}/api/auto-trade`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: liveHeaders(),
     body: JSON.stringify(opts),
   });
   return res.json() as Promise<AutoTradeConfig>;

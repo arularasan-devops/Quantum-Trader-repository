@@ -64,6 +64,8 @@ from app.execution import (
 from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, universe_specs
 from app.market import tiers
 from app.market.provider import MarketDataProvider, build_provider
+from app.execution import live_control
+from app.execution import order_ledger
 from app.market.tick_quality import feed_quality
 from app.models import (
     Alert,
@@ -135,7 +137,10 @@ class _UnavailableProvider(MarketDataProvider):
         self.reason = reason
 
     def feed_health(self) -> dict:
-        return {"mode": "rest", "live": False, "note": self.reason}
+        return {"mode": "unavailable", "live": False, "note": self.reason}
+
+    def feed_mode(self) -> str:
+        return "unavailable"
 
     def step(self) -> None:
         return None
@@ -154,6 +159,36 @@ class _UnavailableProvider(MarketDataProvider):
 
     def news(self):
         return []
+
+
+def classify_feed(health: FeedHealth, provider: MarketDataProvider) -> FeedHealth:
+    """Stamp provider/source/state onto a provider's raw health reading.
+
+    Only the simulator itself may be labelled SIMULATED; a real provider that
+    reports "simulated" (e.g. Groww with no session) is UNAVAILABLE, never a
+    silent fallback to synthetic prices.
+    """
+    from app.market.simulated import SimulatedProvider
+
+    health.provider = (settings.data_provider or "").lower()
+    health.checked_at = time.time()
+    if isinstance(provider, SimulatedProvider):
+        health.source, health.state = "SIMULATED", "SIMULATED"
+        return health
+    if isinstance(provider, _UnavailableProvider) or health.mode in ("simulated", "unavailable"):
+        health.source, health.state = "UNAVAILABLE", "DISCONNECTED"
+        health.live = False
+        return health
+    health.source = "LIVE"
+    ages = [a for a in (health.underlying_age_sec, health.option_age_sec)
+            if isinstance(a, (int, float))]
+    if not ages or max(ages) > float(health.stale_after_sec) * 4:
+        health.state = "DISCONNECTED"
+    elif health.live and max(ages) <= float(health.stale_after_sec):
+        health.state = "CONNECTED"
+    else:
+        health.state = "DEGRADED"
+    return health
 
 
 class AppState:
@@ -261,6 +296,15 @@ class AppState:
         # last bar timestamp recorded into the research store (live auto-capture)
         self._last_capture_ts: int | None = None
         self._capture_error: str | None = None
+        # Live broker order state (ack != fill), mirrored to the crash-safe order
+        # ledger. Restored after a restart only as an UNVERIFIED claim.
+        self._pending_order: dict | None = None
+        self._pending_exit: dict | None = None
+        self._ledger_position: dict | None = None
+        self._order_recovery: dict | None = None
+        self._persist_error: str | None = None
+        self._last_order_poll = 0.0
+        self._restore_live_ledger()
 
     def _provider_for(self, instrument: str) -> MarketDataProvider:
         cached = self._providers.get(instrument)
@@ -290,8 +334,10 @@ class AppState:
         health = self._feed_health()
         ages = [a for a in (health.underlying_age_sec, health.option_age_sec)
                 if isinstance(a, (int, float))]
-        if not ages:
-            return health.mode == "simulated"
+        if health.source == "SIMULATED":
+            return True
+        if health.source != "LIVE" or not ages:
+            return False
         return max(ages) <= float(health.stale_after_sec)
 
     def _feed_health(self) -> FeedHealth:
@@ -301,9 +347,13 @@ class AppState:
         snapshot, so any failure degrades to the plain feed mode.
         """
         try:
-            return FeedHealth(**self.provider.feed_health())
+            health = FeedHealth(**self.provider.feed_health())
         except Exception:
-            return FeedHealth(mode=self.provider.feed_mode())
+            try:
+                health = FeedHealth(mode=self.provider.feed_mode())
+            except Exception:
+                health = FeedHealth(mode="unavailable", note="provider health unreadable")
+        return classify_feed(health, self.provider)
 
     # ---------- instrument selection (analysis only — never auto-trades) ----------
     @property
@@ -460,16 +510,51 @@ class AppState:
 
     # ---------- trading actions (the user only buys / sells) ----------
     def buy(self, option_symbol: str, lots: int = 1, confirm: bool = False,
-            manual: bool = True) -> OrderResult:
+            manual: bool = True, _fill: OrderResult | None = None) -> OrderResult:
+        # ``_fill`` is internal: a broker-confirmed fill being adopted. It never
+        # sends an order.
+        adopted = _fill
+        if adopted is None and self.is_live:
+            blocked = self._live_entry_block()
+            if blocked:
+                self._add_alert("ORDER_RECOVERY", f"Entry refused: {blocked}", "critical")
+                return OrderResult(ok=False, mode="live", side="BUY", option_symbol=option_symbol,
+                                   lots=lots, message=blocked)
+        # An earlier live entry still unresolved at the broker blocks a second
+        # order; its confirmed fills are adopted as the position (no duplicate).
+        if adopted is None and self._pending_order:
+            adopted = self._poll_pending_entry()
+            if adopted is not None and not adopted.ok:
+                return adopted
+            if adopted is None and self._pending_order:
+                pend = self._pending_order
+                return OrderResult(ok=False, mode="live", side="BUY",
+                                   option_symbol=pend["symbol"], lots=pend["lots"],
+                                   order_id=pend.get("order_id"),
+                                   status=pend.get("last_status") or "PARTIAL",
+                                   message="Earlier order still working at the broker — "
+                                           "not sending another.")
+        if adopted is not None:
+            option_symbol = adopted.option_symbol
+            lots = int(adopted.filled_lots or 0)
         chain = self.provider.option_chain()
         q = next((x for x in chain if x.symbol == option_symbol), None)
         if q is None:
+            if adopted is not None:
+                # A confirmed broker fill is never dropped: park it for the operator.
+                self._enter_recovery(f"confirmed fill on {option_symbol} "
+                                     f"({adopted.order_id}) is not in the current chain")
+                self._apply_to_candidate(1, adopted)
+                return OrderResult(ok=False, mode="live", side="BUY",
+                                   option_symbol=option_symbol, lots=lots,
+                                   order_id=adopted.order_id, status=adopted.status,
+                                   message="Broker fill recorded for operator recovery.")
             raise ValueError(f"Unknown option {option_symbol}")
 
         # A hand-placed entry is checked against the engine's own verdict before
         # anything else. ``manual=False`` is the auto path, which already passed
         # the gates that produced the call it is acting on.
-        if manual:
+        if manual and adopted is None:
             refused = manual_guard.refusal(self._last_decision, self._feed_ready())
             if refused:
                 self._add_alert("MANUAL_REFUSED", f"Entry refused: {refused}",
@@ -480,7 +565,13 @@ class AppState:
                     message=refused,
                 )
 
-        can, reason = self.risk.can_open(time.time())
+        if adopted is None and live_control.kill_switch_engaged():
+            if manual:
+                self._add_alert("KILL_SWITCH", "Entry refused: kill switch engaged", "warning")
+            return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
+                               option_symbol=q.symbol, lots=lots,
+                               message="Kill switch engaged — new entries blocked.")
+        can, reason = (True, "") if adopted is not None else self.risk.can_open(time.time())
         if not can:
             self._add_alert("RISK_BLOCK", f"Trade blocked: {reason}", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
@@ -488,16 +579,20 @@ class AppState:
 
         entry = q.premium
         order_id = None
-        if self.is_live:
+        if adopted is not None:
+            entry = float(adopted.fill_premium)
+            order_id = adopted.order_id
+        elif self.is_live:
             if not confirm:
                 return OrderResult(ok=False, mode="live", side="BUY", option_symbol=q.symbol,
                                    lots=lots, message="Confirmation required for a live order.")
-            res = self.provider.place_order(q.symbol, "BUY", lots)
+            res = self._submit_live("_pending_order", q.symbol, "BUY", lots)
             if not res.ok:
-                self._add_alert("ORDER_REJECTED", f"BUY {q.symbol}: {res.message}", "critical")
                 return res
-            entry = res.fill_premium or q.premium
+            # Broker-confirmed average price and lots only; never the quote LTP.
+            entry = float(res.fill_premium)
             order_id = res.order_id
+            lots = int(res.filled_lots or lots)
 
         self.position = Position(
             option_symbol=q.symbol,
@@ -510,6 +605,14 @@ class AppState:
             peak_premium=entry,
             trough_premium=entry,
         )
+        if adopted is not None or self.is_live:
+            self._ledger_position = {"symbol": q.symbol, "lots": lots, "entry": entry,
+                                     "order_ids": [order_id] if order_id else [],
+                                     "ts": int(time.time()), "verified": True}
+            self._persist_state()
+            self._event("POSITION_OPENED", {"order_id": order_id, "side": "BUY",
+                                            "symbol": q.symbol, "lots": lots},
+                        avg_price=entry)
         self._entry_time = int(time.time())
         # Top-of-book at the fill, when the feed carried one. Recorded, never
         # modelled: an unrecorded spread is what let a 5-minute round trip look
@@ -526,7 +629,470 @@ class AppState:
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
         journal_hooks.on_entry(self, q, lots, entry, manual)
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
-                           lots=lots, fill_premium=entry, order_id=order_id, message="Entered")
+                           lots=lots, fill_premium=entry, order_id=order_id, message="Entered",
+                           status="FILLED", filled_lots=lots)
+
+    # ---------- broker order lifecycle (ack != fill) ----------
+    # Live orders only. The intent is persisted BEFORE an order is sent; broker
+    # status is read (never inferred from quotes); confirmed fills are applied
+    # incrementally. Nothing here retries, cancels or resubmits an order.
+    @staticmethod
+    def _is_filled(res: OrderResult) -> bool:
+        if res.status in ("FILLED", "PARTIAL"):
+            return bool(res.fill_premium) and (res.filled_lots is None or res.filled_lots > 0)
+        # Legacy providers that report no status but a fill price.
+        return not res.status and bool(res.fill_premium)
+
+    def _await_fill(self, res: OrderResult) -> OrderResult:
+        """Poll read-only order status until FILLED/REJECTED/CANCELLED or timeout."""
+        if not res.order_id or res.status in ("", "FILLED", "REJECTED", "CANCELLED"):
+            return res
+        deadline = time.time() + max(0.0, float(settings.order_fill_timeout_sec))
+        latest = res
+        while True:
+            try:
+                st = self.provider.order_status(res.order_id)
+            except Exception:
+                st = None
+            if st is not None:
+                latest = st
+                if st.status in ("FILLED", "REJECTED", "CANCELLED"):
+                    return st
+            if time.time() >= deadline:
+                return latest
+            time.sleep(0.1)
+
+    def _submit_live(self, attr: str, symbol: str, side: str, lots: int) -> OrderResult:
+        """Send ONE live order. ok=True carries the confirmed fill increment
+        (``filled_lots`` at the broker's ``fill_premium``); ok=False means
+        rejected, refused, or still working at the broker (tracked, no duplicate)."""
+        pend = {"order_id": None, "state": "SUBMITTING", "symbol": symbol, "side": side,
+                "lots": int(lots), "filled_lots": 0, "avg_price": None, "ts": time.time()}
+        setattr(self, attr, pend)
+        persisted = self._persist_state() and self._event("SUBMIT_INTENT", pend)
+        if not persisted and side == "BUY":
+            # No durable record = no new exposure. (An exit still proceeds: it
+            # reduces risk, and the failure is already alerted as critical.)
+            setattr(self, attr, None)
+            self._persist_state()
+            return OrderResult(ok=False, mode="live", side=side, option_symbol=symbol, lots=lots,
+                               message="Order ledger not writable — live entry refused "
+                                       "before anything was sent.")
+        # If place_order raises, the SUBMITTING record stays: the outcome is
+        # unknown, so new entries remain blocked until it is reconciled.
+        res = self.provider.place_order(symbol, side, lots)
+        if not res.ok:
+            setattr(self, attr, None)
+            self._persist_state()
+            self._event("SUBMIT_REJECTED", pend, res)
+            self._add_alert("ORDER_REJECTED", f"{side} {symbol}: {res.message}", "critical")
+            return res
+        pend["order_id"] = res.order_id
+        pend["state"] = "ACKNOWLEDGED"
+        self._persist_state()
+        self._event("ACKNOWLEDGED", pend, res)
+        res = self._await_fill(res)
+        out = self._consume_status(attr, res)
+        if out is None:  # terminal at the broker with no fill (rejected/cancelled)
+            return res.model_copy(update={"ok": False})
+        if not out.ok:
+            self._add_alert("ORDER_PENDING", f"{side} {symbol} acknowledged ({res.order_id}) "
+                            "but not filled — no position change until it resolves", "critical")
+        return out
+
+    def _consume_status(self, attr: str, st: OrderResult | None) -> OrderResult | None:
+        """Apply one broker status reading to the pending order in ``attr``.
+
+        None = nothing pending, or terminal with no new fill (record cleared);
+        ok=False = still working / unconfirmable (keep blocking duplicates);
+        ok=True = a newly confirmed fill increment (``filled_lots`` new lots at
+        their own average ``fill_premium``). The caller applies the increment
+        and persists; a terminal record is only cleared once every reported
+        fill has been priced and handed over.
+        """
+        pend = getattr(self, attr, None)
+        if not pend:
+            return None
+        if st is None:
+            msg = (f"Broker status for order {pend['order_id']} unavailable — cannot confirm; "
+                   "not sending another order." if pend.get("order_id") else
+                   "Order submission outcome unknown (no broker order id) — check the broker "
+                   "order book and resolve via /api/order-recovery.")
+            if pend.get("last_status") != "UNKNOWN":
+                pend["last_status"] = "UNKNOWN"
+                self._event("STATUS_UNAVAILABLE", pend, note=msg)
+                self._persist_state()
+            self._add_alert("ORDER_UNRESOLVED", f"{pend['side']} {pend['symbol']}: {msg}",
+                            "critical")
+            return OrderResult(ok=False, mode="live", side=pend["side"],
+                               option_symbol=pend["symbol"], lots=pend["lots"],
+                               order_id=pend.get("order_id"), status="UNKNOWN", message=msg)
+        legacy_fill = not st.status and bool(st.fill_premium)
+        total = st.filled_lots
+        if total is None:
+            total = pend["lots"] if (st.status == "FILLED" or legacy_fill) else 0
+        total = max(0, min(int(total), int(pend["lots"])))
+        prev = int(pend.get("filled_lots") or 0)
+        inc, inc_avg = total - prev, None
+        if inc > 0 and st.fill_premium:
+            # Broker averageprice is cumulative over the order; the new lots'
+            # own price is what the cumulative average moved by.
+            prev_avg = float(pend.get("avg_price") or 0.0)
+            inc_avg = (float(st.fill_premium) * total - prev_avg * prev) / inc
+            inc_avg = round(inc_avg if inc_avg > 0 else float(st.fill_premium), 4)
+            pend["filled_lots"] = total
+            pend["avg_price"] = float(st.fill_premium)
+        elif inc > 0:
+            self._add_alert("ORDER_UNPRICED_FILL", f"{pend['side']} {pend['symbol']}: broker "
+                            f"reports {total} lot(s) filled without an average price — "
+                            "not applied; still tracking", "critical")
+            inc = 0
+        status = st.status or ("FILLED" if legacy_fill else "")
+        terminal = (status in ("FILLED", "REJECTED", "CANCELLED")
+                    and total <= int(pend.get("filled_lots") or 0))
+        changed = inc > 0 or status != pend.get("last_status")
+        pend["last_status"] = status
+        if terminal:
+            setattr(self, attr, None)
+        elif status:
+            pend["state"] = status
+        if changed or terminal:
+            kind = ("FILL" if terminal else "PARTIAL_FILL") if inc > 0 else f"STATUS_{status or 'UNKNOWN'}"
+            self._event(kind, pend, st, inc_lots=inc or None, inc_avg_price=inc_avg)
+            if inc <= 0:
+                self._persist_state()
+        if inc > 0:
+            return OrderResult(ok=True, mode="live", side=pend["side"],
+                               option_symbol=pend["symbol"], lots=pend["lots"],
+                               filled_lots=inc, fill_premium=inc_avg,
+                               order_id=pend.get("order_id"), status=status or "FILLED",
+                               message=st.message)
+        if terminal:
+            if status in ("REJECTED", "CANCELLED"):
+                self._add_alert("ORDER_REJECTED", f"{pend['side']} {pend['symbol']}: {status} "
+                                f"{st.message}", "critical")
+            return None
+        done = int(pend.get("filled_lots") or 0)
+        return OrderResult(
+            ok=False, mode="live", side=pend["side"], option_symbol=pend["symbol"],
+            lots=pend["lots"], order_id=pend.get("order_id"),
+            status=status or "ACKNOWLEDGED",
+            message=("Order acknowledged, not filled — awaiting broker fill; no duplicate "
+                     "order will be sent." if not done else
+                     f"Partially filled ({done}/{pend['lots']} lots); remainder still working "
+                     "at the broker — no duplicate order will be sent."),
+        )
+
+    def _resolve_pending(self, attr: str) -> OrderResult | None:
+        """Read-only broker check of the pending order in ``attr`` (see
+        ``_consume_status`` for the return contract)."""
+        pend = getattr(self, attr, None)
+        if not pend:
+            return None
+        st = None
+        if pend.get("order_id"):
+            try:
+                st = self.provider.order_status(pend["order_id"])
+            except Exception:
+                st = None
+        return self._consume_status(attr, st)
+
+    def _poll_pending_entry(self) -> OrderResult | None:
+        """Reconcile an outstanding live entry. Fills for the position this order
+        already opened are added here; an increment with no position yet is
+        returned (ok=True) for ``buy`` to adopt."""
+        res = self._resolve_pending("_pending_order")
+        if res is None or not res.ok:
+            return res
+        if self.position.option_symbol:
+            if self.position.option_symbol == res.option_symbol:
+                self._add_confirmed_lots(res)
+            else:
+                self._enter_recovery(f"fill on {res.option_symbol} ({res.order_id}) while "
+                                     f"holding {self.position.option_symbol}")
+                self._apply_to_candidate(1, res)
+            return None
+        return res
+
+    def _add_confirmed_lots(self, inc: OrderResult) -> None:
+        """Residual fill of the open position's entry order: weighted-average entry."""
+        p = self.position
+        n, px = int(inc.filled_lots or 0), float(inc.fill_premium)
+        held = p.quantity_lots
+        p.entry_premium = round(((p.entry_premium or px) * held + px * n) / (held + n), 4)
+        p.quantity_lots = held + n
+        if self._auto_entry_active:
+            self._auto_entry_lots += n
+        if self._ledger_position is not None:
+            self._ledger_position.update(lots=p.quantity_lots, entry=p.entry_premium)
+            ids = self._ledger_position.setdefault("order_ids", [])
+            if inc.order_id and inc.order_id not in ids:
+                ids.append(inc.order_id)
+        self._persist_state()
+        self._add_alert("ORDER_FILL", f"Residual fill {inc.option_symbol}: +{n} lot(s) @ "
+                        f"{px:.2f}; now {p.quantity_lots} lot(s) avg {p.entry_premium:.2f}",
+                        "warning")
+
+    def _ledger_after_exit(self, remaining: int) -> None:
+        if self._ledger_position is None:
+            return
+        if remaining > 0:
+            self._ledger_position["lots"] = remaining
+        else:
+            self._ledger_position = None
+        self._persist_state()
+
+    def _poll_live_orders(self) -> None:
+        """Throttled, read-only broker reconciliation from the tick loop. Applies
+        confirmed fills only; never places, cancels or resubmits an order."""
+        now = time.time()
+        busy = (self._pending_order or self._pending_exit or self._order_recovery
+                or self._persist_error)
+        if now - self._last_order_poll < (5.0 if busy else 30.0):
+            return
+        self._last_order_poll = now
+        if not busy:
+            if order_ledger.mirror_backlog_bytes() > 0:
+                order_ledger.mirror_pending()
+            return
+        try:
+            if self._persist_error:
+                self._retry_persistence()
+            if self._order_recovery:
+                self._reconcile_recovery()
+                return
+            if self._pending_order:
+                inc = self._poll_pending_entry()
+                if inc is not None and inc.ok:
+                    res = self.buy(inc.option_symbol, lots=int(inc.filled_lots or 0),
+                                   manual=False, _fill=inc)
+                    if res.ok:
+                        self._add_alert("ORDER_FILL", f"Late broker fill adopted: "
+                                        f"{inc.option_symbol} {inc.filled_lots} lot(s) @ "
+                                        f"{inc.fill_premium:.2f} — review stop/target",
+                                        "critical")
+            if self._pending_exit and self.position.option_symbol:
+                inc = self._resolve_pending("_pending_exit")
+                if inc is not None and inc.ok:
+                    self._book_exit(int(inc.filled_lots or 0), inc.order_id, inc.fill_premium)
+        except Exception as exc:
+            self._add_alert("ORDER_RECONCILE_ERROR", f"Order reconciliation error: {exc}",
+                            "critical")
+
+    # ---------- crash-safe persistence + restart recovery ----------
+    def _persist_state(self) -> bool:
+        try:
+            order_ledger.save(self._instrument, {
+                "pending_entry": self._pending_order,
+                "pending_exit": self._pending_exit,
+                "position": self._ledger_position,
+                "recovery": dict(self._order_recovery) if self._order_recovery else None,
+            })
+            return True
+        except order_ledger.LedgerError as exc:
+            self._persist_error = f"ledger write failed: {exc}"[:200]
+            self._add_alert("LEDGER_WRITE_FAILED", f"Order ledger write failed: {exc}",
+                            "critical")
+            return False
+
+    def _event(self, kind: str, pend: dict | None = None, st: OrderResult | None = None,
+               **extra) -> bool:
+        pend = pend or {}
+        fields = {
+            "order_id": pend.get("order_id") or (st.order_id if st else None),
+            "side": pend.get("side") or (st.side if st else None),
+            "option_symbol": pend.get("symbol") or (st.option_symbol if st else None),
+            "status": st.status if st else None,
+            "lots": pend.get("lots"),
+            "filled_lots": pend.get("filled_lots"),
+            "avg_price": st.fill_premium if st else None,
+            "mode": "live",
+        }
+        if st is not None and st.message:
+            fields["broker_message"] = st.message[:200]
+        fields.update(extra)
+        try:
+            order_ledger.record_event(self._instrument, kind, **fields)
+            return True
+        except order_ledger.LedgerError as exc:
+            self._persist_error = f"audit log append failed: {exc}"[:200]
+            self._add_alert("LEDGER_WRITE_FAILED", f"Order audit log write failed ({kind}): "
+                            f"{exc}", "critical")
+            return False
+
+    def _retry_persistence(self) -> None:
+        prev = self._persist_error
+        if self._persist_state():
+            self._persist_error = None
+            self._event("PERSISTENCE_RESTORED", note=prev)
+
+    def _live_entry_block(self) -> str | None:
+        if self._order_recovery:
+            return (f"Order recovery required ({self._order_recovery.get('reason')}) — new live "
+                    "entries blocked until reconciled via /api/order-recovery.")
+        if self._persist_error:
+            return (f"Order persistence failed ({self._persist_error}) — new live entries "
+                    "blocked.")
+        return None
+
+    def _restore_live_ledger(self) -> None:
+        """After a restart, saved live state is a CLAIM, not the broker's truth:
+        restore it as unverified, block new live entries, and reconcile."""
+        try:
+            saved = order_ledger.load(self._instrument)
+        except order_ledger.LedgerError as exc:
+            self._order_recovery = {"reason": f"order ledger unreadable: {exc}"[:300],
+                              "since": time.time(), "manual_only": True}
+            self._add_alert("ORDER_RECOVERY", f"Order ledger unreadable: {exc} — new live "
+                            "entries blocked", "critical")
+            return
+        if not saved:
+            return
+        self._pending_order = saved.get("pending_entry")
+        self._pending_exit = saved.get("pending_exit")
+        pos = saved.get("position")
+        self._ledger_position = dict(pos) if pos else None
+        prev = saved.get("recovery")
+        if prev:
+            self._order_recovery = dict(prev)
+        self._enter_recovery("backend restarted with unresolved live order/position state")
+
+    def _enter_recovery(self, reason: str) -> None:
+        if self._order_recovery is None:
+            self._order_recovery = {"reason": reason[:300], "since": time.time()}
+        if self._ledger_position is not None:
+            self._ledger_position["verified"] = False
+        self._add_alert("ORDER_RECOVERY", f"Live order recovery required: {reason}. New live "
+                        "entries blocked; the saved position is NOT assumed to match the "
+                        "broker. Check the broker, then POST /api/order-recovery.", "critical")
+        self._event("RECOVERY_REQUIRED", note=reason)
+        self._persist_state()
+
+    def _apply_to_candidate(self, sign: int, inc: OrderResult) -> None:
+        """Confirmed fills seen during recovery update the UNVERIFIED saved
+        position (never ``self.position``) and the event log."""
+        rec = self._order_recovery if self._order_recovery is not None else {}
+        rec["fills_seen"] = True
+        c = self._ledger_position
+        n, px = int(inc.filled_lots or 0), float(inc.fill_premium)
+        if sign > 0 and c is None:
+            self._ledger_position = {"symbol": inc.option_symbol, "lots": n, "entry": px,
+                                     "order_ids": [inc.order_id] if inc.order_id else [],
+                                     "ts": int(time.time()), "verified": False}
+        elif c is not None and c.get("symbol") == inc.option_symbol:
+            held = int(c.get("lots") or 0)
+            if sign > 0:
+                c["entry"] = round(((c.get("entry") or px) * held + px * n) / (held + n), 4)
+                c["lots"] = held + n
+            else:
+                c["lots"] = held - n
+                if c["lots"] <= 0:
+                    self._ledger_position = None
+        else:
+            rec.setdefault("conflicts", []).append(
+                {"order_id": inc.order_id, "symbol": inc.option_symbol, "side": inc.side,
+                 "lots": n, "price": px, "ts": time.time()})
+            self._add_alert("ORDER_RECOVERY", f"Recovery conflict: fill on {inc.option_symbol} "
+                            "does not match the saved position", "critical")
+        self._persist_state()
+
+    def _reconcile_recovery(self) -> None:
+        """Read-only order-book reconciliation of restored orders. Auto-clears
+        only when every restored order ended with no fill and no position was
+        saved; anything else waits for the operator."""
+        rec = self._order_recovery
+        for attr, sign in (("_pending_order", 1), ("_pending_exit", -1)):
+            if getattr(self, attr):
+                inc = self._resolve_pending(attr)
+                if inc is not None and inc.ok:
+                    self._apply_to_candidate(sign, inc)
+        if (rec and self._ledger_position is None and not self._pending_order
+                and not self._pending_exit and not rec.get("fills_seen")
+                and not rec.get("manual_only") and not rec.get("conflicts")):
+            self._order_recovery = None
+            self._event("RECOVERY_CLEARED", note="restored orders ended unfilled; "
+                        "no saved position")
+            self._persist_state()
+
+    def recovery_status(self) -> dict:
+        rec = self._order_recovery or {}
+        p = self.position
+        return {
+            "instrument": self._instrument,
+            "recovery_required": self._order_recovery is not None,
+            "reason": rec.get("reason"),
+            "since": rec.get("since"),
+            "conflicts": rec.get("conflicts") or [],
+            "pending_entry": self._pending_order,
+            "pending_exit": self._pending_exit,
+            "saved_position": self._ledger_position,
+            "app_position": ({"symbol": p.option_symbol, "lots": p.quantity_lots,
+                              "entry": p.entry_premium} if p.option_symbol else None),
+            "persist_error": self._persist_error,
+            "live_entries_blocked": self._live_entry_block(),
+        }
+
+    def resolve_recovery(self, action: str, note: str, which: str | None = None) -> dict:
+        """Operator decision after checking the broker (authorised by the caller).
+        Every action is written to the audit log; nothing is sent to the broker."""
+        note = (note or "").strip()[:300]
+        if len(note) < 3:
+            raise ValueError("A note describing the broker-side check is required.")
+        if action == "clear_pending":
+            attr = {"entry": "_pending_order", "exit": "_pending_exit"}.get((which or "").lower())
+            if not attr:
+                raise ValueError("which must be 'entry' or 'exit'.")
+            pend = getattr(self, attr)
+            if not pend:
+                raise ValueError(f"No pending {which} order.")
+            self._event("OPERATOR_CLEARED_PENDING", pend, note=note)
+            setattr(self, attr, None)
+        elif action == "confirm_flat":
+            if self._order_recovery is None:
+                raise ValueError("No recovery in progress.")
+            if self._pending_exit:
+                raise ValueError("Resolve the pending exit order first.")
+            self._event("OPERATOR_CONFIRMED_FLAT", note=note,
+                        saved_position=self._ledger_position)
+            self._ledger_position = None
+            self._order_recovery.pop("conflicts", None)
+        elif action == "adopt_position":
+            if self._order_recovery is None:
+                raise ValueError("No recovery in progress.")
+            c = self._ledger_position
+            if not c or not c.get("lots") or not c.get("entry"):
+                raise ValueError("No saved position with lots and a broker price to adopt.")
+            if self.position.option_symbol:
+                raise ValueError("The app already holds a position on this instrument.")
+            entry = float(c["entry"])
+            opened = int(c.get("ts") or time.time())
+            self.position = Position(
+                option_symbol=c["symbol"], side="LONG", entry_premium=entry,
+                current_premium=entry, quantity_lots=int(c["lots"]),
+                trailing_stop=round(entry * 0.9, 1), entry_time=opened,
+                peak_premium=entry, trough_premium=entry,
+            )
+            self._entry_time = opened
+            self._entry_book = None
+            self._exit_book = None
+            self._entry_factors = []
+            self._entry_context = {"recovered": True, "entry_time": opened,
+                                   "order_ids": list(c.get("order_ids") or [])}
+            c["verified"] = True
+            self._order_recovery.pop("conflicts", None)
+            self._event("OPERATOR_ADOPTED_POSITION", note=note, saved_position=c)
+        else:
+            raise ValueError("action must be adopt_position, confirm_flat or clear_pending.")
+        if (self._order_recovery is not None
+                and (self._ledger_position is None or self._ledger_position.get("verified"))
+                and not self._order_recovery.get("conflicts")
+                and not any(pd and not pd.get("order_id")
+                            for pd in (self._pending_order, self._pending_exit))):
+            self._order_recovery = None
+            self._event("RECOVERY_CLEARED", note=note)
+        if not self._persist_state():
+            raise RuntimeError(f"Order ledger write failed: {self._persist_error}")
+        return self.recovery_status()
 
     def sell(self, confirm: bool = False, lots: int | None = None) -> OrderResult:
         """Close the position. ``lots`` sells only part of it (scale-out), leaving
@@ -538,16 +1104,37 @@ class AppState:
         held = self.position.quantity_lots
         partial = lots is not None and 0 < lots < held
         lots = lots if partial else held
+        if self._pending_exit:
+            exit_fill = self._resolve_pending("_pending_exit")
+            if exit_fill is not None and not exit_fill.ok:
+                return exit_fill
+            if exit_fill is not None:
+                return self._book_exit(int(exit_fill.filled_lots or 0), exit_fill.order_id,
+                                       exit_fill.fill_premium)
         order_id = None
+        exit_px = None
         if self.is_live:
             if not confirm:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Confirmation required for a live order.")
-            res = self.provider.place_order(sym, "SELL", lots)
+            res = self._submit_live("_pending_exit", sym, "SELL", lots)
             if not res.ok:
-                self._add_alert("ORDER_REJECTED", f"SELL {sym}: {res.message}", "critical")
                 return res
             order_id = res.order_id
+            lots = int(res.filled_lots or lots)
+            exit_px = res.fill_premium
+        return self._book_exit(lots, order_id, exit_px)
+
+    def _book_exit(self, lots: int, order_id: str | None,
+                   exit_px: float | None) -> OrderResult:
+        """Realise ``lots`` of the open position (all of it when ``lots >= held``).
+        A live exit is booked at the broker's confirmed average price."""
+        sym = self.position.option_symbol or ""
+        held = self.position.quantity_lots
+        lots = max(0, min(int(lots), held))
+        partial = 0 < lots < held
+        if exit_px:
+            self._mark_position(float(exit_px))
         # On a scale-out only the sold share of the position is realised; the
         # rest keeps running and is booked on the final exit.
         pnl = self.position.net_pnl * (lots / held if held else 1.0)
@@ -685,6 +1272,7 @@ class AppState:
             # keep the runner open: reduce the size, leave entry/context intact
             self.position.quantity_lots = held - lots
             self._auto_entry_lots = max(0, self._auto_entry_lots - lots)
+            self._ledger_after_exit(held - lots)
             self._add_alert(
                 "EXIT_NOW",
                 f"[{mode}] Scaled out {lots}/{held} {sym} net {pnl:+.0f}",
@@ -699,6 +1287,7 @@ class AppState:
         self._add_alert("EXIT_NOW", f"[{mode}] Exited {sym} net {pnl:+.0f}", "info")
         self.position = Position()
         self._entry_time = None
+        self._ledger_after_exit(0)
         return OrderResult(ok=True, mode=mode.lower(), side="SELL", option_symbol=sym,
                            lots=lots, fill_premium=exit_prem, order_id=order_id,
                            message=f"Exited net {pnl:+.0f}")
@@ -724,6 +1313,7 @@ class AppState:
             self.provider = self._provider_for(self._instrument)
         provider_note = self.provider.reason if isinstance(self.provider, _UnavailableProvider) else None
         self.provider.step()
+        self._poll_live_orders()
         _mark_stage(self._instrument, "cache")
         now = int(time.time())
         candles = self.provider.futures_candles(300)
@@ -2078,7 +2668,7 @@ class AppState:
         # when flat). Otherwise use the global capital vs. all-instrument deployed.
         cost_per_lot = (decision.current_premium or 0.0) * lot_size
         if inst_capital is not None and inst_capital > 0:
-            budget = inst_capital
+            budget = min(inst_capital, settings.capital)
             used = deployed_self
         else:
             budget = settings.capital
@@ -2100,7 +2690,8 @@ class AppState:
                         # Deploy 50% of balance at the confidence gate, ramping to
                         # 100% at 100% confidence.
                         frac = 0.5 + 0.5 * conf_norm
-                        budget = live_cash * frac
+                        # Balance may only shrink the budget, never exceed capital.
+                        budget = min(settings.capital, live_cash * frac)
                 except Exception:
                     pass
         if cost_per_lot > 0 and budget > 0:

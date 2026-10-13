@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import dynamic from "next/dynamic";
-import { Snapshot } from "@/lib/types";
+import { FeedHealth, Snapshot } from "@/lib/types";
 import { API_BASE, getSignalStats, SignalStats, setAutoTrade, getEngineSettings, setEntryMode, EntryMode } from "@/lib/api";
 import { buildChecks } from "@/components/ConfidenceChecklist";
 import ExpiryOpportunityPanel from "@/components/ExpiryOpportunityPanel";
@@ -347,6 +347,7 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
 
   /* ---- paper auto-trader (simulated fills only; never live orders) ---- */
   const auto = snap.auto_trade;
+  const feed = feedView(snap.feed_health);
   const [autoBusy, setAutoBusy] = useState(false);
   const pushAuto = (opts: { enabled?: boolean; min_confidence?: number; max_lots?: number }) => {
     setAutoBusy(true);
@@ -576,7 +577,11 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
             {/* persistent live option price — keeps running even after entry/buy */}
             <div className="flex items-center justify-center gap-3 pb-2 mb-1 border-b border-white/8">
               <span className="flex items-center gap-1.5 text-[11px] font-bold text-white/60">
-                <span className="w-2 h-2 rounded-full animate-pulse" style={{ background: GREEN }} /> LIVE
+                <span
+                  className={`w-2 h-2 rounded-full${feed.label === "LIVE" ? " animate-pulse" : ""}`}
+                  style={{ background: feed.color }}
+                />{" "}
+                <span style={{ color: feed.color }}>{feed.label}</span>
               </span>
               <span className="text-[11px] uppercase tracking-wide text-white/40">Option LTP</span>
               <span className="text-2xl font-black tabular-nums" style={{ color: AMBER }}>{inr(d.current_premium, 2)}</span>
@@ -937,25 +942,40 @@ function Row({ l, v, vc }: { l: string; v: string; vc?: string }) {
    instrument that has silently dropped to the 3s REST poll — or an illiquid
    strike that has stopped ticking altogether — looks identical to a live one
    on price alone, which is how a frozen premium became a tradeable signal. */
-function FeedStatus({ snap }: { snap: Snapshot }) {
-  const h = snap.feed_health;
-  const mode = h?.mode ?? snap.feed_mode;
-  if (!h) {
-    return (
-      <StatusItem
-        l="Feed"
-        v={mode === "push" ? "Live Push" : mode === "rest" ? "REST 3s" : "Simulated"}
-        c={mode === "push" ? GREEN : mode === "rest" ? AMBER : MUTED}
-      />
-    );
-  }
+/**
+ * Feed status derived ONLY from the backend's authoritative feed_health
+ * source/state. Missing or unrecognised health is UNKNOWN — never LIVE and
+ * never SIMULATED by default.
+ */
+export function feedView(h: FeedHealth | null | undefined): {
+  label: "LIVE" | "DELAYED" | "SIMULATED" | "DISCONNECTED" | "UNAVAILABLE" | "UNKNOWN";
+  color: string;
+  age: number | null;
+} {
+  if (!h) return { label: "UNKNOWN", color: AMBER, age: null };
+  const src = (h.source || "").toUpperCase();
+  const st = (h.state || "").toUpperCase();
   // The option leg is what we actually trade, so the slower of the two ages is
   // the honest one to show.
   const age = Math.max(h.underlying_age_sec ?? 0, h.option_age_sec ?? 0);
-  const stale = age > h.stale_after_sec;
-  const label = mode === "simulated" ? "Simulated" : h.live && !stale ? "LIVE" : "DELAYED";
-  const color = mode === "simulated" ? MUTED : h.live && !stale ? GREEN : AMBER;
-  const detail = mode === "simulated" ? "" : ` ${age.toFixed(0)}s`;
+  if (src === "UNAVAILABLE") return { label: "UNAVAILABLE", color: RED, age: null };
+  if (st === "DISCONNECTED") return { label: "DISCONNECTED", color: RED, age: null };
+  if (src === "SIMULATED" && st === "SIMULATED") return { label: "SIMULATED", color: MUTED, age: null };
+  if (src === "LIVE" && st === "CONNECTED") {
+    const stale = h.stale_after_sec != null && age > h.stale_after_sec;
+    return stale ? { label: "DELAYED", color: AMBER, age } : { label: "LIVE", color: GREEN, age };
+  }
+  if (src === "LIVE" && st === "DEGRADED") return { label: "DELAYED", color: AMBER, age };
+  return { label: "UNKNOWN", color: AMBER, age: null };
+}
+
+function FeedStatus({ snap }: { snap: Snapshot }) {
+  const h = snap.feed_health;
+  const v = feedView(h);
+  if (!h) return <StatusItem l="Feed" v="UNKNOWN" c={v.color} />;
+  const label = v.label;
+  const color = v.color;
+  const detail = v.age !== null ? ` ${v.age.toFixed(0)}s` : "";
   const title =
     h.note +
     (h.push_pct_today !== null ? ` · ${h.push_pct_today}% of today on push` : "") +

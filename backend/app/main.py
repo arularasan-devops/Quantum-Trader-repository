@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -30,11 +30,14 @@ from app.config import settings
 from app.engine import weights as weights_store
 from app.engine.account_risk import account as account_risk
 from app.execution import futures_paper
+from app.execution import live_control
+from app.execution import order_ledger
 from app.market import instruments as _inst_mod
 from app.market.instruments import DEFAULT_INSTRUMENT
 from app.research.pairs import spec as pair_spec
 from app.research.phase17 import store as p17store
 from app.state import registry
+from app import storage as _storage_mod
 
 _log = logging.getLogger("quantum.api")
 
@@ -960,8 +963,86 @@ async def health() -> dict:
     return {
         "status": "ok",
         "provider": settings.data_provider,
+        "data_source": "SIMULATED" if (settings.data_provider or "").lower() == "simulated"
+        else "LIVE_PROVIDER",
         "trade_mode": "live" if registry.get(DEFAULT_INSTRUMENT).is_live else "paper",
     }
+
+
+class KillSwitchRequest(BaseModel):
+    engaged: bool
+    reason: str = ""
+
+
+@app.get("/api/kill-switch")
+async def get_kill_switch() -> dict:
+    return live_control.kill_switch_status()
+
+
+@app.post("/api/kill-switch")
+async def post_kill_switch(req: KillSwitchRequest,
+                           x_qt_live_token: str | None = Header(default=None)) -> dict:
+    """Engage: always allowed, no token. Release: requires the live-arm token."""
+    if not req.engaged:
+        live_control.require_live_auth(x_qt_live_token)
+    return live_control.set_kill_switch(req.engaged, req.reason)
+
+
+class OrderRecoveryRequest(BaseModel):
+    instrument: str
+    action: str  # adopt_position | confirm_flat | clear_pending
+    note: str = ""
+    which: str | None = None  # entry | exit (clear_pending only)
+
+
+@app.get("/api/order-recovery")
+async def get_order_recovery() -> dict:
+    """Read-only: live order/position recovery state and persistence health."""
+    return {
+        "instruments": [st.recovery_status() for st in registry.active()],
+        "persistence": order_ledger.status(),
+        "journal_mirror": dict(_storage_mod.journal_mirror_status),
+    }
+
+
+@app.post("/api/order-recovery")
+async def post_order_recovery(req: OrderRecoveryRequest,
+                              x_qt_live_token: str | None = Header(default=None)) -> dict:
+    """Operator decision after checking the broker. Requires the live-arm token.
+    Records an audit event; never sends, cancels or modifies a broker order."""
+    live_control.require_live_auth(x_qt_live_token)
+    name = (req.instrument or "").upper()
+    if name not in _inst_mod.REGISTRY:
+        raise HTTPException(404, f"Unknown instrument {req.instrument}")
+    try:
+        return registry.get(name).resolve_recovery(req.action, req.note, req.which)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/db/status")
+async def db_status() -> dict:
+    """Read-only persistence check: active backend, schema version, row counts.
+
+    Never echoes the connection URL (it may carry a password)."""
+    from app.research.store import store as research_store
+
+    def _probe() -> dict:
+        return research_store().status()
+
+    try:
+        info = await asyncio.to_thread(_probe)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail={"backend": "postgresql" if settings.db_url.lower().startswith(
+                ("postgres://", "postgresql://")) else "sqlite",
+                "error": type(exc).__name__},
+        ) from exc
+    info["configured"] = bool(settings.db_url)
+    return info
 
 
 @app.get("/api/snapshot")
@@ -989,26 +1070,38 @@ async def snapshot(instrument: str | None = None) -> dict:
 
 
 @app.post("/api/buy")
-async def buy(req: BuyRequest) -> dict:
+async def buy(req: BuyRequest,
+              x_qt_live_token: str | None = Header(default=None)) -> dict:
     st = registry.get(_norm_instrument(req.instrument))
+    if st.is_live:
+        live_control.require_live_auth(x_qt_live_token)
     result = st.buy(req.option_symbol, req.lots, req.confirm)
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
 
 
 @app.post("/api/sell")
-async def sell(req: SellRequest | None = None) -> dict:
+async def sell(req: SellRequest | None = None,
+               x_qt_live_token: str | None = Header(default=None)) -> dict:
     st = registry.get(_norm_instrument(req.instrument if req else None))
+    if st.is_live:
+        live_control.require_live_auth(x_qt_live_token)
     result = st.sell((req.confirm if req else False))
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
 
 
 @app.post("/api/auto-trade")
-async def auto_trade(req: AutoTradeRequest) -> dict:
+async def auto_trade(req: AutoTradeRequest,
+                     x_qt_live_token: str | None = Header(default=None)) -> dict:
     """Toggle/configure the PAPER auto-trader at runtime. Simulated fills only —
     it is hard-guarded off whenever trade_mode is live and never places a real
     order. Mutates the process-wide settings so it applies to every instrument."""
     from app.config import settings
 
+    if (req.allow_live or req.live_max_order_value is not None
+            or req.live_max_lots is not None):
+        live_control.require_live_auth(x_qt_live_token)
+    if req.enabled and live_control.kill_switch_engaged():
+        raise HTTPException(409, "Kill switch is engaged; release it before enabling the bot.")
     if req.enabled is not None:
         settings.auto_trade_enabled = bool(req.enabled)
     if req.min_confidence is not None:
@@ -1022,7 +1115,7 @@ async def auto_trade(req: AutoTradeRequest) -> dict:
     if req.trail_pct is not None:
         settings.auto_trade_trail_pct = max(2.0, min(50.0, float(req.trail_pct)))
     if req.capital is not None:
-        settings.capital = max(1000.0, float(req.capital))
+        settings.capital = live_control.clamp_capital(req.capital)
     if req.risk_per_trade_pct is not None:
         settings.risk_per_trade_pct = max(0.1, min(20.0, float(req.risk_per_trade_pct)))
     if req.daily_profit_target is not None:
@@ -1032,7 +1125,8 @@ async def auto_trade(req: AutoTradeRequest) -> dict:
     if req.allow_live is not None:
         settings.auto_trade_allow_live = bool(req.allow_live)
     if req.live_max_order_value is not None:
-        settings.auto_trade_live_max_order_value = max(0.0, float(req.live_max_order_value))
+        settings.auto_trade_live_max_order_value = min(
+            max(0.0, float(req.live_max_order_value)), settings.capital)
     if req.live_max_lots is not None:
         settings.auto_trade_live_max_lots = max(1, min(50, int(req.live_max_lots)))
     if req.zero_to_hero_enabled is not None:
@@ -1049,7 +1143,7 @@ async def auto_trade(req: AutoTradeRequest) -> dict:
         settings.auto_trade_pre_t1_trail = bool(req.pre_t1_trail)
     if req.instrument_capital is not None:
         settings.auto_trade_instrument_capital = {
-            str(k).upper(): max(0.0, float(v))
+            str(k).upper(): min(max(0.0, float(v)), settings.capital)
             for k, v in req.instrument_capital.items()
             if v is not None and float(v) > 0
         }
@@ -1088,11 +1182,14 @@ async def auto_trade(req: AutoTradeRequest) -> dict:
         "instrument_lots": settings.auto_trade_instrument_lots,
         "trade_mode": settings.trade_mode,
         "mode": "live" if live_armed else "paper",
+        "configured_capital": live_control.CONFIGURED_CAPITAL,
+        "kill_switch": live_control.kill_switch_engaged(),
     }
 
 
 @app.post("/api/auto-buy")
-async def auto_buy(req: AutoBuyRequest) -> dict:
+async def auto_buy(req: AutoBuyRequest,
+                   x_qt_live_token: str | None = Header(default=None)) -> dict:
     """ONE-CLICK LIVE auto-buy switch. Flipping ``on`` true wires the whole
     hands-off flow in a single action: enable the bot, arm it for live orders,
     size every entry from your REAL available balance scaled by the signal's
@@ -1108,6 +1205,10 @@ async def auto_buy(req: AutoBuyRequest) -> dict:
     from app.config import settings
     from app.market import angelone
 
+    if req.on:
+        live_control.require_live_auth(x_qt_live_token)
+        if live_control.kill_switch_engaged():
+            raise HTTPException(409, "Kill switch is engaged; release it before arming.")
     balance: float | None = None
     try:
         balance = angelone.available_cash(ttl=5.0)
@@ -1142,13 +1243,13 @@ async def auto_buy(req: AutoBuyRequest) -> dict:
         settings.auto_trade_quick_scalp_lots = 0
         # Use the engine's regime ATR stop as-is (wide). 0 = no extra tightening.
         settings.auto_trade_max_stop_pct = 0.0
-        # Blast-radius backstop: a single live order can never exceed the cash you
-        # actually hold. Keep the prior cap if the balance can't be read.
+        # Balance can only SHRINK the per-order ceiling; it never raises it above
+        # the configured live cap or the strategy capital, and live lots stay at
+        # the configured cap (no silent expansion).
+        ceiling = min(settings.auto_trade_live_max_order_value, settings.capital)
         if balance and balance > 0:
-            settings.auto_trade_live_max_order_value = round(balance, 2)
-        # Let the confidence-scaled balance budget drive lot count (bounded by the
-        # order-value cap above), rather than a tiny fixed lot ceiling.
-        settings.auto_trade_live_max_lots = max(settings.auto_trade_live_max_lots, 50)
+            ceiling = min(ceiling, round(balance, 2))
+        settings.auto_trade_live_max_order_value = ceiling
     else:
         settings.auto_trade_enabled = False
         settings.auto_trade_allow_live = False

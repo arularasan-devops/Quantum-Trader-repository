@@ -136,7 +136,15 @@ class Settings(BaseSettings):
     orders_on_primary_only: bool = True
 
     # --- Risk management / position sizing ---
+    # Single strategy-capital source of truth (QT_CAPITAL). Runtime API changes
+    # may only lower it; broker balance never raises it (execution/live_control).
     capital: float = 500000.0            # trading capital used for sizing (₹5L)
+    # Shared secret required (X-QT-Live-Token) to arm anything that can reach a
+    # broker. Empty = live arming refused. Never commit a real value.
+    live_arm_token: str = ""
+    # How long a live order may stay acknowledged-but-unfilled before the entry
+    # is treated as pending (no position opened, no duplicate order).
+    order_fill_timeout_sec: float = 5.0
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
     # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
     # change the engine's actual quantity (see app/journal/sizing.py).

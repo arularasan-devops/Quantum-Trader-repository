@@ -801,6 +801,10 @@ export interface FeedHealth {
   push_pct_today: number | null;
   fallbacks_today: number;
   note: string;
+  provider?: string;
+  source?: string; // LIVE | SIMULATED | UNAVAILABLE | UNKNOWN
+  state?: string; // CONNECTED | DEGRADED | DISCONNECTED | SIMULATED
+  checked_at?: number | null;
 }
 
 export interface Snapshot {
