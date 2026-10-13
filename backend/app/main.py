@@ -128,7 +128,7 @@ def _exchange_open(instrument: str) -> bool:
     ``ignore_market_hours`` (the simulated 24/7 demo default) keeps everything
     open, so the simulator and the smokes are unaffected.
     """
-    if settings.ignore_market_hours:
+    if settings.hours_ignored():
         return True
     from app.market.instruments import get_spec
 

@@ -1251,8 +1251,14 @@ class Settings(BaseSettings):
     # instruments all evening — the exact cost that slows the names still trading.
     equity_close_ist: str = "15:30"
     market_days: str = "0-4"  # 0=Mon … 6=Sun
-    # Simulated demo runs 24/7; set false with a live feed to respect hours.
+    # Simulated demo runs 24/7. Only honoured for the simulator: a real broker
+    # feed always respects exchange hours (see hours_ignored).
     ignore_market_hours: bool = True
+
+    def hours_ignored(self) -> bool:
+        return self.ignore_market_hours and self.data_provider.lower() in (
+            "simulated", "sim", "demo",
+        )
 
     def minutes_to_close(self, now_utc: float) -> int:
         """Minutes left in the IST session (0 once it has closed).
