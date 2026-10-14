@@ -2,43 +2,6 @@
 @tailwind components;
 @tailwind utilities;
 
-html,
-body {
-  background: #090c10;
-  color: #e6edf3;
-  height: 100%;
-}
-
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-thumb {
-  background: #1e2733;
-  border-radius: 8px;
-}
-
-.panel {
-  @apply bg-panel border border-line rounded-xl;
-}
-.panel-title {
-  @apply text-[11px] uppercase tracking-widest text-muted px-3 pt-3 pb-2;
-}
-
-@keyframes pulseGlow {
-  0%,
-  100% {
-    filter: brightness(1);
-  }
-  50% {
-    filter: brightness(1.12);
-  }
-}
-.decision-pulse {
-  animation: pulseGlow 2.2s ease-in-out infinite;
-}
-
-/* Integrated local dashboard styles */
 :root {
   --accent: #16c784;
   --accent-dim: rgba(22, 199, 132, 0.15);
@@ -74,7 +37,19 @@ body {
 }
 /* A card that must scroll its own content. `.card` clips to its rounded corners
    with overflow:hidden, and because this file is plain CSS after
-overscroll-behavior: contain;
+   @tailwind utilities, that also overrides Tailwind's `overflow-auto` at equal
+   specificity — which silently made tall modals unscrollable (the watchlist ran
+   off the bottom of the screen with no scrollbar). Opt in explicitly instead. */
+.card-scroll {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+/* Same escape hatch, sideways: a card that is a single scrollable row (the tab
+   bar). Vertical stays clipped so the row cannot be nudged off its own line. */
+.card-scroll-x {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
 }
 .card-accent {
   border-color: color-mix(in srgb, var(--accent) 45%, transparent);

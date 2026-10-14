@@ -1425,8 +1425,6 @@ class AppState:
         # Stabilise the recommendation so it is concrete/actionable, not flickering.
         decision = self._stabilize(raw_decision, in_pos, now)
         self._annotate_averaging(decision, in_pos)
-        if not in_pos:
-            self._block_closed_market(decision, now)
 
         # Risk Management v2 (feature-flagged, reversible): refine the premium stop
         # with a Greeks-aware model and run the Pre-Trade Validator. Runs AFTER the
@@ -1721,7 +1719,7 @@ class AppState:
         # login (build_provider has no silent fallback), so provider == angelone
         # means a live feed is connected.
         feed_label = "LIVE Angel One feed" if settings.data_provider.lower() == "angelone" else "SIMULATED feed"
-        if settings.hours_ignored():
+        if settings.ignore_market_hours:
             session_note = "Live session" if is_open else session_note
             is_open = True
         session_note = f"{session_note} · {feed_label}"
@@ -1917,20 +1915,6 @@ class AppState:
         c.next_review_seconds = max(0, int(settings.signal_min_hold_seconds - age))
         self._mark_plan(c, now)
         return c
-
-    def _block_closed_market(self, c: Decision, now: float) -> None:
-        """A real feed keeps streaming frozen quotes after the bell; never turn
-        them into a fresh BUY (or an auto-entry) outside exchange hours."""
-        if settings.hours_ignored():
-            return
-        is_open, note = settings.market_session(now, get_spec(self._instrument).exchange)
-        if is_open or not (c.signal == Signal.BUY or c.market_signal == Signal.BUY):
-            return
-        if c.signal == Signal.BUY:
-            c.signal = Signal.WAIT
-        if c.market_signal == Signal.BUY:
-            c.market_signal = Signal.WAIT
-        c.reasons = [f"WAIT — {note}; no new entry outside market hours", *c.reasons][:6]
 
     def _mark_plan(self, c: Decision, now: float) -> None:
         """Stamp plan freshness on the decision and suppress an unenterable BUY.

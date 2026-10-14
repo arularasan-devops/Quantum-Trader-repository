@@ -167,10 +167,10 @@ def load_series(instrument: str) -> Series | None:
     """
     rel = BACKTEST_FILES.get(instrument.upper())
     if not rel:
-        return _imported_series(instrument)
+        return None
     path = _resolve(rel)
     if not os.path.exists(path):
-        return _imported_series(instrument)
+        return None
     seen: set[int] = set()
     rows: list[dict] = []
     with open(path, encoding="utf-8") as fh:
@@ -190,38 +190,6 @@ def load_series(instrument: str) -> Series | None:
     if not rows:
         return None
     return Series(instrument.upper(), rows)
-
-
-def _imported_series(instrument: str) -> "Series | None":
-    """Fall back to an operator-imported historical CSV, when one is registered.
-
-    Additive and last in precedence: a shipped five-year file always wins, so no
-    existing result changes source, and with no imports registered this returns
-    ``None`` exactly as the bare lookup did. The import layer is what decides
-    eligibility; nothing is re-judged here on friendlier terms.
-    """
-    try:
-        from app.research.historical_import import adapter
-    except ImportError:
-        # The import layer is an overlay; a tree without it behaves as before.
-        return None
-    return adapter.load_series(instrument, timeframe=1)
-
-
-def _imported_instruments() -> set[str]:
-    """Instruments an operator has imported a CSV for, so coverage names them.
-
-    Additive: an empty registry leaves the requested universe exactly as it was.
-    """
-    try:
-        from app.research.historical_import import registry
-    except ImportError:
-        return set()
-    return {
-        (r.get("instrument") or "").upper()
-        for r in registry.datasets()
-        if r.get("dataset_id") and int(r.get("timeframe") or 0) == 1
-    } - {""}
 
 
 def _thin_instruments() -> dict[str, dict]:
@@ -264,8 +232,7 @@ def coverage() -> dict:
     thin = _thin_instruments()
     usable: list[dict] = []
     excluded: list[dict] = []
-    for inst in sorted(set(INDEX) | set(MCX) | set(BACKTEST_FILES)
-                       | _imported_instruments()):
+    for inst in sorted(set(INDEX) | set(MCX) | set(BACKTEST_FILES)):
         s = load_series(inst)
         if s is not None and len(s) >= MIN_BARS:
             sessions = int(np.unique(s.ts // 86_400).size)

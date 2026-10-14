@@ -38,8 +38,6 @@ from app.research.phase17 import (
     store,
     tracker,
 )
-from app.research.phase45 import service as p45
-from app.research.phase50 import tiers as p50tiers
 
 _LOCK = threading.Lock()
 _STATE: dict[str, object] = {
@@ -68,59 +66,6 @@ _MAX_TODAY_FLOOR = 400
 def _max_today() -> int:
     return max(_MAX_TODAY_FLOOR,
                _MAX_TODAY_PER_INSTRUMENT * len(capture.universe()))
-
-
-_HEARTBEAT_STOP = threading.Event()
-_HEARTBEAT: threading.Thread | None = None
-# Half the journal's rate limit, so a scheduling hiccup cannot cost a minute's
-# line and turn a live process into apparent downtime.
-_HEARTBEAT_TICK_SEC = store.PROCESS_INTERVAL_SEC / 2.0
-
-
-def _heartbeat_loop() -> None:
-    """Write the process-liveness line until asked to stop. Never raises.
-
-    Deliberately its own thread and not part of the tick: the whole value of the
-    line is that it keeps being written when the capture loop has stopped
-    writing its own, which is the difference between "restart supervision would
-    have recovered these minutes" and "restarting fixes nothing".
-    """
-    while not _HEARTBEAT_STOP.wait(_HEARTBEAT_TICK_SEC):
-        try:
-            store.note_process_alive()
-            # Same thread, and for the same reason: it is still running when
-            # the tick path has wedged. "The tick path did not run" was as far
-            # as the process journal could take a stall, and it named no
-            # instrument and no line of code to go and look at.
-            store.note_stall()
-        except Exception as exc:  # a diagnostic must not kill its own thread
-            _note_failure(exc)
-
-
-def start_process_heartbeat() -> bool:
-    """Start the process-liveness thread once. Returns whether it is running."""
-    global _HEARTBEAT
-    if not settings.phase17_capture:
-        return False
-    with _LOCK:
-        if _HEARTBEAT is not None and _HEARTBEAT.is_alive():
-            return True
-        _HEARTBEAT_STOP.clear()
-        _HEARTBEAT = threading.Thread(
-            target=_heartbeat_loop, name="phase17-process-liveness", daemon=True)
-        _HEARTBEAT.start()
-    store.note_process_alive()
-    return True
-
-
-def stop_process_heartbeat() -> None:
-    """Test and shutdown seam. Leaves the journal alone."""
-    global _HEARTBEAT
-    _HEARTBEAT_STOP.set()
-    with _LOCK:
-        thread, _HEARTBEAT = _HEARTBEAT, None
-    if thread is not None:
-        thread.join(timeout=2.0)
 
 
 def _note_failure(exc: Exception) -> None:
@@ -229,32 +174,18 @@ def observe(
     """
     if not settings.phase17_capture:
         return None
-    # Before eligibility, sampling and the build, all of which can refuse the
-    # row: the question a coverage hole raises is whether the tick path ran at
-    # all, and only a line written unconditionally answers it. Rate-limited to
-    # one a minute, so a wide universe costs one line per minute, not per tick.
-    store.note_liveness(instrument)
     if not capture.eligible(instrument):
         with _LOCK:
             _STATE["skipped_ineligible"] = int(_STATE["skipped_ineligible"]) + 1
-        store.note_gap(instrument, store.NOT_IN_UNIVERSE)
         return None
     # §77: CRUDEOIL every tick, the other four MCX names sampled. They stay in
     # the universe — a single day of vehicle evidence is not grounds for
     # removing an instrument — but they no longer write a row per tick each.
-    #
-    # The sampled gate is now the Phase 50 research tier: 15 seconds instead of
-    # 60, because the 60-second one is what left 47 of 86 events unable to
-    # answer a 15-second observation grid. Same signature, same inputs — the
-    # instrument, the clock and the last capture instant, never the overlay
-    # state — and reverting the flag restores the previous gate. This is the
-    # research recorder; no production scanner, signal or order path reads it.
     with _LOCK:
         last = _LAST_CAPTURE.get((instrument or "").upper())
-    if not p50tiers.due(instrument, now=time.time(), last_capture_ts=last):
+    if not mcx.due(instrument, now=time.time(), last_capture_ts=last):
         with _LOCK:
             _STATE["skipped_sampled"] = int(_STATE["skipped_sampled"]) + 1
-        store.note_gap(instrument, store.SAMPLED_TIER)
         return None
     try:
         now = time.time()
@@ -275,21 +206,8 @@ def observe(
             window_steps=int(settings.phase17_window_steps),
         )
         if obs is None:
-            # The tick ran and produced nothing. Which of the two reasons it
-            # was matters: an empty chain is a feed problem, a chain with no
-            # usable contract is a strike-window problem, and the coverage
-            # hole they leave behind is identical.
-            store.note_gap(
-                instrument,
-                store.NO_OPTION_CHAIN if not chain else store.NO_CONTRACT,
-            )
             return None
         _roll_session(obs.session or "")
-        # Which cadence this session was captured under, journalled once per
-        # session. The fresh-sample rule needs the boundary in the data: a
-        # comparison counts sessions carrying the new fingerprint rather than
-        # assuming the sessions it holds share one policy.
-        p50tiers.note_session(obs.session or "", now=now)
 
         # Premium history first — see the module docstring.
         entry_mod.note_chain([obs.selected] if obs.selected else [], ts=obs.capture_ts)
@@ -328,17 +246,9 @@ def observe(
             with _LOCK:
                 _STATE["written"] = int(_STATE["written"]) + 1
         store.note_coverage(instrument, now=now)
-        # Last, after the raw row is on disk and every production side effect
-        # has already happened, so the shadow board reads evidence it cannot
-        # have altered. It returns counts, never a decision, and never raises.
-        p45.observe(obs)
         return obs.observation_id
     except Exception as exc:  # research capture must never break a tick
         _note_failure(exc)
-        try:
-            store.note_gap(instrument, store.CAPTURE_RAISED)
-        except Exception:  # the diagnostic must not become the failure
-            pass
         return None
 
 
@@ -459,14 +369,9 @@ def health() -> dict:
         "mcx_tiers": {
             "deep": sorted(mcx.DEEP_CAPTURE),
             "sampled": sorted(mcx.SAMPLED_CAPTURE),
-            # What the gate actually is now, beside the number it used to be, so
-            # a reader of the health payload can tell which cadence a running
-            # process is capturing under without reading the config.
-            "sample_interval_sec": p50tiers.slow_tier_sec(),
-            "previous_sample_interval_sec": mcx.SAMPLE_INTERVAL_SEC,
+            "sample_interval_sec": mcx.SAMPLE_INTERVAL_SEC,
             "basis": mcx.BASIS,
         },
-        "tier_cadence": p50tiers.policy(),
         "today_rows": len(_TODAY),
         "session": _SESSION,
         "tracker": tracker.health(),

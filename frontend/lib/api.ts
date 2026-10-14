@@ -1,87 +1,16 @@
-import { BacktestResult, EconomicEvent, EventGuard, Fundamentals, PerformanceReport } from "./types";
+import {
+  BacktestResult,
+  EconomicEvent,
+  EventGuard,
+  Fundamentals,
+  FuturesSignalCard,
+  PerformanceReport,
+} from "./types";
 
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 export const WS_BASE =
   process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8000";
-
-// Live-arm token (X-QT-Live-Token). Held in memory only: never written to
-// localStorage/sessionStorage/cookies, never put in a URL, never logged. It is
-// gone after a page reload by design. Sent only on order / arming calls.
-let liveToken: string | null = null;
-
-export function setLiveToken(token: string | null) {
-  liveToken = token && token.trim() ? token.trim() : null;
-}
-
-if (typeof window !== "undefined") {
-  // Remove the token an earlier build kept in persistent browser storage.
-  try {
-    window.localStorage.removeItem("qt_live_token");
-  } catch {
-    /* storage unavailable */
-  }
-}
-
-function liveHeaders(token?: string): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  const t = token ?? liveToken;
-  if (t) h["X-QT-Live-Token"] = t;
-  return h;
-}
-
-async function errorDetail(res: Response): Promise<string> {
-  try {
-    const j = await res.json();
-    const d = j?.detail ?? j;
-    return typeof d === "string" ? d : JSON.stringify(d);
-  } catch {
-    return res.statusText || "request failed";
-  }
-}
-
-export interface KillSwitchState {
-  engaged: boolean;
-  reason: string;
-  ts: number | null;
-}
-
-export async function getKillSwitch(): Promise<KillSwitchState> {
-  const res = await fetch(`${API_BASE}/api/kill-switch`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Kill-switch status failed (${res.status}): ${await errorDetail(res)}`);
-  return res.json();
-}
-
-/** Engage: no token needed — anyone may stop new entries. */
-export async function engageKillSwitch(reason = ""): Promise<KillSwitchState> {
-  const res = await fetch(`${API_BASE}/api/kill-switch`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ engaged: true, reason }),
-  });
-  if (!res.ok) throw new Error(`Engage failed (${res.status}): ${await errorDetail(res)}`);
-  return res.json();
-}
-
-/** Release: requires the live-arm token, passed once in a header and not kept. */
-export async function releaseKillSwitch(token: string, reason = ""): Promise<KillSwitchState> {
-  const res = await fetch(`${API_BASE}/api/kill-switch`, {
-    method: "POST",
-    headers: liveHeaders(token),
-    body: JSON.stringify({ engaged: false, reason }),
-  });
-  if (!res.ok) throw new Error(`Release failed (${res.status}): ${await errorDetail(res)}`);
-  return res.json();
-}
-
-export async function setKillSwitch(engaged: boolean, reason = "") {
-  const res = await fetch(`${API_BASE}/api/kill-switch`, {
-    method: "POST",
-    headers: liveHeaders(),
-    body: JSON.stringify({ engaged, reason }),
-  });
-  return res.json();
-}
 
 export interface OrderResult {
   ok: boolean;
@@ -92,8 +21,6 @@ export interface OrderResult {
   fill_premium: number | null;
   order_id: string | null;
   message: string;
-  status?: string;
-  filled_lots?: number | null;
 }
 
 export async function buyOption(
@@ -104,7 +31,7 @@ export async function buyOption(
 ) {
   const res = await fetch(`${API_BASE}/api/buy`, {
     method: "POST",
-    headers: liveHeaders(),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ option_symbol, lots, confirm, instrument }),
   });
   return res.json() as Promise<{ result: OrderResult; position: unknown }>;
@@ -166,7 +93,7 @@ export async function fetchSignalScan() {
 export async function sellPosition(confirm = false, instrument?: string) {
   const res = await fetch(`${API_BASE}/api/sell`, {
     method: "POST",
-    headers: liveHeaders(),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ confirm, instrument }),
   });
   return res.json() as Promise<{ result: OrderResult; position: unknown }>;
@@ -274,7 +201,7 @@ export interface AutoBuyStatus {
 export async function setAutoBuy(on: boolean) {
   const res = await fetch(`${API_BASE}/api/auto-buy`, {
     method: "POST",
-    headers: liveHeaders(),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ on }),
   });
   return res.json() as Promise<AutoBuyStatus>;
@@ -305,7 +232,7 @@ export async function setAutoTrade(opts: {
 }) {
   const res = await fetch(`${API_BASE}/api/auto-trade`, {
     method: "POST",
-    headers: liveHeaders(),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(opts),
   });
   return res.json() as Promise<AutoTradeConfig>;
@@ -458,7 +385,18 @@ export interface ScreenerRow {
   opportunity_label: string;
   trade_quality: string;
   expected_move_points: number | null;
-  win_probability: number | null;
+  /** Conviction on 0..100, not a probability: it cannot print below 50 and
+   *  averaged 78 where the target was actually reached 42.8% of the time. */
+  conviction_meter: number | null;
+  /** The measured target-before-stop frequency for this trade's reward:risk,
+   *  underlying-only — this is the number that may be read as a rate. */
+  observed_target_rate: {
+    target_hit_rate_pct: number;
+    expectancy_r: number;
+    sample: number;
+    band: string;
+    window: string;
+  } | null;
   moneyness: string | null;
   expected_holding_minutes: number | null;
   spot_price: number | null;
@@ -555,7 +493,14 @@ export interface FlowInstrumentStat {
   win_rate: number;
   switch_rate: number;
   avg_final_pts: number;
-  net_rupees: number;
+  /** Net of brokerage, statutory charges and spread. Null when uncostable. */
+  net_rupees: number | null;
+  gross_rupees: number;
+  cost_rupees: number | null;
+  avg_net_pts: number | null;
+  avg_cost_pts: number | null;
+  net_win_rate: number | null;
+  costed_legs: number;
   avg_hold_min: number;
   best_pts: number | null;
 }
@@ -573,12 +518,24 @@ export interface FlowRecent {
   max_gain_points: number | null;
   final_rupees: number | null;
   max_gain_rupees: number | null;
+  /** Round-trip cost this leg paid, and what is left after it. */
+  cost_points?: number | null;
+  cost_rupees?: number | null;
+  cost_spread_points?: number | null;
+  cost_spread_source?: string | null;
+  net_points?: number | null;
+  net_rupees?: number | null;
+  net_win?: boolean | null;
   lots: number | null;
   lot_size: number | null;
   win: boolean;
   close_reason: string;
   duration_sec: number;
   agreement: string;
+  /** IST trading date and clock times of the leg. Derived for older rows. */
+  session?: string | null;
+  open_time_ist?: string | null;
+  close_time_ist?: string | null;
 }
 
 export interface FlowSummary {
@@ -589,14 +546,47 @@ export interface FlowSummary {
   profit_factor: number | null;
   avg_hold_min: number | null;
   false_signal_rate: number;
-  net_rupees: number;
+  /** Headline P&L, net of costs. Null when no leg could be costed. */
+  net_rupees: number | null;
+  gross_rupees: number;
+  costs: FlowCostBlock;
   instruments: FlowInstrumentStat[];
   recent: FlowRecent[];
+  /** The single session these numbers cover, or null for every recorded one. */
+  session?: string | null;
+  sessions?: string[];
   as_of: number;
 }
 
-export async function getFlowReport(limit = 200) {
-  const res = await fetch(`${API_BASE}/api/flow-report?limit=${limit}`);
+/** What the round trips cost, beside what the legs earned before paying them. */
+export interface FlowCostBlock {
+  costed_legs: number;
+  coverage_pct: number;
+  measured_spread_legs?: number;
+  assumed_spread_legs?: number;
+  cost_points?: number;
+  cost_rupees?: number;
+  gross_points?: number;
+  net_points?: number;
+  cost_per_leg_points?: number;
+  gross_per_leg_points?: number;
+  /** Cost per leg over gross edge per leg. Above 1 the trade count is the loss. */
+  cost_to_gross_edge?: number | null;
+  net_win_rate?: number;
+  verdict:
+    | "NOT_COSTED"
+    | "GROSS_NEGATIVE"
+    | "COST_EXCEEDS_EDGE"
+    | "COST_HALVES_EDGE"
+    | "COST_COVERED";
+  note: string;
+}
+
+/** `session` takes an IST date or `TODAY`, which the server resolves. */
+export async function getFlowReport(limit = 200, session?: string) {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (session) q.set("session", session);
+  const res = await fetch(`${API_BASE}/api/flow-report?${q.toString()}`);
   return res.json() as Promise<{
     enabled: boolean;
     paper_lots: number;
@@ -631,6 +621,21 @@ export interface JournalTrade {
   note: string | null;
   /** PULLBACK / REVERSAL / IGNITION / MOMENTUM / ... — which trigger opened it. */
   entry_trigger: string | null;
+  /** SIGNAL or FLOW — which book the row belongs to. */
+  book?: string | null;
+  /** Charges itemised. Brokerage is per ORDER; rows written before that
+   *  correction carry cost_model COST_MODEL_OLD and are left as they were. */
+  brokerage?: number | null;
+  statutory?: number | null;
+  brokerage_per_order?: number | null;
+  cost_model?: string | null;
+  /** MEASURED / PARTIAL_* / UNKNOWN — a spread is never modelled onto a row. */
+  cost_status?: string | null;
+  entry_bid?: number | null;
+  entry_ask?: number | null;
+  exit_bid?: number | null;
+  exit_ask?: number | null;
+  spread_cost_rupees?: number | null;
 }
 
 /** Per-trigger performance, so the unproven entries can be judged on real fills. */
@@ -642,8 +647,22 @@ export interface TriggerStats {
   profit_factor: number | null;
 }
 
-/** Which book to score: everything, the option engine, or the futures paper tool. */
-export type JournalBook = "all" | "options" | "futures";
+/** What was held out of the journal's figures, and what it was worth.
+ *
+ * Seeded demonstration rows are excluded rather than deleted: a reader who
+ * remembers a ₹1.94L journal needs to see where that total went. */
+export interface JournalProvenance {
+  real_trades: number;
+  excluded_seeded: number;
+  excluded_pnl: number;
+  excluded_win_rate: number | null;
+  note: string;
+}
+
+/** Which book to score: everything, the option engine, the futures paper tool,
+ *  or the Flow book on its own. Flow is held out of every other view — pooled,
+ *  its one-minute legs decide each aggregate by weight of numbers. */
+export type JournalBook = "all" | "options" | "futures" | "flow";
 
 export async function getTradeJournal(limit = 500, book: JournalBook = "all") {
   const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}`);
@@ -654,11 +673,435 @@ export async function getTradeJournal(limit = 500, book: JournalBook = "all") {
     net_pnl: number;
     trades: JournalTrade[];
     by_trigger: Record<string, TriggerStats>;
+    provenance: JournalProvenance;
+    book?: string;
+    flow_excluded?: boolean;
   }>;
 }
 
 export function tradeJournalCsvUrl(limit = 5000, book: JournalBook = "all") {
   return `${API_BASE}/api/trade-journal.csv?limit=${limit}&book=${book}`;
+}
+
+/** One row of the Signal Board Journal: what the board said, and what followed.
+ *
+ * The record made at signal time and the outcome are kept apart on purpose —
+ * `market_state`, `signal_info` and `entry_plan` are exactly what was computed
+ * then, and `outcome_record` is attached beside them, never merged into them, so
+ * hindsight cannot edit the original call. A field that was never recorded is
+ * `null` or `UNAVAILABLE`; it is never filled in with a plausible value.
+ */
+export interface SignalBoardRow {
+  signal_id: string;
+  episode_id: string | null;
+  recorded_at: string;
+  board_action: string;
+  position_signal: string | null;
+  followed: boolean;
+  market_state: Record<string, unknown>;
+  /** Score, confidence, reasons — and the gate trace and setup evidence, which
+   *  the journal keeps here rather than in blocks of their own. */
+  signal_info: Record<string, unknown>;
+  volatility: Record<string, unknown>;
+  entry_plan: Record<string, unknown>;
+  note: string | null;
+  immutable: boolean;
+  /** Identity of the call, at the top level of the record. */
+  session: string | null;
+  time_ist: string | null;
+  ts: number | null;
+  instrument: string | null;
+  exchange: string | null;
+  lot_size: number | null;
+  vehicle: string | null;
+  option_type: string | null;
+  strike: number | null;
+  expiry: string | null;
+  tradingsymbol: string | null;
+  moneyness: string | null;
+  premium: number | null;
+  setup_type: string | null;
+  volatility_class: string | null;
+  signal_score: number | null;
+  outcome_state: string | null;
+  outcome_record: Record<string, unknown> | null;
+  /** OPTIONS | FUTURES, and the exact leg behind it. */
+  market?: string | null;
+  signal_vehicle?: string | null;
+  /** Lifecycle status: ACTIVE | RESOLVED | INVALIDATED | MISSED_DISPLAY |
+   *  MISSED_EXECUTION. Derived from the lifecycle ledger, not from the outcome. */
+  signal_status?: string | null;
+  t1_hit: boolean;
+  t2_hit: boolean;
+  t3_hit: boolean;
+  stop_hit: boolean;
+  realized_r: number | null;
+  minutes_to_resolution: number | null;
+  speed: string | null;
+  expiry_day: boolean | null;
+  /** Conviction as the board displayed it, and the reasons it printed. */
+  conviction_pct: number | null;
+  /** The engine's 0..100 conviction reading. Measured at 78 average on a 42.8%
+   *  event, so it is never rendered as a chance of winning. */
+  conviction_meter: number | null;
+  reason_text: string | null;
+  reason_codes: string[] | null;
+  /** What the premium did: entry, peak, worst and where it ended. Points are on
+   *  the premium itself, so they are what a one-lot position moved by. Blank
+   *  while the call is still open — an open trade has no exit. */
+  entry_premium: number | null;
+  final_premium: number | null;
+  peak_points: number | null;
+  peak_pct: number | null;
+  worst_points: number | null;
+  worst_pct: number | null;
+  minutes_to_peak: number | null;
+  net_points: number | null;
+  net_pct: number | null;
+  /** The market read and the chosen vehicle judged apart (Part 24). Present only
+   *  once the call resolved; a wrong vehicle on a right market read is a
+   *  VEHICLE_FAILURE, not a wrong call on direction. */
+  market_signal_correct?: boolean | null;
+  vehicle_signal_correct?: boolean | null;
+  failure_kind?: string | null;
+  market_move_points?: number | null;
+  attribution_note?: string | null;
+}
+
+/** Whether the journal is actually being written to, from the server's own view
+ *  of the file. Read by the Reports tab so an empty table states its reason. */
+export interface JournalRecording {
+  enabled: boolean;
+  file: string;
+  session: string;
+  rows_today: number;
+  last_row_at: string | null;
+  write_failures: number;
+  last_error: string | null;
+  last_error_at: string | null;
+  last_error_instrument: string | null;
+  verdict: string;
+}
+
+/** Rates whose denominator is zero come back as `null`, never as 0%. */
+export interface SignalBoardStats {
+  session: string;
+  signals_recorded: number;
+  buy_signals: number;
+  wait_signals: number;
+  no_trade_signals: number;
+  followed_signals: number;
+  resolved_signals: number;
+  unresolved_signals: number;
+  unresolved_note: string;
+  t1_hit_rate_pct: number | null;
+  t2_hit_rate_pct: number | null;
+  t3_hit_rate_pct: number | null;
+  stop_hit_rate_pct: number | null;
+  target_before_stop_pct: number | null;
+  timeout_pct: number | null;
+  avg_minutes_to_t1: number | null;
+  avg_minutes_to_t2: number | null;
+  avg_minutes_to_t3: number | null;
+  /** Mean realised R over resolutions that produced one. */
+  avg_r: number | null;
+  net_r: number | null;
+  profit_factor: number | null;
+  avg_mfe_r: number | null;
+  avg_mae_r: number | null;
+  avg_mfe_capture: number | null;
+  avg_give_back_r: number | null;
+  give_back_sample: number;
+}
+
+export type SignalBoardFilters = Partial<{
+  /** An IST trading date, or `TODAY` — resolved by the server, not the browser. */
+  session: string;
+  instrument: string;
+  /** OPTIONS | FUTURES — which vehicle's book the row belongs to. */
+  market: string;
+  /** CE | PE | FUTURES — the exact leg, not the coarse vehicle field. */
+  signal_vehicle: string;
+  /** ACTIVE | RESOLVED | INVALIDATED | MISSED_DISPLAY | MISSED_EXECUTION. */
+  status: string;
+  /** The board's market bias, which a gate may still have refused. */
+  action: string;
+  /** The position the board printed — the call itself. */
+  position_signal: string;
+  vehicle: string;
+  option_type: string;
+  setup_type: string;
+  volatility_class: string;
+  outcome: string;
+  exchange: string;
+  speed: string;
+  t1_hit: boolean;
+  t2_hit: boolean;
+  t3_hit: boolean;
+  stop_hit: boolean;
+  /** Only calls that carried a contract, an entry, a stop and a first target. */
+  followed: boolean;
+  expiry_day: boolean;
+  min_score: number;
+  max_score: number;
+  max_minutes_to_resolution: number;
+  /** Inclusive IST trading dates, `YYYY-MM-DD`. */
+  date_from: string;
+  date_to: string;
+}>;
+
+/** The CSV of BUY calls for a date range, as a URL the browser downloads itself.
+ *  Read-only: the endpoint has no side effect and no order path. */
+export function signalBoardReportCsvUrl(
+  opts: { date_from?: string; date_to?: string; instrument?: string } = {},
+): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(opts)) {
+    if (v) q.set(k, v);
+  }
+  const qs = q.toString();
+  return `${API_BASE}/api/signal-board-report.csv${qs ? `?${qs}` : ""}`;
+}
+
+export async function getSignalBoardHistory(
+  limit = 300,
+  filters: SignalBoardFilters = {},
+) {
+  const q = new URLSearchParams({ limit: String(limit) });
+  for (const [k, v] of Object.entries(filters)) {
+    if (v === undefined || v === "" || v === null) continue;
+    q.set(k, String(v));
+  }
+  const res = await fetch(`${API_BASE}/api/signal-board-history?${q.toString()}`);
+  return res.json() as Promise<{
+    rows: SignalBoardRow[];
+    count: number;
+    /** BUY calls in the same range that carried no contract, stop or target. */
+    buy_calls_without_plan: number;
+    sessions: string[];
+    statistics: SignalBoardStats;
+    /** Why the list is empty when it is empty — a failing journal and a quiet
+     *  session both return zero rows and must not look alike. */
+    recording: JournalRecording;
+  }>;
+}
+
+// ---- Futures research vehicle + signal lifecycle (Parts 22-24, 27, 32, 34) ----
+
+/** The research futures card. `executable` is always false: no order route. */
+export async function getFuturesSignal(instrument?: string) {
+  const qs = instrument ? `?instrument=${encodeURIComponent(instrument)}` : "";
+  const res = await fetch(`${API_BASE}/api/futures-signal${qs}`);
+  type Payload = {
+    instrument: string;
+    card: FuturesSignalCard | null;
+    research_only: boolean;
+    executable: boolean;
+    note: string;
+  };
+  const body = await res.json();
+  // Futures research is unavailable for many instruments, and the API says so
+  // with a 503 whose body is {detail}. Carry the reason as the note instead of
+  // handing the board an error object shaped like a card.
+  if (!res.ok) {
+    return {
+      instrument: instrument || "",
+      card: null,
+      research_only: true,
+      executable: false,
+      note: String(body?.detail ?? "futures research not available"),
+    } as Payload;
+  }
+  return body as Payload;
+}
+
+export interface VehicleComparison {
+  instrument: string;
+  label: string;
+  option: Record<string, unknown>;
+  futures: Record<string, unknown>;
+  /** Resolved history behind each vehicle — net R, MFE, MAE, target-before-stop.
+   *  Absent, or null on a side, when nothing has resolved yet; that is not zero. */
+  resolved?: {
+    option: Record<string, unknown>;
+    futures: Record<string, unknown>;
+    note: string;
+  } | null;
+  reasons: string[];
+  note: string;
+}
+
+/** Option plan vs futures plan on the same event. A label, never a choice. */
+export async function getVehicleComparison(instrument?: string) {
+  const qs = instrument ? `?instrument=${encodeURIComponent(instrument)}` : "";
+  const res = await fetch(`${API_BASE}/api/vehicle-comparison${qs}`);
+  if (!res.ok) return null;
+  return (await res.json()) as VehicleComparison;
+}
+
+export interface MissedSignalRow {
+  episode_id: string;
+  global_signal_id: string | null;
+  instrument: string | null;
+  market: string;
+  vehicle: string | null;
+  time_ist: string | null;
+  signal_price: number | null;
+  raw_events: number;
+  engine_generated: boolean;
+  dashboard_published: boolean;
+  user_visible: boolean;
+  paper_eligible: boolean;
+  filled: boolean;
+  missed_stage: string;
+  missed_reason: string;
+  detail: Record<string, unknown> | null;
+  /** CORRECTLY_REFUSED | STOPPED_BEFORE_USER — a refusal is not a loss. */
+  classification: string;
+}
+
+export async function getMissedSignals(session?: string, reason?: string) {
+  const q = new URLSearchParams();
+  if (session) q.set("session", session);
+  if (reason) q.set("reason", reason);
+  const qs = q.toString();
+  const res = await fetch(`${API_BASE}/api/missed-signals${qs ? `?${qs}` : ""}`);
+  return res.json() as Promise<{
+    rows: MissedSignalRow[];
+    count: number;
+    reasons: string[];
+    note: string;
+  }>;
+}
+
+export interface SignalReconciliation {
+  session: string | null;
+  window: { ledger_events: number; journal_rows: number };
+  counts: Record<string, number>;
+  missed_reasons: Record<string, number>;
+  missing_dashboard_publication: Record<string, unknown>[];
+  missing_journal_row: Record<string, unknown>[];
+  note: string;
+}
+
+export async function getSignalReconciliation(session?: string) {
+  const qs = session ? `?session=${encodeURIComponent(session)}` : "";
+  const res = await fetch(`${API_BASE}/api/signal-reconciliation${qs}`);
+  return res.json() as Promise<SignalReconciliation>;
+}
+
+/** A best-of group with the sample size it was computed on. */
+export interface GroupBest {
+  name: string;
+  n: number;
+  avg: number;
+}
+
+export interface SignalBoardDaily {
+  date?: string;
+  sessions?: string[];
+  overall?: SignalBoardStats;
+  by_session?: Record<string, Record<string, unknown>>;
+  statistics?: SignalBoardStats;
+  outcome_counts?: Record<string, number>;
+  t1_count?: number;
+  t2_count?: number;
+  t3_count?: number;
+  stop_count?: number;
+  timeout_count?: number;
+  expired_count?: number;
+  best_setup_by_avg_r?: GroupBest | null;
+  best_instrument_by_avg_r?: GroupBest | null;
+  highest_mfe?: { signal_id: string; instrument: string | null; mfe_r: number | null } | null;
+  largest_give_back?: {
+    signal_id: string;
+    instrument: string | null;
+    give_back_r: number | null;
+    mfe_r: number | null;
+    realized_r: number | null;
+  } | null;
+  most_common_blocker?: string | null;
+  blocker_counts?: Record<string, number>;
+}
+
+/** One recorded day under a one-a-day selection policy, graded by its outcome.
+ *
+ * Selected on the card as it was written; `signal_score` is what the board
+ * printed at signal time, not a rating of the result. `gross_only` is always
+ * true — no cost is charged in this table.
+ */
+export interface DailyBestPick {
+  policy: string;
+  session: string | null;
+  signal_id: string | null;
+  instrument: string | null;
+  symbol: string | null;
+  direction: string | null;
+  signal_time_ist: string | null;
+  signal_score: number | null;
+  conviction: number | null;
+  trade_quality: string | null;
+  a_plus_shadow: string | null;
+  entry: number | null;
+  stop: number | null;
+  outcome: string | null;
+  targets_reached: string[];
+  best_target: string | null;
+  reached_t1: boolean;
+  realized_r: number | null;
+  mfe_r: number | null;
+  hold_minutes: number | null;
+  minutes_to_t1: number | null;
+  card_found: boolean;
+  gross_only: boolean;
+}
+
+export interface DailyBestSummary {
+  sessions: number;
+  days_with_a_signal: number;
+  days_no_card_to_rank: number;
+  graded: number;
+  reached_t1: number;
+  reached_t1_pct: number | null;
+  reached_t2_pct: number | null;
+  reached_t3_pct: number | null;
+  stopped: number;
+  expired: number;
+  sum_r_gross: number | null;
+  mean_r_gross: number | null;
+  median_r_gross: number | null;
+  evidence: string;
+  sessions_required: number;
+  sessions_shortfall: number;
+  gross_only: boolean;
+}
+
+export interface DailyBestReport {
+  policies: Record<string, { history: DailyBestPick[]; summary: DailyBestSummary }>;
+  every_signal: {
+    sessions: number;
+    graded: number;
+    reached_t1: number;
+    reached_t1_pct: number | null;
+    signals_per_day: number | null;
+    sum_r_gross: number | null;
+    mean_r_gross: number | null;
+  };
+  ranking_validated: boolean;
+  ranking_verdict: string;
+  notes: string[];
+  research_only: boolean;
+}
+
+export async function getDailyBest(limitDays = 120) {
+  const res = await fetch(`${API_BASE}/api/daily-best?limit_days=${limitDays}`);
+  return res.json() as Promise<DailyBestReport>;
+}
+
+export async function getSignalBoardDaily(session?: string) {
+  const q = session ? `?session=${encodeURIComponent(session)}` : "";
+  const res = await fetch(`${API_BASE}/api/signal-board-daily${q}`);
+  return res.json() as Promise<SignalBoardDaily>;
 }
 
 export interface FlowSettings {
@@ -1757,5 +2200,1772 @@ export async function runAiCycle(): Promise<{
   ms: number;
 }> {
   const res = await fetch(`${API_BASE}/api/ai/cycle`, { method: "POST" });
+  return res.json();
+}
+
+/* ------------------------------------------------------------------ Phase 17
+ * Vehicle evidence + the A+ paper board. Read-only and paper-only: there is no
+ * mutating endpoint in this group, so nothing on these screens can place,
+ * modify or promote an order.
+ */
+export interface P17QualityTally {
+  total: number;
+  counts: Record<string, number>;
+  exact_match_rate_pct: number | null;
+  usable_rate_pct: number | null;
+  unmatched: number;
+  unmatched_pct: number | null;
+  target_pct: number;
+  meets_target: boolean | null;
+  tolerances_ms: { exact: number; good: number; degraded: number };
+}
+
+export interface P17Health {
+  enabled: boolean;
+  observations: number;
+  written: number;
+  failures: number;
+  last_error: string | null;
+  last_observation_ts: number | null;
+  skipped_ineligible: number;
+  universe: string[];
+  today_rows: number;
+  session: string | null;
+  tracker: {
+    open_legs: number;
+    budget: number;
+    opened: number;
+    dropped: number;
+    resolved: number;
+    follow_minutes: number;
+  };
+  paper: {
+    open: number;
+    entered: number;
+    refused: number;
+    closed: number;
+    enabled: boolean;
+  };
+  entry_history: Record<string, number | null>;
+  store: Record<string, unknown>;
+}
+
+export interface P17BoardRow {
+  observation_id: string;
+  instrument: string;
+  direction: string | null;
+  vehicle: string | null;
+  symbol: string | null;
+  strike: number | null;
+  expiry: string | null;
+  days_to_expiry: number | null;
+  premium: number | null;
+  bid: number | null;
+  ask: number | null;
+  spread: number | null;
+  spread_pct: number | null;
+  entry: number | null;
+  stop: number | null;
+  target1: number | null;
+  target2: number | null;
+  target3: number | null;
+  a_plus_score: number | null;
+  a_plus_label: string | null;
+  components: Record<string, number | null> | null;
+  t1_score: number | null;
+  t1_rank: string | null;
+  t1_basis: string | null;
+  promotable: boolean | null;
+  not_a_probability: boolean;
+  vehicle_class: string | null;
+  cost_points: number | null;
+  cost_over_expected_move: number | null;
+  entry_quality: string | null;
+  expected_hold_minutes: number | null;
+  data_quality: string;
+  reasons: string[] | null;
+  paper_only: boolean;
+  no_real_order: boolean;
+}
+
+export interface P17Board {
+  preferred: P17BoardRow[];
+  watch: P17BoardRow[];
+  candidates_considered: number;
+  a_plus_found: number;
+  watch_found: number;
+  empty_is_valid: boolean;
+  paper_only: boolean;
+  no_real_order: boolean;
+  note: string;
+}
+
+export interface P17Side {
+  symbol: string | null;
+  vehicle: string | null;
+  strike: number | null;
+  premium: number | null;
+  bid: number | null;
+  ask: number | null;
+  spread: number | null;
+  spread_pct: number | null;
+  oi: number | null;
+  volume: number | null;
+  iv: number | null;
+  delta: number | null;
+  moneyness: string | null;
+  vehicle_class: string | null;
+  cost_points: number | null;
+  data_quality: string;
+}
+
+export interface P17EvidenceRow {
+  observation_id: string;
+  signal_ts: number;
+  instrument: string;
+  candidate_class: string | null;
+  direction: string | null;
+  market_signal: string | null;
+  regime: string | null;
+  htf_alignment: string | null;
+  selected_vehicle: string | null;
+  ce_pe: { selected: P17Side; opposite: P17Side };
+  room: {
+    t1_score: number | null;
+    t1_rank: string | null;
+    not_a_probability: boolean;
+    underlying_move_required: number | null;
+    room_after_spread: number | null;
+  };
+  entry_quality: string | null;
+  a_plus_score: number | null;
+  a_plus_label: string | null;
+  both_sides: boolean;
+  data_quality: string;
+  tracking: string | null;
+}
+
+export interface P17Evidence {
+  rows: P17EvidenceRow[];
+  counts: P17QualityTally;
+  note: string;
+  research_only: boolean;
+}
+
+export interface P17PaperRow {
+  episode_id: string;
+  instrument: string;
+  vehicle: string | null;
+  symbol: string | null;
+  entry_ts: number | null;
+  entry_price: number | null;
+  entry_side: string | null;
+  exit_ts: number | null;
+  exit_price: number | null;
+  exit_side: string | null;
+  exit_reason: string | null;
+  gross_points: number | null;
+  cost_points: number | null;
+  net_points: number | null;
+  net_r: number | null;
+  mfe_points: number | null;
+  mae_points: number | null;
+  hold_minutes: number | null;
+  cost_status: string | null;
+  paper_only: boolean;
+  no_real_order: boolean;
+}
+
+export interface P17Paper {
+  open: P17PaperRow[];
+  resolved: P17PaperRow[];
+  report: Record<string, unknown>;
+  paper_only: boolean;
+  no_real_order: boolean;
+}
+
+export interface P17Summary {
+  questions: { total: number; requires_more_data: number };
+  promotion: { status: string | null; verdict: string | null };
+  candidates: number | null;
+  exact_match_rate_pct: number | null;
+  meets_target: boolean | null;
+  both_side_pct: number | null;
+  a_plus: number;
+  paper_entries: number | null;
+  paper_net_points: number | null;
+  paper_cost_points: number | null;
+  paper_expectancy_r: number | null;
+  a_plus_status: string | null;
+  vehicle_classes: Record<string, number> | null;
+  wrong_market_pct: number | null;
+  wrong_vehicle_pct: number | null;
+  basis: string;
+  paper_only: boolean;
+  no_real_order: boolean;
+  questions_detail: { question: string; answer: unknown }[];
+}
+
+export async function getP17Health(): Promise<P17Health> {
+  const res = await fetch(`${API_BASE}/api/phase17/health`);
+  return res.json();
+}
+
+export async function getP17Board(): Promise<P17Board> {
+  const res = await fetch(`${API_BASE}/api/phase17/board`);
+  return res.json();
+}
+
+export async function getP17Evidence(limit = 60): Promise<P17Evidence> {
+  const res = await fetch(`${API_BASE}/api/phase17/evidence?limit=${limit}`);
+  return res.json();
+}
+
+export async function getP17Paper(): Promise<P17Paper> {
+  const res = await fetch(`${API_BASE}/api/phase17/paper`);
+  return res.json();
+}
+
+export async function getP17Summary(): Promise<P17Summary> {
+  const res = await fetch(`${API_BASE}/api/phase17/summary`);
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18 — the closing auction session (15:10-15:30 IST). RESEARCH / PAPER.
+//
+// Everything below is read-only by construction: there is no CAS mutation
+// endpoint to call, so no control in this app can send a CAS order.
+// ---------------------------------------------------------------------------
+export interface CasScoreComponent {
+  points: number;
+  max: number;
+  detail: string;
+}
+
+export interface CasCard {
+  strategy: string;
+  paper_only: boolean;
+  no_real_order: boolean;
+  banner: string;
+  session: string | null;
+  instrument: string;
+  exchange: string | null;
+  timestamp: number | null;
+  cas_state: string | null;
+  sub_window: string | null;
+  remaining_seconds: number | null;
+  expiry: string | null;
+  days_to_expiry: number | null;
+  expiry_class: string | null;
+  direction: string;
+  direction_components: Record<string, { vote: string; detail: string }> | null;
+  data_quality: string | null;
+  observation_id: string | null;
+  signal: string;
+  status: string;
+  reason: string;
+  option_type: string | null;
+  rung?: string | null;
+  strike?: number | null;
+  symbol?: string | null;
+  bid?: number | null;
+  ask?: number | null;
+  spread?: number | null;
+  spread_pct?: number | null;
+  preferred_entry?: number | null;
+  iv?: number | null;
+  delta?: number | null;
+  gamma?: number | null;
+  theta?: number | null;
+  oi?: number | null;
+  volume?: number | null;
+  cas_score: number | null;
+  cas_score_is_probability: boolean;
+  cas_score_components?: Record<string, CasScoreComponent> | null;
+  t1_rank?: string | null;
+  entry_quality?: string | null;
+  tradability?: string | null;
+  expected_hold_seconds?: number | null;
+  executability?: string | null;
+  // The explicitly requested card fields.
+  current_underlying: number | null;
+  cas_expected_move_points: number | null;
+  cas_move_range: { low: number | null; high: number | null } | null;
+  move_pct: number | null;
+  move_atr: number | null;
+  expectation_basis: string | null;
+  expectation_samples: number | null;
+  expectation_warning: string | null;
+  current_option_premium: number | null;
+  expected_option_move_points: number | null;
+  expected_option_move_pct: number | null;
+  t1: number | null;
+  t2: number | null;
+  t3: number | null;
+  stop: number | null;
+  risk: number | null;
+  reward_risk: number | null;
+  estimated_seconds_to_t1: number | null;
+  time_to_t1_samples: number | null;
+  time_to_t1_note: string | null;
+}
+
+export interface CasPaperRow {
+  episode_id: string;
+  session: string | null;
+  instrument: string;
+  strategy_variant: string | null;
+  option_type: string | null;
+  rung: string | null;
+  symbol: string | null;
+  entry_ts: number | null;
+  entry_price: number | null;
+  exit_ts: number | null;
+  exit_price: number | null;
+  status: string | null;
+  gross_rupees: number | null;
+  net_rupees: number | null;
+  net_r: number | null;
+  theoretical_rupees: number | null;
+  mfe_points: number | null;
+  mae_points: number | null;
+  hold_seconds: number | null;
+  executability: string | null;
+  data_quality: string | null;
+  paper_only: boolean;
+}
+
+export interface CasHealth {
+  strategy: string;
+  paper_only: boolean;
+  no_real_order: boolean;
+  enabled: boolean;
+  paper_enabled: boolean;
+  window: string;
+  session: string | null;
+  observations: number;
+  written: number;
+  cards: number;
+  entries: number;
+  resolutions: number;
+  failures: number;
+  last_error: string | null;
+  last_observation_ts: number | null;
+  skipped_outside_window: number;
+  skipped_ineligible: number;
+  open_legs: number;
+  resolved_legs: number;
+  quality: {
+    status: string;
+    match_rate_pct: number | null;
+    target_pct: number;
+    meets_target: boolean;
+    counts: Record<string, number>;
+    note: string;
+  };
+}
+
+export interface CasBoard {
+  cards: CasCard[];
+  open: CasPaperRow[];
+  resolved: CasPaperRow[];
+  window: string;
+  strategy: string;
+  paper_only: boolean;
+  no_real_order: boolean;
+  banner: string;
+}
+
+export interface CasReconciliation {
+  strategy: string;
+  observations: number;
+  candidates: number;
+  ce_captures: number;
+  pe_captures: number;
+  both_side_rungs: number;
+  exact_timestamp_matches: number;
+  near_exact_matches: number;
+  exact_or_near_pct: number | null;
+  missing_books: number;
+  paper_signals: number;
+  paper_entries: number;
+  paper_exits: number;
+  resolved: number;
+  unresolved: number;
+  unresolved_reasons: Record<string, number>;
+  quality_gate: string;
+  arithmetic: {
+    signals_to_entries_lost: number;
+    entries_to_exits_lost: number;
+    exits_to_resolved_lost: number;
+  };
+  note: string;
+}
+
+export interface CasQuestion {
+  question: string;
+  answer: string;
+  basis: string;
+}
+
+export interface CasReport {
+  daily: Record<string, unknown>;
+  strategy: Record<string, unknown>;
+  capture: Record<string, unknown>;
+  paper: Record<string, unknown>;
+  validation: {
+    strategy: string;
+    verdict: string;
+    reason: string;
+    note: string;
+    regime_start: string;
+    promotion_is_manual: boolean;
+    excluded_pre_cas_rows: number;
+    fold_sessions: Record<string, string[]>;
+    folds: Record<string, Record<string, number | string | null>>;
+    evidence: {
+      all_met: boolean;
+      missing: string[];
+      checks: Record<string, { have: number | null; need: number; ok: boolean }>;
+    };
+  };
+  questions: CasQuestion[];
+  paper_only: boolean;
+  no_real_order: boolean;
+}
+
+export async function getCasHealth(): Promise<CasHealth> {
+  const res = await fetch(`${API_BASE}/api/cas-health`);
+  return res.json();
+}
+
+export async function getCasBoard(): Promise<CasBoard> {
+  const res = await fetch(`${API_BASE}/api/cas-board`);
+  return res.json();
+}
+
+export async function getCasReconciliation(): Promise<CasReconciliation> {
+  const res = await fetch(`${API_BASE}/api/cas-reconciliation`);
+  return res.json();
+}
+
+export async function getCasReport(): Promise<CasReport> {
+  const res = await fetch(`${API_BASE}/api/cas-report`);
+  return res.json();
+}
+
+// --- Phase 19 — futures paper book, T1 calibration, production readiness -----
+// Read-only. Nothing in this block can place, size, activate or promote
+// anything: PRODUCTION_CANDIDATE is a request for review, not a switch.
+
+export interface ReadinessRow {
+  strategy: string;
+  vehicle: string;
+  status: string;
+  sample_size: number;
+  holdout_size: number;
+  net_expectancy_r: number | null;
+  dev_net_expectancy_r: number | null;
+  profit_factor: number | null;
+  max_drawdown_r: number | null;
+  t1_pct: number | null;
+  capture_pct: number | null;
+  capture_target_pct: number;
+  last_validation: string | null;
+  blockers: string[];
+  paper_only: boolean;
+  no_real_order: boolean;
+  promotion_is_manual: boolean;
+  resolved?: number;
+  valid_plans?: number;
+  paper_entries?: number;
+  upstream_status?: string | null;
+  window?: string;
+  gate?: string;
+  note?: string;
+}
+
+export interface ReliabilityBin {
+  bin: string;
+  predicted: number | null;
+  observed: number | null;
+  n: number;
+  gap: number | null;
+}
+
+export interface Calibration {
+  verdict: string;
+  may_publish_probability: boolean;
+  display: string;
+  blockers: string[];
+  rows: number;
+  dev_rows: number;
+  holdout_rows: number;
+  scored_holdout_rows: number;
+  base_rate: number | null;
+  brier: number | null;
+  brier_base_rate: number | null;
+  brier_skill: number | null;
+  ece: number | null;
+  monotone: boolean | null;
+  reliability_curve: ReliabilityBin[];
+  gates: Record<string, number>;
+  note: string;
+}
+
+export interface ReadinessBoard {
+  rows: ReadinessRow[];
+  statuses: string[];
+  best_status: string;
+  production_candidates: string[];
+  any_production_candidate: boolean;
+  calibration: Calibration;
+  capture: {
+    option_exact_near_pct: number | null;
+    option_target_pct: number;
+    cas_match_pct: number | null;
+    futures_freshness_pct: number | null;
+  };
+  paper_only: boolean;
+  no_real_order: boolean;
+  promotion_is_manual: boolean;
+  banner: string;
+  note: string;
+}
+
+export interface FuturesPaperRow {
+  instrument: string;
+  session: string;
+  direction: string;
+  contract: string | null;
+  expiry: string | null;
+  entry_price: number;
+  exit_price: number;
+  entry_basis: string;
+  exit_basis: string;
+  outcome: string;
+  risk_points: number;
+  gross_points: number;
+  net_points: number | null;
+  net_r: number | null;
+  net_rupees: number | null;
+  mfe_points: number;
+  mae_points: number;
+  mfe_capture_pct: number | null;
+  giveback_points: number;
+  reached_t1: boolean;
+  minutes_to_t1: number | null;
+  hold_minutes: number;
+  hold_bucket: string | null;
+  cost_points: number | null;
+  cost_rupees: number | null;
+  brokerage_rupees: number | null;
+  tax_rupees: number | null;
+  txn_rupees: number | null;
+  spread_cost_points: number | null;
+  slippage_points: number;
+  cost_status: string;
+  entry_time_ist: string;
+  exit_time_ist: string;
+}
+
+export interface FuturesPaperBoard {
+  health: {
+    enabled: boolean;
+    plans_seen: number;
+    entries: number;
+    exits: number;
+    resolved: number;
+    open: number;
+    skipped: Record<string, number>;
+    last_error: string | null;
+    max_hold_minutes: number;
+    max_feed_age_sec: number;
+    paper_only: boolean;
+    no_real_order: boolean;
+  };
+  freshness_pct: number | null;
+  open: Array<Record<string, unknown>>;
+  resolved: FuturesPaperRow[];
+  evaluation: {
+    development: Record<string, number | null>;
+    validation: Record<string, number | null>;
+    holdout: Record<string, number | null>;
+    rows_considered: number;
+    rows_excluded_uncosted: number;
+    rows_with_measured_spread: number;
+    basis: string;
+    note: string;
+  };
+  paper_only: boolean;
+  no_real_order: boolean;
+  banner: string;
+}
+
+export async function getReadiness(): Promise<ReadinessBoard> {
+  const res = await fetch(`${API_BASE}/api/phase19/readiness`);
+  return res.json();
+}
+
+export async function getCalibration(): Promise<Calibration> {
+  const res = await fetch(`${API_BASE}/api/phase19/calibration`);
+  return res.json();
+}
+
+export async function getFuturesPaper(): Promise<FuturesPaperBoard> {
+  const res = await fetch(`${API_BASE}/api/phase19/futures-paper`);
+  return res.json();
+}
+
+/* ---------------------------------------------------------------- Phase 22 */
+/* CORE A+ PAPER — the selective pullback + continuation + vehicle-selection
+   candidate. Every type here is read-only: there is no Phase 22 mutation in
+   this client because there is no Phase 22 order path in the backend. */
+
+export type P22Vehicle = {
+  vehicle: string;
+  symbol: string | null;
+  status: "MEASURED" | "UNMEASURED";
+  bid: number | null;
+  ask: number | null;
+  spread?: number | null;
+  spread_pct?: number | null;
+  entry?: number | null;
+  premium?: number | null;
+  stop?: number | null;
+  target1?: number | null;
+  target2?: number | null;
+  target3?: number | null;
+  levels_basis?: string | null;
+  cost_points?: number | null;
+  cost_rupees?: number | null;
+  brokerage?: number | null;
+  statutory?: number | null;
+  slippage_points?: number | null;
+  room_points?: number | null;
+  room_after_cost?: number | null;
+  cost_over_room?: number | null;
+  risk_points?: number | null;
+  cost_over_risk?: number | null;
+  net_rr_after_cost?: number | null;
+  reasons: string[];
+  pricing: string;
+};
+
+export type P22Row = {
+  instrument: string;
+  direction: string | null;
+  setup: string;
+  setup_refusals: string[];
+  definition: string;
+  vehicle: string;
+  vehicles: P22Vehicle[];
+  vehicle_reasons: string[];
+  symbol?: string | null;
+  entry: number | null;
+  stop: number | null;
+  target1: number | null;
+  target2: number | null;
+  target3: number | null;
+  levels_basis?: string | null;
+  net_rr_after_cost?: number | null;
+  current: number | null;
+  spread: number | null;
+  spread_pct: number | null;
+  room_points: number | null;
+  room_after_cost: number | null;
+  expected_move_points: number | null;
+  t1_rank: number | null;
+  t1_rank_basis: string;
+  expected_hold_minutes: number | null;
+  noise_points: number | null;
+  status: string;
+  paper_pnl: number | null;
+  mfe: number | null;
+  mae: number | null;
+  held_minutes?: number | null;
+  paper_only: boolean;
+  no_real_order: boolean;
+  updated_ts: number;
+};
+
+export type P22Board = {
+  definition: string;
+  definition_fingerprint: string;
+  rows: P22Row[];
+  no_trade: boolean;
+  candidates: number;
+  selected: number;
+  open: number;
+  closed: number;
+  net_paper_rupees: number;
+  statuses: string[];
+  paper_only: boolean;
+  no_real_order: boolean;
+  promotion: string;
+};
+
+export type P22Health = {
+  definition: string;
+  definition_fingerprint: string;
+  observed: number;
+  failures: number;
+  last_error: string | null;
+  open: number;
+  paper_only: boolean;
+  no_real_order: boolean;
+};
+
+export type P22Check = {
+  condition: string;
+  state: "PASS" | "FAIL" | "UNKNOWN";
+  detail: string;
+  [key: string]: unknown;
+};
+
+export type P22Verdict = {
+  verdict: "SURVIVES" | "FAILS" | "REQUIRES_MORE_DATA";
+  headline: string;
+  checks: P22Check[];
+  execution: string;
+  promotion: string;
+};
+
+export type P22Study = {
+  outdir: string;
+  available: string[];
+  missing: string[];
+  verdict?: P22Verdict;
+  definition?: { definition?: Record<string, unknown>; fingerprint?: string };
+  pullback_vs_non_pullback?: Record<string, unknown>;
+  vehicles?: Record<string, unknown>;
+  stop_bands?: Record<string, unknown>;
+};
+
+export async function getP22Board(): Promise<P22Board> {
+  const res = await fetch(`${API_BASE}/api/phase22/board`);
+  return res.json();
+}
+
+export async function getP22Health(): Promise<P22Health> {
+  const res = await fetch(`${API_BASE}/api/phase22/health`);
+  return res.json();
+}
+
+export async function getP22Study(): Promise<P22Study> {
+  const res = await fetch(`${API_BASE}/api/phase22/study`);
+  return res.json();
+}
+
+/* ---------- Phase 23 — break-even hurdle PAPER SHADOW (read-only) ---------- */
+
+export type P23Metrics = {
+  arm?: string;
+  trades: number;
+  signals?: number;
+  accepted?: number;
+  rejected?: number;
+  t1_before_sl_pct: number | null;
+  t1: number;
+  sl: number;
+  win_pct: number | null;
+  profit_factor: number | null;
+  net_pnl: number;
+  avg_net_r: number | null;
+  median_net_r: number | null;
+  max_drawdown: number;
+  max_losing_streak: number;
+  avg_hurdle_pct: number | null;
+  median_measured_spread_pct: number | null;
+  median_hold_minutes: number | null;
+  avg_winner: number | null;
+  avg_loser: number | null;
+  attribution?: P23Attribution;
+};
+
+export type P23Attribution = {
+  arm: string;
+  threshold_pct: number | null;
+  refused_trades: number;
+  abstained_unmeasured: number;
+  money_saved_by_refusing_high_hurdle_trades: number;
+  money_missed_by_refusing_them: number;
+  net_effect: number;
+  largest_single_refused_abs_pnl: number;
+  net_effect_excluding_largest: number;
+};
+
+export type P23Coverage = {
+  opportunities: number;
+  rows_on_file: number;
+  simulated_feed_rows_excluded: number;
+  measured_book: number;
+  unmeasured_book: number;
+  measured_pct: number | null;
+  engine_would_buy: number;
+  engine_refused: number;
+  resolved_trades: number;
+  open_or_unresolved: number;
+};
+
+export type P23SweepRow = {
+  threshold_pct: number;
+  accepted: number;
+  rejected: number;
+  abstained_unmeasured: number;
+  net_pnl: number;
+  vs_existing_net_pnl: number;
+  profit_factor: number | null;
+  win_pct: number | null;
+  t1_before_sl_pct: number | null;
+  avg_net_r: number | null;
+  median_net_r: number | null;
+  max_drawdown: number;
+  money_saved: number;
+  money_missed: number;
+  net_effect: number;
+  net_effect_excluding_largest: number;
+};
+
+export type P23Verdict = {
+  status: string;
+  discovered_threshold_pct: number | null;
+  promotion_requires_human_review: boolean;
+  measured_resolved_trades: number;
+  sessions: number;
+  candidates: {
+    threshold_pct: number;
+    net_effect: number;
+    vs_existing_net_pnl: number;
+    profit_factor: number | null;
+    blocking_reasons: string[];
+    passes: boolean;
+  }[];
+  note: string;
+};
+
+export type P23Summary = {
+  gates: { strict_pct: number; loose_pct: number };
+  report: {
+    vehicle: string;
+    futures_excluded: boolean;
+    futures_note: string;
+    spread_source: string;
+    coverage: P23Coverage;
+    cumulative: Record<string, P23Metrics>;
+    breakdowns: Record<string, Record<string, Record<string, P23Metrics>>>;
+    sweep: P23SweepRow[];
+    daily: { date: string; coverage: P23Coverage; arms: Record<string, P23Metrics> }[];
+  };
+  verdict: P23Verdict;
+  health: Record<string, number | string | null>;
+};
+
+export type P23Row = {
+  ts: number | null;
+  date: string | null;
+  time_bucket: string;
+  instrument: string | null;
+  feed: string | null;
+  real_feed: boolean | null;
+  option: string | null;
+  option_type: string | null;
+  strike: number | null;
+  premium: number | null;
+  bid: number | null;
+  ask: number | null;
+  measured_spread_pct: number | null;
+  round_trip_cost_rupees: number | null;
+  hurdle_pct: number | null;
+  hurdle_status: string | null;
+  hurdle_reason: string | null;
+  signal: string | null;
+  confidence: number | null;
+  engine_would_buy: boolean | null;
+  gate_3_allows: string | null;
+  gate_5_allows: string | null;
+  outcome: string | null;
+  exit_reason: string | null;
+  net_pnl: number | null;
+  net_r: number | null;
+  hold_minutes: number | null;
+  resolved: boolean | null;
+};
+
+export async function getP23Summary(): Promise<P23Summary> {
+  const res = await fetch(`${API_BASE}/api/phase23/summary`);
+  return res.json();
+}
+
+export async function getP23Rows(limit = 200): Promise<{ rows: P23Row[]; count: number }> {
+  const res = await fetch(`${API_BASE}/api/phase23/rows?limit=${limit}`);
+  return res.json();
+}
+
+/* ── Phase 24 — five-year discovery study (read-only research) ─────────────
+ * Three GETs over artefacts the CLI wrote. Nothing here can start a study,
+ * promote a strategy or reach an order path.
+ */
+export type P24CoverageRow = {
+  instrument: string;
+  bars: number;
+  sessions?: number;
+  reason?: string;
+};
+
+export type P24Coverage = {
+  series: {
+    usable: P24CoverageRow[];
+    excluded: P24CoverageRow[];
+    min_bars_required: number;
+    equity_note: string;
+  };
+  option_books: {
+    snapshots: number;
+    real_broker_snapshots: number;
+    snapshots_with_two_sided_book: number;
+    two_sided_by_instrument?: Record<string, number>;
+    two_sided_first_ts?: number;
+    two_sided_last_ts?: number;
+    /** A captured window can support a CE/PE study even when five years cannot. */
+    ce_pe_study_possible?: boolean;
+    /** True when the store could not be counted — unmeasured, not empty. */
+    unmeasured?: boolean;
+    note: string;
+  };
+};
+
+export type P24PoolRow = {
+  instrument: string;
+  stop_band_atr: number;
+  candidates: number;
+  resolved: number;
+  unresolved: number;
+  sessions: number;
+  base_t1_before_sl_pct: number;
+  base_avg_net_r: number;
+  base_timeout_pct: number;
+  median_cost_points_per_round_trip: number;
+  cost_as_fraction_of_risk: number;
+};
+
+export type P24GeometryRow = {
+  instrument: string;
+  stop_band_atr: number;
+  t1_r: number;
+  trades: number;
+  t1_before_sl_pct: number;
+  breakeven_t1_pct_before_costs: number;
+  avg_net_r: number;
+  cost_as_fraction_of_risk: number;
+};
+
+/** The conclusion is keyed exactly as the study is required to report it. */
+export type P24Conclusion = {
+  BEST_VALIDATED_STRATEGY: string | null;
+  EXPECTED_T1_BEFORE_SL: number | null;
+  NET_EXPECTANCY_R: number | null;
+  PROFIT_FACTOR: number | null;
+  FINAL_HOLDOUT: string | number | null;
+  TRADES_PER_WEEK: number | null;
+  STATUS: string;
+  CLOSEST_CANDIDATE?: {
+    strategy_id?: string;
+    instrument?: string;
+    side?: string;
+    stop_band_atr?: number;
+    conditions?: string[];
+    why_it_failed?: string[];
+  } | string | null;
+};
+
+export type P24Summary = {
+  available: boolean;
+  note?: string;
+  version?: string;
+  generated_at?: number;
+  windows?: Record<string, unknown>;
+  pools?: P24PoolRow[];
+  hypotheses_evaluated?: number;
+  answers?: Record<string, unknown>;
+  conclusion?: P24Conclusion;
+  coverage?: P24Coverage["series"];
+  option_books?: P24Coverage["option_books"];
+  /** OK, or NO_USABLE_HISTORY when the study had nothing to search. */
+  data_status?: string;
+  vehicles?: Record<string, { status: string; note?: string }>;
+  geometry_sweep?: P24GeometryRow[];
+  paper_only: boolean;
+};
+
+export type P24Strategy = {
+  strategy_id: string;
+  instrument: string;
+  vehicle: string;
+  side: string;
+  stop_band_atr: number;
+  conditions: string[];
+  complexity: number;
+  score: number | null;
+  status: string;
+  failed_clauses: string[];
+  dev_trades: number | null;
+  dev_t1_pct: number | null;
+  dev_avg_net_r: number | null;
+  val_trades: number | null;
+  val_avg_net_r: number | null;
+  holdout_trades: number | null;
+  holdout_t1_pct: number | null;
+  holdout_avg_net_r: number | null;
+  holdout_profit_factor: number | null;
+  holdout_max_drawdown_r: number | null;
+  holdout_longest_losing_streak: number | null;
+  outlier_top1_pct: number | null;
+  folds_positive: number | null;
+  folds_scored: number | null;
+  walk_forward_stable: boolean | null;
+  trades_per_week: number | null;
+  no_trade_pct: number | null;
+  fingerprint_published: boolean;
+};
+
+export async function getP24Coverage(): Promise<P24Coverage> {
+  const res = await fetch(`${API_BASE}/api/phase24/coverage`);
+  return res.json();
+}
+
+export async function getP24Summary(): Promise<P24Summary> {
+  const res = await fetch(`${API_BASE}/api/phase24/summary`);
+  return res.json();
+}
+
+export async function getP24Strategies(limit = 25): Promise<{
+  rows: P24Strategy[];
+  count: number;
+  research_only: boolean;
+  vehicles_measured: string[];
+  vehicles_requiring_more_data: string[];
+}> {
+  const res = await fetch(`${API_BASE}/api/phase24/strategies?limit=${limit}`);
+  return res.json();
+}
+
+/* ------------------------------------------------------------------ *
+ * PHASE 25 — CAPTURED-WINDOW CE/PE STUDY (RESEARCH · PAPER ONLY)
+ *
+ * Read-only. The strongest verdict this study can produce is RESEARCH_LEAD:
+ * the capture is weeks of option books, so nothing here is a validated edge
+ * and nothing can be promoted from this panel.
+ * ------------------------------------------------------------------ */
+export type P25InstrumentCoverage = {
+  instrument: string;
+  snapshots?: number;
+  real_broker_snapshots?: number;
+  sessions?: number;
+  contract_paths?: number;
+  simulator_snapshots_excluded?: number;
+  one_sided_legs_excluded?: number;
+  eligible?: boolean;
+  status: string;
+  reasons?: string[];
+};
+
+export type P25Coverage = {
+  /** True when the store could not be read: unmeasured, never empty. */
+  unmeasured: boolean;
+  cause?: string;
+  note?: string;
+  eligible: P25InstrumentCoverage[];
+  reported_only: P25InstrumentCoverage[];
+  window_claim?: string;
+};
+
+export type P25Geometry = {
+  stop_pct_of_premium_bands: number[];
+  t1_r: number;
+  t2_r: number;
+  t3_r: number;
+  horizon_seconds: number;
+  max_forward_quotes: number;
+  entry: string;
+  exit: string;
+  slippage_pct_per_side: number;
+  costs_charged: string;
+  split: string;
+};
+
+export type P25Pool = {
+  instrument: string;
+  candidates: number;
+  resolved: number;
+  unresolved: number;
+  sessions: number;
+  ce: number;
+  pe: number;
+  base_t1_before_sl_pct: number | null;
+  base_avg_net_r: number | null;
+  base_avg_net_rupees: number | null;
+  base_timeout_pct: number | null;
+  median_measured_spread_pct: number | null;
+  median_hurdle_pct: number | null;
+  median_premium_ask: number | null;
+};
+
+export type P25GeometryRow = {
+  instrument: string;
+  stop_band_pct_of_premium: number;
+  t1_r: number;
+  trades: number;
+  t1_before_sl_pct: number | null;
+  breakeven_t1_pct_before_costs: number;
+  avg_net_r: number | null;
+  cost_as_fraction_of_risk: number | null;
+  median_measured_spread_pct: number | null;
+  spread_as_fraction_of_risk: number | null;
+};
+
+export type P25Cohort = {
+  trades: number;
+  status?: string;
+  t1_before_sl_pct?: number | null;
+  avg_net_r?: number | null;
+  avg_net_rupees?: number | null;
+  /** A string when the cohort had no losing trade, so it is not a ratio. */
+  profit_factor?: number | string | null;
+};
+
+export type P25HurdleBand = P25Cohort & { band: string };
+
+export type P25Instrument = {
+  instrument: string;
+  status: string;
+  pool: P25Pool | null;
+  sides?: Record<string, P25Cohort> | null;
+  time_of_day?: Record<string, P25Cohort> | null;
+  hurdle_bands?: P25HurdleBand[] | null;
+  geometry_sweep?: P25GeometryRow[] | null;
+  reasons?: string[] | null;
+};
+
+export type P25Conclusion = {
+  verdict: string;
+  headline: string;
+  window: string;
+  leads: number;
+  closest_candidate?: {
+    strategy_id?: string;
+    instrument?: string;
+    option_type?: string;
+    conditions?: string[];
+    status?: string;
+    failed_clauses?: string[];
+  } | null;
+};
+
+export type P25Summary = {
+  available: boolean;
+  note?: string;
+  version?: string;
+  generated_at?: number;
+  quick_mode?: boolean;
+  geometry?: P25Geometry;
+  window_claim?: string;
+  hypotheses_evaluated?: number;
+  conclusion?: P25Conclusion;
+  answers?: { question: string; answer: string }[];
+  instruments?: P25Instrument[];
+  paper_only: boolean;
+};
+
+export type P25CohortRow = {
+  strategy_id: string;
+  instrument: string;
+  option_type: string;
+  underlying_view: string | null;
+  stop_band_pct_of_premium: number | null;
+  conditions: string[];
+  complexity: number | null;
+  score: number | null;
+  status: string;
+  failed_clauses: string[];
+  dev_trades: number | null;
+  dev_t1_pct: number | null;
+  dev_avg_net_r: number | null;
+  val_trades: number | null;
+  val_avg_net_r: number | null;
+  holdout_trades: number | null;
+  holdout_t1_pct: number | null;
+  holdout_avg_net_r: number | null;
+  holdout_profit_factor: number | string | null;
+  holdout_max_drawdown_r: number | null;
+  outlier_top1_pct: number | null;
+  folds_positive: number | null;
+  folds_measurable: number | null;
+  trades_per_session: number | null;
+  no_trade_pct: number | null;
+  is_research_lead: boolean;
+  paper_only: boolean;
+};
+
+export async function getP25Coverage(): Promise<P25Coverage> {
+  const res = await fetch(`${API_BASE}/api/phase25/coverage`);
+  return res.json();
+}
+
+export async function getP25Summary(): Promise<P25Summary> {
+  const res = await fetch(`${API_BASE}/api/phase25/summary`);
+  return res.json();
+}
+
+export async function getP25Cohorts(limit = 25): Promise<{
+  rows: P25CohortRow[];
+  count: number;
+  research_only: boolean;
+  paper_only: boolean;
+  window_claim: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/phase25/cohorts?limit=${limit}`);
+  return res.json();
+}
+
+/* ------------------------------------------------------------------ *
+ * PHASE 26 — EXIT MANAGEMENT AND TRADABILITY (RESEARCH / ADVISORY)
+ *
+ * Read-only. Every one of these endpoints reads an artefact a CLI run
+ * wrote: there is no run trigger over HTTP, no threshold to set and no
+ * refusal wired to the advisory table.
+ * ------------------------------------------------------------------ */
+export type P26Geometry = {
+  key: string;
+  label: string;
+  why: string;
+  stop_pct_of_premium: number;
+  target_r: number | null;
+  partial_at_r: number | null;
+  partial_fraction: number | null;
+  stop_to_breakeven_after_partial: boolean | null;
+  trail_giveback_r: number | null;
+  trail_arms_at_r: number | null;
+  dead_leg_cut_seconds: number | null;
+  dead_leg_min_mfe_r: number | null;
+  horizon_seconds: number;
+  max_forward_quotes: number;
+  breakeven_hit_rate_pct_before_costs: number | null;
+  exit_orders: number;
+  tags: string[];
+};
+
+export type P26VariantTotal = {
+  variant: string;
+  geometry: P26Geometry;
+  instruments_scored: number;
+  trades: number;
+  avg_net_r: number;
+  total_net_r: number;
+  total_net_rupees: number;
+  profit_exit_before_sl_pct: number;
+  stop_out_pct: number;
+  /** Trades that reached the horizon, in loss — Phase 25's actual finding. */
+  flat_timeout_pct: number;
+  /** Trades that reached the horizon at all, in profit or not. */
+  horizon_exit_pct: number;
+  horizon_exit_in_profit_pct: number;
+  positive_net_pct: number;
+  avg_hold_sec: number;
+  instruments_positive: string[];
+  instruments_better_than_baseline: string[];
+};
+
+export type P26Window = {
+  trades: number;
+  avg_net_r: number | null;
+  profit_factor: number | string | null;
+  t1_before_sl_pct?: number | null;
+};
+
+export type P26InstrumentVariant = {
+  variant: string;
+  trades: number;
+  avg_net_r: number;
+  profit_factor: number | string | null;
+  profit_exit_before_sl_pct: number;
+  outcome_mix: Record<string, { trades: number; pct: number }>;
+  median_hold_sec: number;
+  holdout?: P26Window;
+};
+
+export type P26Instrument = {
+  instrument: string;
+  status: string;
+  candidates: number | null;
+  sessions: number | null;
+  best_variant_on_development: string | null;
+  uplift: number | null;
+  variants: P26InstrumentVariant[];
+  reasons?: string[];
+};
+
+export type P26Band = {
+  band: string;
+  trades: number;
+  avg_net_r: number | null;
+  total_net_rupees: number | null;
+  profit_factor: number | string | null;
+};
+
+export type P26TimeBand = {
+  bucket: string;
+  trades: number;
+  t1_before_sl_pct: number | null;
+  avg_net_r: number | null;
+  total_net_rupees: number | null;
+};
+
+export type P26AdvisoryRow = {
+  instrument: string;
+  trades: number;
+  median_measured_spread_pct: number | null;
+  spread_as_fraction_of_risk: number | null;
+  median_break_even_hurdle_pct: number | null;
+  all_costs_as_fraction_of_risk: number | null;
+  median_premium_ask: number | null;
+  measured_t1_before_sl_pct: number | null;
+  measured_avg_net_r: number | null;
+  measured_total_net_rupees: number | null;
+  verdict: string;
+  advisory_only: boolean;
+  hurdle_bands: P26Band[];
+  time_of_day: P26TimeBand[];
+  counterfactual_if_refused: Record<string, unknown>;
+};
+
+export type P26Advisory = {
+  available: boolean;
+  note?: string;
+  advisory_claim?: string;
+  window_claim?: string;
+  /** Always false: this table is measured, never wired to a live refusal. */
+  wired_to_live_refusal?: boolean;
+  rows?: P26AdvisoryRow[];
+  counts?: Record<string, number>;
+  instruments_by_verdict?: Record<string, string[]>;
+  thresholds?: Record<string, number | boolean>;
+  refusing_hurdle_gt_5pct_on_this_window?: Record<string, number>;
+};
+
+export type P26Conclusion = {
+  verdict: string;
+  headline: string;
+  window: string;
+  leads: number;
+  best_variant: string | null;
+  baseline_variant: string;
+  exit_management_improved_the_pool: boolean;
+  pool_positive_under_any_variant: boolean;
+  closest_cohort: {
+    strategy_id: string;
+    instrument: string;
+    option_type: string;
+    variant: string;
+    conditions: string[];
+    status: string;
+    failed_clauses: string[];
+  } | null;
+};
+
+export type P26Summary = {
+  available: boolean;
+  note?: string;
+  version?: string;
+  generated_at?: number;
+  quick_mode?: boolean;
+  execution?: Record<string, string | number>;
+  window_claim?: string;
+  advisory_claim?: string;
+  event_hypotheses_evaluated?: number;
+  variant_totals?: P26VariantTotal[];
+  variants_tested?: P26Geometry[];
+  conclusion?: P26Conclusion;
+  answers?: { question: string; answer: string }[];
+  instruments?: P26Instrument[];
+  paper_only: boolean;
+};
+
+export type P26CohortRow = {
+  strategy_id: string;
+  instrument: string;
+  option_type: string;
+  exit_variant: string;
+  conditions: string[];
+  score: number | null;
+  status: string;
+  failed_clauses: string[];
+  fdr_survivor: boolean | null;
+  fdr_denominator: number | null;
+  dev_trades: number | null;
+  dev_avg_net_r: number | null;
+  val_trades: number | null;
+  val_avg_net_r: number | null;
+  holdout_trades: number | null;
+  holdout_avg_net_r: number | null;
+  holdout_profit_factor: number | string | null;
+  holdout_max_drawdown_r: number | null;
+  outlier_top1_pct: number | null;
+  folds_positive: number | null;
+  folds_measurable: number | null;
+  trades_per_session: number | null;
+  no_trade_pct: number | null;
+  is_research_lead: boolean;
+  paper_only: boolean;
+};
+
+export async function getP26Summary(): Promise<P26Summary> {
+  const res = await fetch(`${API_BASE}/api/phase26/summary`);
+  return res.json();
+}
+
+export async function getP26Advisory(): Promise<P26Advisory> {
+  const res = await fetch(`${API_BASE}/api/phase26/advisory`);
+  return res.json();
+}
+
+export async function getP26Cohorts(limit = 25): Promise<{
+  rows: P26CohortRow[];
+  count: number;
+  research_only: boolean;
+  paper_only: boolean;
+  window_claim: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/phase26/cohorts?limit=${limit}`);
+  return res.json();
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 27 — higher-timeframe (5m / 15m) futures research, read only.
+ * There is no run endpoint on purpose: a dashboard refresh cannot start
+ * a study, and nothing here can place, size or refuse an order.
+ * ------------------------------------------------------------------ */
+export type P27Window = {
+  trades: number | null;
+  t1_before_sl_pct: number | null;
+  avg_net_r: number | null;
+  median_net_r: number | null;
+  profit_factor: number | null;
+  max_drawdown_r: number | null;
+};
+
+export type P27Strategy = {
+  strategy_id: string;
+  timeframe_minutes: number;
+  instrument: string;
+  side: string;
+  stop_band_atr: number | null;
+  conditions: string[];
+  complexity: number | null;
+  score: number | null;
+  status: string;
+  gate_verdict: string | null;
+  fdr_survivor: boolean | null;
+  fdr_denominator: number | null;
+  failed_clauses: string[] | null;
+  parameter_perturbation_tested: boolean | null;
+  development: P27Window | null;
+  validation: P27Window | null;
+  holdout: P27Window | null;
+  walk_forward: {
+    folds_scored: number | null;
+    folds_positive: number | null;
+    stable: boolean | null;
+  } | null;
+  selectivity: Record<string, number | null> | null;
+};
+
+export type P27TimeframeBlock = {
+  timeframe_minutes: number;
+  hypotheses_evaluated: number;
+  candidates_surviving_development: number;
+  diagnostics: Record<string, number>;
+};
+
+export type P27Summary = {
+  available: boolean;
+  note?: string;
+  generated_at?: string;
+  runtime_seconds?: number;
+  quick_mode?: boolean;
+  instruments?: string[];
+  timeframes?: number[];
+  resample_claim?: string;
+  spread_claim?: string;
+  stop_rule?: string;
+  research_ceiling?: string;
+  timeframe_results?: P27TimeframeBlock[];
+  answers?: Record<string, unknown>;
+  conclusion?: {
+    verdict: string;
+    headline: string;
+    statement?: string;
+    stop_rule_triggered: boolean;
+    closest_candidate?: unknown;
+    what_this_does_not_say?: string[];
+  };
+};
+
+export type P27ComparisonRow = {
+  timeframe_minutes: number;
+  instrument: string;
+  stop_band_atr: number | null;
+  trades: number | null;
+  t1_before_sl_pct: number | null;
+  breakeven_t1_pct_before_costs: number | null;
+  avg_net_r: number | null;
+  cost_as_fraction_of_risk: number | null;
+  median_risk_points?: number | null;
+  source: string;
+};
+
+export type P27Coverage = {
+  timeframes: number[];
+  usable: { instrument: string; bars: number; sessions: number | null }[];
+  excluded: {
+    instrument: string;
+    bars: number;
+    status: string;
+    reason: string;
+  }[];
+  resampled: {
+    instrument: string;
+    timeframe_minutes: number;
+    source_minute_bars: number;
+    output_bars: number;
+    sessions: number;
+    full_bars: number;
+    short_bars: number;
+    short_bar_pct: number;
+    median_minutes_per_bar: number;
+    spans_a_session: boolean;
+  }[];
+  one_minute_reference?: string;
+};
+
+export async function getP27Summary(): Promise<P27Summary> {
+  const res = await fetch(`${API_BASE}/api/phase27/summary`);
+  return res.json();
+}
+
+export async function getP27Coverage(): Promise<P27Coverage> {
+  const res = await fetch(`${API_BASE}/api/phase27/coverage`);
+  return res.json();
+}
+
+export async function getP27Comparison(): Promise<{
+  available?: boolean;
+  rows?: P27ComparisonRow[];
+  note?: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/phase27/comparison`);
+  return res.json();
+}
+
+export async function getP27Strategies(limit = 25): Promise<{
+  rows: P27Strategy[];
+  count: number;
+  research_only: boolean;
+  paper_only: boolean;
+  stop_rule: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/phase27/strategies?limit=${limit}`);
+  return res.json();
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 28 — multi-day futures and cash-equity research, read only.
+ * Again no run endpoint: a dashboard refresh cannot start a study, and
+ * nothing here can place, size or refuse an order. Two things must stay
+ * visible in the types themselves: a cash-equity name with no five-year
+ * history is INSUFFICIENT_HISTORY (unanswered) rather than a failure, and
+ * a long-only row is only interesting next to buy-and-hold over the same
+ * window, so the benchmark travels with the row.
+ * ------------------------------------------------------------------ */
+export type P28Window = {
+  trades: number | null;
+  t1_before_sl_pct: number | null;
+  avg_net_r: number | null;
+  median_net_r: number | null;
+  profit_factor: number | null;
+  max_drawdown_r: number | null;
+};
+
+export type P28Strategy = {
+  strategy_id: string;
+  vehicle: string;
+  instrument: string;
+  side: string;
+  stop_band_atr: number | null;
+  horizon_trading_days: number | null;
+  conditions: string[];
+  complexity: number | null;
+  score: number | null;
+  status: string;
+  gate_verdict: string | null;
+  fdr_survivor: boolean | null;
+  fdr_denominator: number | null;
+  failed_clauses: string[] | null;
+  parameter_perturbation_tested: boolean | null;
+  development: P28Window | null;
+  validation: P28Window | null;
+  holdout: P28Window | null;
+  walk_forward: {
+    folds_scored: number | null;
+    folds_positive: number | null;
+    stable: boolean | null;
+  } | null;
+  benchmark_holdout: {
+    benchmark: string | null;
+    net_points_per_exposed_day: number | null;
+    benchmark_net_points_per_day: number | null;
+    beats_benchmark: boolean | null;
+  } | null;
+  exit_breakdown: Record<string, number | null> | null;
+  selectivity: Record<string, number | null> | null;
+};
+
+export type P28VehicleBlock = {
+  vehicle: string;
+  candidates_surviving_development: number | null;
+  cohorts_examined_including_near_misses: number | null;
+  diagnostics: Record<string, number>;
+};
+
+export type P28EquityHistory = {
+  status: string;
+  tested: string[];
+  missing: string[];
+  note?: string;
+  how_to_answer_it?: string;
+  corporate_actions?: string;
+};
+
+export type P28Summary = {
+  available: boolean;
+  note?: string;
+  version?: string;
+  generated_at?: number;
+  runtime_seconds?: number;
+  quick_mode?: boolean;
+  instruments?: string[];
+  data_status?: string;
+  answers?: Record<string, unknown>;
+  equity_history?: P28EquityHistory;
+  option_logic?: string;
+  gap_claim?: string;
+  rollover_claim?: string;
+  delivery_claim?: string;
+  buy_and_hold_claim?: string;
+  stop_rule?: string;
+  research_ceiling?: string;
+  conclusion?: {
+    verdict: string;
+    headline: string;
+    statement?: string;
+    stop_rule_triggered?: boolean;
+    equity_caveat?: P28EquityHistory;
+    what_this_does_not_say?: string[];
+  };
+};
+
+export type P28Funnel = {
+  available: boolean;
+  note?: string;
+  vehicles?: P28VehicleBlock[];
+};
+
+export type P28HoldingRow = {
+  holding_period: string;
+  instrument: string;
+  stop_band_atr: number | null;
+  median_risk_points: number | null;
+  median_cost_points: number | null;
+  cost_as_fraction_of_risk: number | null;
+  avg_net_r: number | null;
+  source: string;
+};
+
+export type P28Economics = {
+  available: boolean;
+  note?: string;
+  pools?: {
+    instrument: string;
+    vehicle: string;
+    source: string;
+    daily_bars: number | null;
+    span_years: number | null;
+    candidates: number | null;
+    stop_band_atr: number | null;
+    horizon_trading_days: number | null;
+    base_t1_before_sl_pct: number | null;
+    base_avg_net_r: number | null;
+    gap_resolved_pct: number | null;
+    cost_as_fraction_of_risk: number | null;
+    rolls_charged: number | null;
+  }[];
+  holding_period_comparison?: {
+    rows?: P28HoldingRow[];
+    median_cost_over_risk_intraday?: number | null;
+    median_cost_over_risk_daily?: number | null;
+  };
+};
+
+export type P28CoverageRow = {
+  instrument: string;
+  vehicle: string;
+  source: string;
+  daily_bars: number;
+  span_years: number | null;
+  thin_sessions: number | null;
+  source_bars: number | null;
+  status?: string;
+  reason?: string;
+};
+
+export type P28Coverage = {
+  usable: P28CoverageRow[];
+  excluded: P28CoverageRow[];
+  min_daily_bars?: number;
+  min_years?: number;
+  note?: string;
+  equity_history?: P28EquityHistory;
+  daily_bar_rules?: Record<string, unknown>;
+};
+
+export async function getP28Summary(): Promise<P28Summary> {
+  const res = await fetch(`${API_BASE}/api/phase28/summary`);
+  return res.json();
+}
+
+export async function getP28Coverage(): Promise<P28Coverage> {
+  const res = await fetch(`${API_BASE}/api/phase28/coverage`);
+  return res.json();
+}
+
+export async function getP28Funnel(): Promise<P28Funnel> {
+  const res = await fetch(`${API_BASE}/api/phase28/funnel`);
+  return res.json();
+}
+
+export async function getP28Economics(): Promise<P28Economics> {
+  const res = await fetch(`${API_BASE}/api/phase28/economics`);
+  return res.json();
+}
+
+export async function getP28Strategies(limit = 25): Promise<{
+  rows: P28Strategy[];
+  count: number;
+  research_only: boolean;
+  paper_only: boolean;
+  stop_rule: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/phase28/strategies?limit=${limit}`);
   return res.json();
 }

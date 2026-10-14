@@ -1331,17 +1331,45 @@ class AngelOneProvider(MarketDataProvider):
         # Angel's /quote FULL endpoint accepts at most ~50 tokens per request;
         # a wide strike window (e.g. QT_STRIKES_EACH_SIDE=15 -> 60+ tokens) trips
         # "Tokens max limit exceeded" (AB4029). Split into <=45-token batches.
+        future_token = self._future.token if self._future else None
+        future_seen = False
+
         for i in range(0, len(tokens), _QUOTE_TOKEN_CHUNK):
             batch = tokens[i : i + _QUOTE_TOKEN_CHUNK]
             try:
                 resp = self._smart.getMarketData(_QUOTE_MODE, {self._exchange: batch})
-            except Exception:
+            except Exception as exc:
+                # Throttle diagnostics so repeated broker failures do not flood logs.
+                now = time.monotonic()
+                last = getattr(self, "_last_quote_error_log_at", 0.0)
+                if now - last >= 30.0:
+                    self._last_quote_error_log_at = now
+                    msg = _redact_secrets(str(exc))[:200]
+                    _log.warning(
+                        "Angel REST quote request failed: exchange=%s batch_size=%d error=%s",
+                        self._exchange, len(batch), msg or type(exc).__name__,
+                    )
                 continue
+
             rows = ((resp or {}).get("data") or {}).get("fetched") or []
+            if not rows and batch and future_token in batch:
+                now = time.monotonic()
+                last = getattr(self, "_last_quote_empty_log_at", 0.0)
+                if now - last >= 30.0:
+                    self._last_quote_empty_log_at = now
+                    status = _redact_secrets(str((resp or {}).get("status")))[:80]
+                    message = _redact_secrets(str((resp or {}).get("message")))[:160]
+                    _log.warning(
+                        "Angel REST quote response has no fetched rows for underlying: "
+                        "exchange=%s status=%s message=%s",
+                        self._exchange, status, message,
+                    )
+
             for row in rows:
                 token = str(row.get("symbolToken"))
                 depth = row.get("depth") or {}
-                if token == (self._future.token if self._future else None):
+                if token == future_token:
+                    future_seen = True
                     # Age on the REST fallback is the age of this poll, and the
                     # poll floor is 3s — that is the number the board needs to
                     # show instead of an implied "live".
@@ -1375,6 +1403,18 @@ class AngelOneProvider(MarketDataProvider):
                         else None
                     ),
                 }
+        if future_token and not future_seen:
+            now = time.monotonic()
+            last = getattr(self, "_last_quote_missing_log_at", 0.0)
+            if now - last >= 30.0:
+                self._last_quote_missing_log_at = now
+                _log.warning(
+                    "Angel REST quote cycle did not return the underlying token: "
+                    "exchange=%s token=%s batch_count=%d",
+                    self._exchange, future_token,
+                    (len(tokens) + _QUOTE_TOKEN_CHUNK - 1) // _QUOTE_TOKEN_CHUNK,
+                )
+
         if self._future and self._future.token in self._quotes:
             self._spot = self._quotes[self._future.token]["ltp"] or self._spot
 

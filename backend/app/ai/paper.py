@@ -112,7 +112,7 @@ def pretrade_checks(instrument: str, side: str, quote, feats: dict,
         fails.append("INVALID_INSTRUMENT")
     else:
         is_open, _ = settings.market_session(time.time(), spec.exchange)
-        if not (is_open or settings.hours_ignored()):
+        if not (is_open or settings.ignore_market_hours):
             fails.append("MARKET_CLOSED")
     if quote is None:
         fails.append("NO_CONTRACT")

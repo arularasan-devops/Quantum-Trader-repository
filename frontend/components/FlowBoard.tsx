@@ -476,7 +476,7 @@ export default function FlowBoard({ snap }: { snap: Snapshot }) {
                 <Stat k="Win rate" v={`${report.win_rate}%`} vc={report.win_rate >= 50 ? GREEN : RED} />
                 <Stat k="Profit factor" v={report.profit_factor == null ? "—" : report.profit_factor.toFixed(2)}
                   vc={(report.profit_factor ?? 0) >= 1 ? GREEN : RED} />
-                <Stat k="Net paper ₹" v={rupees(report.net_rupees)} vc={report.net_rupees >= 0 ? GREEN : RED} />
+                <Stat k="Net paper ₹" v={rupees(report.net_rupees)} vc={report.net_rupees == null ? MUTED : report.net_rupees >= 0 ? GREEN : RED} />
                 <Stat k="Avg hold" v={hhmm((report.avg_hold_min ?? 0) * 60)} />
                 <Stat k="Wins / Losses" v={`${report.wins}/${report.losses}`} />
               </div>
@@ -504,7 +504,7 @@ export default function FlowBoard({ snap }: { snap: Snapshot }) {
                           <td className="py-1 px-2 text-right tabular-nums" style={{ color: s.win_rate >= 50 ? GREEN : RED }}>{s.win_rate}%</td>
                           <td className="py-1 px-2 text-right tabular-nums text-white/60">{s.switch_rate}%</td>
                           <td className="py-1 px-2 text-right tabular-nums" style={{ color: s.avg_final_pts >= 0 ? GREEN : RED }}>{s.avg_final_pts}</td>
-                          <td className="py-1 px-2 text-right tabular-nums" style={{ color: s.net_rupees >= 0 ? GREEN : RED }}>{rupees(s.net_rupees)}</td>
+                          <td className="py-1 px-2 text-right tabular-nums" style={{ color: s.net_rupees == null ? MUTED : s.net_rupees >= 0 ? GREEN : RED }}>{rupees(s.net_rupees)}</td>
                           <td className="py-1 px-2 text-right tabular-nums text-white/60">{hhmm(s.avg_hold_min * 60)}</td>
                         </tr>
                       ))}

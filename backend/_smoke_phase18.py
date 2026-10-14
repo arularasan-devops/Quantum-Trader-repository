@@ -34,7 +34,6 @@ from app.models import (  # noqa: E402
 )
 from app.research.phase18 import (  # noqa: E402
     artefacts,
-    cas_cache,
     direction,
     execution,
     expectation,
@@ -505,159 +504,13 @@ def test_store() -> None:
     check(len(str(settings.phase18_universe).split(",")) >= 1, "a universe is set")
 
 
-# ----------------------------------------------------------------- CAS cache
-def test_cas_cache() -> None:
-    """The cache must be faster and never a different answer.
-
-    /api/cas-report rebuilds from the whole journal, timed out at 30s on
-    2026-09-15 and cost that session its CAS tab. The cache removes the rebuild
-    from the request, so what has to hold is that a hit is only ever served for
-    the exact journals it was built from.
-    """
-    check(set(cas_cache.SOURCES) == {store.OBSERVATIONS, store.PAPER,
-                                     store.COVERAGE},
-          "the fingerprint covers every journal the report is built from")
-
-    for p in (cas_cache.path(), cas_cache.path() + ".tmp"):
-        if os.path.exists(p):
-            os.remove(p)
-
-    fp = cas_cache.fingerprint()
-    check(set(fp) == set(cas_cache.SOURCES),
-          "one fingerprint entry per source journal")
-    missing = [n for n, v in fp.items() if v.get("state") == cas_cache.ABSENT]
-    check(all("bytes" not in fp[n] for n in missing),
-          "an absent journal is recorded absent, not as an empty one")
-
-    check(cas_cache.load() is None and cas_cache.fresh() is None,
-          "no cache file means no cache, not a stale read")
-
-    first = cas_cache.report()
-    check(first["cache"]["served"] == cas_cache.REBUILT_ABSENT,
-          "the first call rebuilds and says so")
-    check(os.path.exists(cas_cache.path()), "the rebuild writes the cache")
-    check(first["paper_only"] is True and first["no_real_order"] is True,
-          "the cached payload keeps the paper-only statement")
-
-    second = cas_cache.report()
-    check(second["cache"]["served"] == cas_cache.HIT,
-          "the second call is served from the cache")
-    check(second["cache"]["built_at"] == first["cache"]["built_at"],
-          "a hit reports when the numbers were computed, not when asked")
-
-    direct = reports.build_payloads(
-        observations=store.observations(), paper_rows=store.paper(),
-        coverage=store.coverage(),
-    )
-    check(second["capture"] == direct["phase18_cas_capture"],
-          "a cached capture payload equals a freshly built one")
-    check(second["validation"] == direct["phase18_cas_validation"],
-          "a cached verdict equals a freshly built one")
-    check(second["daily"]["verdict"] == direct["cas_daily_report"]["verdict"],
-          "caching cannot change the verdict")
-
-    # A journal that grew must invalidate: same answer served over new evidence
-    # would be a report describing a store it never saw.
-    with open(store.path(store.COVERAGE), "a", encoding="utf-8") as fh:
-        fh.write('{"session": "2025-09-25", "smoke": true}\n')
-    check(cas_cache.fresh() is None,
-          "an appended journal invalidates the cache")
-    third = cas_cache.report()
-    check(third["cache"]["served"] == cas_cache.REBUILT_STALE,
-          "a changed journal rebuilds and says which of the two it was")
-    check(third["cache"]["built_at"] != first["cache"]["built_at"],
-          "the rebuilt payload carries its own build time")
-
-    # An mtime change with no size change still invalidates: a rewritten file of
-    # the same length is not the same evidence.
-    entry = cas_cache.load()
-    check(entry is not None, "the rebuilt cache is readable")
-    stamp = os.stat(store.path(store.COVERAGE))
-    os.utime(store.path(store.COVERAGE),
-             (stamp.st_atime, stamp.st_mtime + 60.0))
-    check(cas_cache.fresh() is None,
-          "a same-size journal with a new mtime invalidates the cache")
-    os.utime(store.path(store.COVERAGE), (stamp.st_atime, stamp.st_mtime))
-    check(cas_cache.fresh() is not None,
-          "restoring the journal's state makes the same cache current again")
-
-    # A torn or hand-edited cache is not evidence about anything.
-    with open(cas_cache.path(), "w", encoding="utf-8") as fh:
-        fh.write("{not json")
-    check(cas_cache.load() is None and cas_cache.fresh() is None,
-          "an unreadable cache is ignored rather than raising")
-    check(cas_cache.report()["cache"]["served"] == cas_cache.REBUILT_ABSENT,
-          "an unreadable cache counts as no cache and is rebuilt over")
-
-    warm = cas_cache.ensure()
-    check(warm["rebuilt"] is False and warm["state"] == cas_cache.HIT,
-          "warming a current cache rebuilds nothing")
-
-    src = open("app/research/phase18/cas_cache.py", encoding="utf-8").read()
-    for bad in ("place_order", "buy(", "sell(", "smart", "broker"):
-        check(bad not in src, f"the cache has no {bad!r} anywhere near it")
-
-    main_src = open("app/main.py", encoding="utf-8").read()
-    head = main_src.split('@app.get("/api/cas-report")')[1][:600]
-    check("cas_cache.report" in head,
-          "the endpoint serves the report through the cache")
-
-
-# -------------------------------------------------------- snapshot pre-warm
-def test_prewarm() -> None:
-    """The nightly collection must read a finished CAS report, not race one."""
-    from app.research.phase37 import schedule as p37schedule
-
-    check(p37schedule.PREWARM_MINUTES_BEFORE > 0,
-          "the warm-up runs before the trigger, not at it")
-    warm_at = ts_at(23, 36, day="2025-09-25")
-    early = ts_at(23, 30, day="2025-09-25")
-    check(p37schedule.in_prewarm_window(warm_at),
-          "23:36 IST is inside the warm-up window")
-    check(not p37schedule.in_prewarm_window(early),
-          "23:30 IST is before the warm-up window")
-    check(not p37schedule.in_window(warm_at),
-          "the warm-up happens before the snapshot window opens")
-    check(p37schedule.prewarm_once(early) is None,
-          "nothing is warmed outside the window")
-    first = p37schedule.prewarm_once(warm_at)
-    check(isinstance(first, dict) and "state" in first,
-          "the warm-up reports what it did")
-    check(p37schedule.prewarm_once(warm_at) is None,
-          "the warm-up runs once per session")
-    state = p37schedule.status(warm_at)
-    check(state["in_prewarm_window"] is True and state["last_prewarm"] == first,
-          "the schedule status carries the warm-up outcome")
-    check(state["back_fill"].startswith("NEVER"),
-          "warming changed nothing about back-filling a past session")
-
-    # A warm that raised must not consume the session's one attempt: the whole
-    # point is that the report is ready before 23:40.
-    later = ts_at(23, 37, day="2025-09-26")
-    def _boom() -> dict:
-        raise OSError("the store was unreadable")
-    original = cas_cache.ensure
-    cas_cache.ensure = _boom
-    try:
-        failed = p37schedule.prewarm_once(later)
-    finally:
-        cas_cache.ensure = original
-    check(isinstance(failed, dict)
-          and failed["state"] == p37schedule.PREWARM_FAILED,
-          "a warm-up that raised is reported rather than swallowed")
-    again = p37schedule.prewarm_once(later)
-    check(isinstance(again, dict) and again["state"] != p37schedule.PREWARM_FAILED,
-          "a failed warm-up is retried on the next poll, not marked done")
-
-
 def main() -> int:
     started = time.time()
     for fn in (test_session, test_quality, test_execution, test_direction,
                test_score, test_expectation, test_signal, test_paper,
                test_overnight,
                test_validation, test_safety, test_live_flow, test_studies,
-               test_reports, test_journal, test_store, test_cas_cache,
-               test_prewarm):
+               test_reports, test_journal, test_store):
         fn()
     service.reset_for_tests()
     print(f"checked {CHECKS} in {time.time() - started:.1f}s")

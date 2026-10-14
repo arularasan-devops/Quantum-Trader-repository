@@ -230,6 +230,85 @@ export interface CreditSpreadSignal {
  * POINTS, not premium: one point is `lot_size` rupees, there is no theta and no
  * IV, and a bearish view is a SHORT rather than a long put. PAPER ONLY — there
  * is no live order route into this tool. */
+/**
+ * Research-only futures plan returned by GET /api/futures-signal.
+ * This is a validated research card, not an executable order.
+ */
+export interface FuturesSignalCard {
+  enabled: boolean;
+  status: string;
+  signal: string;
+  direction: string | null;
+  instrument: string | null;
+  exchange: string | null;
+  contract: string | null;
+  expiry: string | null;
+  days_to_expiry: number | null;
+  lot_size: number | null;
+  quoted_contract: string | null;
+  quoted_days_to_expiry: number | null;
+  rolled: boolean;
+  reason_for_roll: string | null;
+  price_basis: string | null;
+  price_basis_note: string;
+  price: number | null;
+  entry: number | null;
+  entry_zone_low: number | null;
+  entry_zone_high: number | null;
+  stop: number | null;
+  target1: number | null;
+  target2: number | null;
+  target3: number | null;
+  risk_points: number | null;
+  risk_rupees_per_lot: number | null;
+  reward_risk_t1: number | null;
+  reward_risk_t2: number | null;
+  cost_points: number | null;
+  cost_to_risk_pct: number | null;
+  atr: number | null;
+  atr_pct: number | null;
+  adx: number | null;
+  regime: string | null;
+  trend: string | null;
+  momentum: string | null;
+  setup_type: string | null;
+  signal_score: number | null;
+  expected_move_points: number | null;
+  spread_points: number | null;
+  spread_pct: number | null;
+  volume: number | null;
+  open_interest: number | null;
+  liquidity_note: string;
+  data_freshness_sec: number | null;
+  plan_age_seconds: number;
+  plan_version: number;
+  plan_state: string;
+  invalid_reason: string | null;
+  reason: string;
+  checks: {
+    name: string;
+    passed: boolean;
+    value: number | string | null;
+    threshold: number | string | null;
+    detail: string;
+  }[];
+  global_signal_id: string | null;
+  episode_id: string | null;
+  futures_signal_id: string | null;
+  market: string;
+  vehicle: string;
+  signal_ts: number | null;
+  signal_time_ist: string | null;
+  event_type: string | null;
+  raw_event_count: number | null;
+  meaningful_update_count: number | null;
+  last_published_at: number | null;
+  feed_state: string | null;
+  feed_source: string | null;
+  research_only: boolean;
+  executable: boolean;
+}
+
 export interface FuturesSignal {
   enabled: boolean;
   state: "OFF" | "WAIT" | "BLOCKED" | "ENTERED" | "HOLDING" | "CLOSED" | "ERROR";

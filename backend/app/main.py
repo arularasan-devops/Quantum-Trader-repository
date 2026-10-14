@@ -11,7 +11,6 @@ Endpoints
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import json
 import logging
@@ -20,7 +19,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -30,14 +29,13 @@ from app.config import settings
 from app.engine import weights as weights_store
 from app.engine.account_risk import account as account_risk
 from app.execution import futures_paper
-from app.execution import live_control
-from app.execution import order_ledger
 from app.market import instruments as _inst_mod
 from app.market.instruments import DEFAULT_INSTRUMENT
+from app.state import registry
+
+import concurrent.futures
 from app.research.pairs import spec as pair_spec
 from app.research.phase17 import store as p17store
-from app.state import registry
-from app import storage as _storage_mod
 
 _log = logging.getLogger("quantum.api")
 
@@ -128,7 +126,7 @@ def _exchange_open(instrument: str) -> bool:
     ``ignore_market_hours`` (the simulated 24/7 demo default) keeps everything
     open, so the simulator and the smokes are unaffected.
     """
-    if settings.hours_ignored():
+    if settings.ignore_market_hours:
         return True
     from app.market.instruments import get_spec
 
@@ -163,6 +161,10 @@ def _mark_feed_stage(instrument: str, stage: str) -> None:
 class Hub:
     # How many screener-only (unwatched) instruments to refresh per background
     # turn. Small, so the instrument you're viewing always ticks first and fast.
+    _TICK_WORKERS = 4
+
+    _PAIR_CAPTURE_EVERY = 5.0
+
     _BG_PER_CYCLE = 3
     # Background instruments only refresh every Nth loop, so the watched
     # instrument isn't dragged behind a queue of full-engine computes every
@@ -187,16 +189,6 @@ class Hub:
     # stop dead while every dial still reads "armed", which is exactly what
     # happened on a 46-name universe (median scan age 13 minutes).
     _SCAN_MIN_PER_CYCLE = 2
-    # Threads that may run instrument ticks. A tick abandoned on the budget
-    # leaves its thread wedged wherever it blocked, so this is also the number
-    # of wedges the loop tolerates before it must stop starting ticks: more
-    # than the one a healthy loop has in flight, and small enough that
-    # exhaustion is reached and reported rather than hidden behind a growing
-    # queue. Its own pool, not the default executor, because everything else
-    # that runs off the loop — a report, the nightly snapshot, a history
-    # fetch — would otherwise queue behind a wedged provider call it has
-    # nothing to do with.
-    _TICK_WORKERS = 4
 
     @property
     def scan_target_sec(self) -> float:
@@ -212,21 +204,6 @@ class Hub:
     def scanned_per_cycle(self) -> float:
         """Scanned (unwatched) instruments per cycle, averaged over recent ones."""
         return round(self._scan_rate, 2)
-
-    @property
-    def ticks_abandoned(self) -> int:
-        """Ticks this process stopped waiting for, and never took a price from.
-
-        Reported rather than absorbed: the budget bounds what one wedged
-        instrument costs the other 45, it does not recover the minute, and a
-        rising count here is a provider or tick-path fault that is still open.
-        """
-        return self._ticks_abandoned
-
-    @property
-    def ticks_wedged_now(self) -> int:
-        """Tick workers still held by an abandoned tick, right now."""
-        return len([f for f in self._wedged if not f.done()])
 
     @property
     def closed_skipped(self) -> int:
@@ -276,6 +253,71 @@ class Hub:
         self._tick_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._TICK_WORKERS, thread_name_prefix="tick")
         self._wedged: set[concurrent.futures.Future] = set()
+
+    def _capture_pair_legs(self, active: list) -> None:
+        """Sample the frozen pair's legs on their own cadence (research only).
+
+        Capture used to ride on the tick, which is the scan's clock, not the
+        study's: a leg that is not being watched is ticked when the round-robin
+        reaches it, so with a large universe one leg was read a handful of times
+        an hour while the other -- the default instrument -- was read every
+        cycle. A pair needs BOTH legs on the SAME minute, so the observations
+        that carried a real book on both sides almost never happened (measured
+        share 9.7% on the first live session).
+
+        This reads only what the push feed has already delivered: no broker
+        request, no engine evaluation, no change to which instruments the
+        scanner prioritises or to when a production decision is computed. If a
+        leg is absent from the active universe it is simply not sampled -- the
+        coverage report already says which leg is missing.
+        """
+        if not settings.pair_capture_enabled:
+            return
+        now = time.monotonic()
+        if now - self._pair_captured_at < self._PAIR_CAPTURE_EVERY:
+            return
+        self._pair_captured_at = now
+        legs = {pair_spec.LEG_A, pair_spec.LEG_B}
+        for st in active:
+            if st.instrument in legs:
+                try:
+                    st.capture_pair_leg()
+                except Exception:  # pragma: no cover - research must not break the loop
+                    _log.exception("pair capture failed for %s", st.instrument)
+
+    async def _resolve_shadow_paper(self, loop) -> None:
+        """Let Phase 45's paper outcomes catch up with the clock (research only).
+
+        The shadow journal records a decision when it happens; what the decision
+        would have made can only be read once the forward window exists. This
+        walks the pending events off the event loop, rate-limited inside the
+        service so this call is cheap on the cycles it does nothing on, and
+        never raising: an unresolvable batch is counted, not propagated. It
+        writes only to the shadow store — no production state, no order path.
+        """
+        if not settings.phase45_shadow:
+            return
+        from app.research.phase45 import service as p45
+
+        try:
+            await loop.run_in_executor(None, p45.resolve_due)
+        except Exception:  # pragma: no cover - research must not break the loop
+            _log.exception("phase45 paper resolution failed")
+
+    @property
+    def ticks_abandoned(self) -> int:
+        """Ticks this process stopped waiting for, and never took a price from.
+
+        Reported rather than absorbed: the budget bounds what one wedged
+        instrument costs the other 45, it does not recover the minute, and a
+        rising count here is a provider or tick-path fault that is still open.
+        """
+        return self._ticks_abandoned
+
+    @property
+    def ticks_wedged_now(self) -> int:
+        """Tick workers still held by an abandoned tick, right now."""
+        return len([f for f in self._wedged if not f.done()])
 
     def scan_ages(self) -> dict[str, float]:
         """Seconds since each active instrument was last ticked.
@@ -362,61 +404,6 @@ class Hub:
         # Close the timestamp chain: this is the moment the price the engine used
         # actually left the server. Observability only.
         _mark_feed_stage(inst, "render")
-
-    # Seconds between samples of the frozen pair's two legs. One minute bar is
-    # the unit of the study, so a few seconds is enough to catch every bar while
-    # the socket is alive; it is not a tick and computes no signal.
-    _PAIR_CAPTURE_EVERY = 5.0
-
-    def _capture_pair_legs(self, active: list) -> None:
-        """Sample the frozen pair's legs on their own cadence (research only).
-
-        Capture used to ride on the tick, which is the scan's clock, not the
-        study's: a leg that is not being watched is ticked when the round-robin
-        reaches it, so with a large universe one leg was read a handful of times
-        an hour while the other -- the default instrument -- was read every
-        cycle. A pair needs BOTH legs on the SAME minute, so the observations
-        that carried a real book on both sides almost never happened (measured
-        share 9.7% on the first live session).
-
-        This reads only what the push feed has already delivered: no broker
-        request, no engine evaluation, no change to which instruments the
-        scanner prioritises or to when a production decision is computed. If a
-        leg is absent from the active universe it is simply not sampled -- the
-        coverage report already says which leg is missing.
-        """
-        if not settings.pair_capture_enabled:
-            return
-        now = time.monotonic()
-        if now - self._pair_captured_at < self._PAIR_CAPTURE_EVERY:
-            return
-        self._pair_captured_at = now
-        legs = {pair_spec.LEG_A, pair_spec.LEG_B}
-        for st in active:
-            if st.instrument in legs:
-                try:
-                    st.capture_pair_leg()
-                except Exception:  # pragma: no cover - research must not break the loop
-                    _log.exception("pair capture failed for %s", st.instrument)
-
-    async def _resolve_shadow_paper(self, loop) -> None:
-        """Let Phase 45's paper outcomes catch up with the clock (research only).
-
-        The shadow journal records a decision when it happens; what the decision
-        would have made can only be read once the forward window exists. This
-        walks the pending events off the event loop, rate-limited inside the
-        service so this call is cheap on the cycles it does nothing on, and
-        never raising: an unresolvable batch is counted, not propagated. It
-        writes only to the shadow store — no production state, no order path.
-        """
-        if not settings.phase45_shadow:
-            return
-        from app.research.phase45 import service as p45
-
-        try:
-            await loop.run_in_executor(None, p45.resolve_due)
-        except Exception:  # pragma: no cover - research must not break the loop
-            _log.exception("phase45 paper resolution failed")
 
     async def run(self) -> None:
         loop = asyncio.get_event_loop()
@@ -770,25 +757,6 @@ async def _startup() -> None:
     app.state.intel = asyncio.create_task(_refresh_intelligence())
     app.state.ai = asyncio.create_task(_ai_loop())
     app.state.feed_profile = asyncio.create_task(_feed_profile_loop())
-    # A line a minute saying THIS PROCESS is up, written from a thread of its
-    # own so it survives a wedged capture loop. Without it, a coverage hole can
-    # only say "the tick path did not run", which reads identically for a dead
-    # process and a stalled one and sends the operator to the wrong fix.
-    # Diagnostic only: writes no price, decides nothing, places no order.
-    from app.research.phase17 import service as _p17
-
-    _p17.start_process_heartbeat()
-
-    # Snapshot the research tabs once, after the last close of the day, from a
-    # thread of its own. The floors are counted from these snapshots, and while
-    # taking one was a manual command most captured sessions never became
-    # countable sessions. It only ever files against the day it runs on: the
-    # tabs report cumulative totals, so back-dating one would inflate the very
-    # count the floors are measured against.
-    # Read-only: fetches the research endpoints over loopback and writes JSON.
-    from app.research.phase37 import schedule as _p37sched
-
-    _p37sched.start()
 
 
 def _warm_ledgers() -> None:
@@ -944,12 +912,6 @@ async def _feed_profile_loop() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    from app.research.phase17 import service as _p17
-
-    _p17.stop_process_heartbeat()
-    from app.research.phase37 import schedule as _p37sched
-
-    _p37sched.stop()
     app.state.task.cancel()
     app.state.intel.cancel()
     app.state.ai.cancel()
@@ -963,86 +925,8 @@ async def health() -> dict:
     return {
         "status": "ok",
         "provider": settings.data_provider,
-        "data_source": "SIMULATED" if (settings.data_provider or "").lower() == "simulated"
-        else "LIVE_PROVIDER",
         "trade_mode": "live" if registry.get(DEFAULT_INSTRUMENT).is_live else "paper",
     }
-
-
-class KillSwitchRequest(BaseModel):
-    engaged: bool
-    reason: str = ""
-
-
-@app.get("/api/kill-switch")
-async def get_kill_switch() -> dict:
-    return live_control.kill_switch_status()
-
-
-@app.post("/api/kill-switch")
-async def post_kill_switch(req: KillSwitchRequest,
-                           x_qt_live_token: str | None = Header(default=None)) -> dict:
-    """Engage: always allowed, no token. Release: requires the live-arm token."""
-    if not req.engaged:
-        live_control.require_live_auth(x_qt_live_token)
-    return live_control.set_kill_switch(req.engaged, req.reason)
-
-
-class OrderRecoveryRequest(BaseModel):
-    instrument: str
-    action: str  # adopt_position | confirm_flat | clear_pending
-    note: str = ""
-    which: str | None = None  # entry | exit (clear_pending only)
-
-
-@app.get("/api/order-recovery")
-async def get_order_recovery() -> dict:
-    """Read-only: live order/position recovery state and persistence health."""
-    return {
-        "instruments": [st.recovery_status() for st in registry.active()],
-        "persistence": order_ledger.status(),
-        "journal_mirror": dict(_storage_mod.journal_mirror_status),
-    }
-
-
-@app.post("/api/order-recovery")
-async def post_order_recovery(req: OrderRecoveryRequest,
-                              x_qt_live_token: str | None = Header(default=None)) -> dict:
-    """Operator decision after checking the broker. Requires the live-arm token.
-    Records an audit event; never sends, cancels or modifies a broker order."""
-    live_control.require_live_auth(x_qt_live_token)
-    name = (req.instrument or "").upper()
-    if name not in _inst_mod.REGISTRY:
-        raise HTTPException(404, f"Unknown instrument {req.instrument}")
-    try:
-        return registry.get(name).resolve_recovery(req.action, req.note, req.which)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(503, str(exc)) from exc
-
-
-@app.get("/api/db/status")
-async def db_status() -> dict:
-    """Read-only persistence check: active backend, schema version, row counts.
-
-    Never echoes the connection URL (it may carry a password)."""
-    from app.research.store import store as research_store
-
-    def _probe() -> dict:
-        return research_store().status()
-
-    try:
-        info = await asyncio.to_thread(_probe)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=503,
-            detail={"backend": "postgresql" if settings.db_url.lower().startswith(
-                ("postgres://", "postgresql://")) else "sqlite",
-                "error": type(exc).__name__},
-        ) from exc
-    info["configured"] = bool(settings.db_url)
-    return info
 
 
 @app.get("/api/snapshot")
@@ -1070,38 +954,26 @@ async def snapshot(instrument: str | None = None) -> dict:
 
 
 @app.post("/api/buy")
-async def buy(req: BuyRequest,
-              x_qt_live_token: str | None = Header(default=None)) -> dict:
+async def buy(req: BuyRequest) -> dict:
     st = registry.get(_norm_instrument(req.instrument))
-    if st.is_live:
-        live_control.require_live_auth(x_qt_live_token)
     result = st.buy(req.option_symbol, req.lots, req.confirm)
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
 
 
 @app.post("/api/sell")
-async def sell(req: SellRequest | None = None,
-               x_qt_live_token: str | None = Header(default=None)) -> dict:
+async def sell(req: SellRequest | None = None) -> dict:
     st = registry.get(_norm_instrument(req.instrument if req else None))
-    if st.is_live:
-        live_control.require_live_auth(x_qt_live_token)
     result = st.sell((req.confirm if req else False))
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
 
 
 @app.post("/api/auto-trade")
-async def auto_trade(req: AutoTradeRequest,
-                     x_qt_live_token: str | None = Header(default=None)) -> dict:
+async def auto_trade(req: AutoTradeRequest) -> dict:
     """Toggle/configure the PAPER auto-trader at runtime. Simulated fills only —
     it is hard-guarded off whenever trade_mode is live and never places a real
     order. Mutates the process-wide settings so it applies to every instrument."""
     from app.config import settings
 
-    if (req.allow_live or req.live_max_order_value is not None
-            or req.live_max_lots is not None):
-        live_control.require_live_auth(x_qt_live_token)
-    if req.enabled and live_control.kill_switch_engaged():
-        raise HTTPException(409, "Kill switch is engaged; release it before enabling the bot.")
     if req.enabled is not None:
         settings.auto_trade_enabled = bool(req.enabled)
     if req.min_confidence is not None:
@@ -1115,7 +987,7 @@ async def auto_trade(req: AutoTradeRequest,
     if req.trail_pct is not None:
         settings.auto_trade_trail_pct = max(2.0, min(50.0, float(req.trail_pct)))
     if req.capital is not None:
-        settings.capital = live_control.clamp_capital(req.capital)
+        settings.capital = max(1000.0, float(req.capital))
     if req.risk_per_trade_pct is not None:
         settings.risk_per_trade_pct = max(0.1, min(20.0, float(req.risk_per_trade_pct)))
     if req.daily_profit_target is not None:
@@ -1125,8 +997,7 @@ async def auto_trade(req: AutoTradeRequest,
     if req.allow_live is not None:
         settings.auto_trade_allow_live = bool(req.allow_live)
     if req.live_max_order_value is not None:
-        settings.auto_trade_live_max_order_value = min(
-            max(0.0, float(req.live_max_order_value)), settings.capital)
+        settings.auto_trade_live_max_order_value = max(0.0, float(req.live_max_order_value))
     if req.live_max_lots is not None:
         settings.auto_trade_live_max_lots = max(1, min(50, int(req.live_max_lots)))
     if req.zero_to_hero_enabled is not None:
@@ -1143,7 +1014,7 @@ async def auto_trade(req: AutoTradeRequest,
         settings.auto_trade_pre_t1_trail = bool(req.pre_t1_trail)
     if req.instrument_capital is not None:
         settings.auto_trade_instrument_capital = {
-            str(k).upper(): min(max(0.0, float(v)), settings.capital)
+            str(k).upper(): max(0.0, float(v))
             for k, v in req.instrument_capital.items()
             if v is not None and float(v) > 0
         }
@@ -1182,14 +1053,11 @@ async def auto_trade(req: AutoTradeRequest,
         "instrument_lots": settings.auto_trade_instrument_lots,
         "trade_mode": settings.trade_mode,
         "mode": "live" if live_armed else "paper",
-        "configured_capital": live_control.CONFIGURED_CAPITAL,
-        "kill_switch": live_control.kill_switch_engaged(),
     }
 
 
 @app.post("/api/auto-buy")
-async def auto_buy(req: AutoBuyRequest,
-                   x_qt_live_token: str | None = Header(default=None)) -> dict:
+async def auto_buy(req: AutoBuyRequest) -> dict:
     """ONE-CLICK LIVE auto-buy switch. Flipping ``on`` true wires the whole
     hands-off flow in a single action: enable the bot, arm it for live orders,
     size every entry from your REAL available balance scaled by the signal's
@@ -1205,10 +1073,6 @@ async def auto_buy(req: AutoBuyRequest,
     from app.config import settings
     from app.market import angelone
 
-    if req.on:
-        live_control.require_live_auth(x_qt_live_token)
-        if live_control.kill_switch_engaged():
-            raise HTTPException(409, "Kill switch is engaged; release it before arming.")
     balance: float | None = None
     try:
         balance = angelone.available_cash(ttl=5.0)
@@ -1243,13 +1107,13 @@ async def auto_buy(req: AutoBuyRequest,
         settings.auto_trade_quick_scalp_lots = 0
         # Use the engine's regime ATR stop as-is (wide). 0 = no extra tightening.
         settings.auto_trade_max_stop_pct = 0.0
-        # Balance can only SHRINK the per-order ceiling; it never raises it above
-        # the configured live cap or the strategy capital, and live lots stay at
-        # the configured cap (no silent expansion).
-        ceiling = min(settings.auto_trade_live_max_order_value, settings.capital)
+        # Blast-radius backstop: a single live order can never exceed the cash you
+        # actually hold. Keep the prior cap if the balance can't be read.
         if balance and balance > 0:
-            ceiling = min(ceiling, round(balance, 2))
-        settings.auto_trade_live_max_order_value = ceiling
+            settings.auto_trade_live_max_order_value = round(balance, 2)
+        # Let the confidence-scaled balance budget drive lot count (bounded by the
+        # order-value cap above), rather than a tiny fixed lot ceiling.
+        settings.auto_trade_live_max_lots = max(settings.auto_trade_live_max_lots, 50)
     else:
         settings.auto_trade_enabled = False
         settings.auto_trade_allow_live = False
@@ -1815,89 +1679,6 @@ async def fundamentals(instrument: str | None = None) -> dict:
 async def journal(instrument: str | None = None) -> dict:
     st = registry.get(_norm_instrument(instrument))
     return {"trades": st.journal, "today_profit": st.today_profit, "today_loss": st.today_loss}
-
-
-# ---- Journal v2 (sessions / signals / trade events / sizing; read-only API) ----
-def _jr_filters(**kw) -> dict:
-    out = {k: v for k, v in kw.items() if v not in (None, "")}
-    if "instrument" in out:
-        out["instrument"] = str(out["instrument"]).upper()
-    return out
-
-
-@app.get("/api/journal/v2/status")
-async def journal_v2_status() -> dict:
-    from app.journal import hooks as jr_hooks
-    from app.journal.store import store as jr_store
-
-    js = jr_store()
-    return {"backend": js.backend, "schema_version": js.schema_version(),
-            "counts": js.counts(), "write_errors": jr_hooks.status(),
-            "sim_starting_capital": settings.sim_starting_capital}
-
-
-@app.get("/api/journal/v2/trades")
-async def journal_v2_trades(instrument: str | None = None, mode: str | None = None,
-                            strategy: str | None = None, setup: str | None = None,
-                            regime: str | None = None, status: str | None = None,
-                            result: str | None = None, since: float | None = None,
-                            until: float | None = None, page: int = Query(1, ge=1),
-                            page_size: int = Query(50, ge=1, le=500)) -> dict:
-    from app.journal.store import store as jr_store
-
-    return jr_store().list_trades(_jr_filters(
-        instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
-        status=status, result=result, since=since, until=until), page, page_size)
-
-
-@app.get("/api/journal/v2/trades.csv")
-async def journal_v2_trades_csv(instrument: str | None = None, mode: str | None = None,
-                                strategy: str | None = None, setup: str | None = None,
-                                regime: str | None = None, status: str | None = None,
-                                result: str | None = None, since: float | None = None,
-                                until: float | None = None) -> PlainTextResponse:
-    from app.journal.store import store as jr_store
-
-    body = jr_store().trades_csv(_jr_filters(
-        instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
-        status=status, result=result, since=since, until=until))
-    return PlainTextResponse(body, media_type="text/csv", headers={
-        "Content-Disposition": 'attachment; filename="journal_trades.csv"'})
-
-
-@app.get("/api/journal/v2/trades/{trade_id}")
-async def journal_v2_trade(trade_id: str) -> dict:
-    from app.journal.store import store as jr_store
-
-    detail = jr_store().trade_detail(trade_id)
-    if detail is None:
-        raise HTTPException(404, "Unknown trade")
-    return detail
-
-
-@app.get("/api/journal/v2/sessions")
-async def journal_v2_sessions(instrument: str | None = None, mode: str | None = None,
-                              since: float | None = None, until: float | None = None,
-                              page: int = Query(1, ge=1),
-                              page_size: int = Query(50, ge=1, le=500)) -> dict:
-    from app.journal.store import store as jr_store
-
-    return jr_store().list_sessions(_jr_filters(
-        instrument=instrument, mode=mode, since=since, until=until), page, page_size)
-
-
-@app.get("/api/journal/v2/signals")
-async def journal_v2_signals(instrument: str | None = None, mode: str | None = None,
-                             outcome: str | None = None, signal: str | None = None,
-                             setup: str | None = None, regime: str | None = None,
-                             session_id: str | None = None, since: float | None = None,
-                             until: float | None = None, page: int = Query(1, ge=1),
-                             page_size: int = Query(50, ge=1, le=500)) -> dict:
-    from app.journal.store import store as jr_store
-
-    return jr_store().list_signals(_jr_filters(
-        instrument=instrument, mode=mode, outcome=outcome, signal=signal, setup=setup,
-        regime=regime, session_id=session_id, since=since, until=until), page, page_size)
 
 
 @app.get("/api/signal-stats")
@@ -2861,11 +2642,6 @@ async def scan_health() -> dict:
         # resume by themselves at the next open. Reported so a small scan count in
         # the evening reads as the session, not as a starved loop.
         "closed_skipped": hub.closed_skipped,
-        # Ticks the loop stopped waiting for, and workers still held by one.
-        # A wedged tick no longer stops the scan, so without these the repair
-        # would make the fault invisible instead of visible and bounded.
-        "ticks_abandoned": hub.ticks_abandoned,
-        "ticks_wedged_now": hub.ticks_wedged_now,
         "behind": sorted(over),
         "behind_count": len(over),
         "armed": bool(settings.auto_trade_enabled or settings.futures_paper_enabled),
@@ -4258,16 +4034,29 @@ async def cas_reconciliation() -> dict:
 
 @app.get("/api/cas-report")
 async def cas_report() -> dict:
-    """The persisted CAS evidence: quality gate, paper economics, verdict.
-
-    Rebuilt from the whole CAS journal, so it is served from a cache bound to
-    that journal's exact size and mtime — a mismatch rebuilds and is never
-    served stale. See app/research/phase18/cas_cache.py.
-    """
-    from app.research.phase18 import cas_cache
+    """The persisted CAS evidence: quality gate, paper economics, verdict."""
+    from app.research.phase18 import reports, store
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, cas_cache.report)
+
+    def _run() -> dict:
+        payloads = reports.build_payloads(
+            observations=store.observations(),
+            paper_rows=store.paper(),
+            coverage=store.coverage(),
+        )
+        return {
+            "daily": payloads["cas_daily_report"],
+            "strategy": payloads["cas_strategy_report"],
+            "capture": payloads["phase18_cas_capture"],
+            "paper": payloads["phase18_cas_paper"],
+            "validation": payloads["phase18_cas_validation"],
+            "questions": reports.answers(payloads),
+            "paper_only": True,
+            "no_real_order": True,
+        }
+
+    return await loop.run_in_executor(None, _run)
 
 
 @app.get("/api/cas-journal")
@@ -4417,43 +4206,6 @@ async def phase22_study() -> dict:
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _read)
-
-
-# ---------------------------------------------------------------------------
-# FROZEN PAIR CAPTURE — BANKNIFTY/NIFTY RELATIVE VALUE + NEAR/NEXT BASIS
-#
-# Evidence accumulation for ONE frozen configuration. No endpoint here selects a
-# threshold, fits a hedge ratio or promotes anything, and the retest withholds a
-# verdict until the pre-declared sample exists.
-# ---------------------------------------------------------------------------
-@app.get("/api/pairs/status")
-async def pairs_status() -> dict:
-    """Frozen pair capture: counts, the retest so far, and basis coverage.
-
-    Read-only. The retest publishes no verdict until the pre-declared evidence
-    bar is met, so this endpoint cannot become a promotion signal.
-    """
-    from app.research.pairs import report as pair_report
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, pair_report.status)
-
-
-@app.get("/api/pairs/spec")
-async def pairs_spec() -> dict:
-    """The frozen relationship and its fingerprint."""
-    from app.research.pairs import spec as pair_spec
-
-    return pair_spec.as_dict()
-
-
-@app.get("/api/pairs/health")
-async def pairs_health() -> dict:
-    """Capture counters and the last research-side error, if any."""
-    from app.research.pairs import capture as pair_capture
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, pair_capture.health)
 
 
 # ---------------------------------------------------------------------------
@@ -4762,17 +4514,36 @@ async def phase28_strategies(limit: int = 25) -> dict:
             "paper_only": True, "stop_rule": P28_STOP_RULE}
 
 
-# ---------------------------------------------------------------------------
-# Phase 29 — defined-risk credit spreads, read-only.
-#
-# The seller's side of the option book, priced the only honest way: the short leg
-# sold at the bid, the protective leg bought at the ask, both quoted in the same
-# snapshot, four legs of charges. Every route below reads artefacts the CLI
-# wrote; none of them can start a study (a study takes minutes and would starve
-# the engine), and none of them touches a signal, a paper book or an order path.
-# No margin figure is produced and no expiry outcome is assumed, so the payload
-# carries those two claims next to any number a panel might render.
-# ---------------------------------------------------------------------------
+@app.get("/api/pairs/status")
+async def pairs_status() -> dict:
+    """Frozen pair capture: counts, the retest so far, and basis coverage.
+
+    Read-only. The retest publishes no verdict until the pre-declared evidence
+    bar is met, so this endpoint cannot become a promotion signal.
+    """
+    from app.research.pairs import report as pair_report
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, pair_report.status)
+
+
+@app.get("/api/pairs/spec")
+async def pairs_spec() -> dict:
+    """The frozen relationship and its fingerprint."""
+    from app.research.pairs import spec as pair_spec
+
+    return pair_spec.as_dict()
+
+
+@app.get("/api/pairs/health")
+async def pairs_health() -> dict:
+    """Capture counters and the last research-side error, if any."""
+    from app.research.pairs import capture as pair_capture
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, pair_capture.health)
+
+
 @app.get("/api/phase29/coverage")
 async def phase29_coverage() -> dict:
     """Which instruments quoted two strikes in one snapshot, so a spread prices."""
@@ -4835,15 +4606,6 @@ async def phase29_leads() -> dict:
             "paper_only": True, "promoted": False}
 
 
-# ---------------------------------------------------------------------------
-# Phase 35 — OPPORTUNITY PAPER (§20), read-only.
-# Whether the money is lost because there was no opportunity or because the
-# engine selected, entered, expressed or exited it wrongly. Both routes read the
-# opportunity store and the artefacts the CLI wrote; neither can ingest, rebuild
-# or start Stage A (a rebuild walks 100k+ raw rows and Stage A 1.4m bars, either
-# would starve the engine), and neither touches a signal, a gate or an order
-# path. Every payload carries research_only/paper_only next to its numbers.
-# ---------------------------------------------------------------------------
 @app.get("/api/phase35/panel")
 async def phase35_panel(
     instrument: str | None = None,
@@ -4878,14 +4640,6 @@ async def phase35_panel(
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase 36 — CRUDEOIL vehicle selection (FUTURES vs CE vs PE), read-only.
-# The route reads the artefacts the CLI wrote and nothing else: a run resolves
-# every leg at twelve horizons plus a placebo and a stress grid, so computing it
-# inside a request would starve the capture the evidence comes from. No signal,
-# gate, strike, target, stop, exit, sizing or order path is reachable from here,
-# and the study can never return VALIDATED.
-# ---------------------------------------------------------------------------
 @app.get("/api/phase36/report")
 async def phase36_report(
     instrument: str = "CRUDEOIL",
@@ -5029,20 +4783,12 @@ async def phase35_stagea() -> dict:
     return await loop.run_in_executor(None, p35.stagea_artefact)
 
 
-# ---------------------------------------------------------------------------
-# Phase 45 — SHADOW SIGNALS: the futures board, the options board (CE and PE
-# separately), the synchronized vehicle comparison, the paper journal and the
-# shadow performance summary. RESEARCH ONLY, PAPER ONLY.
-#
-# Read-only in the strongest sense available here: these routes read a journal
-# written by the capture path and can neither evaluate, re-evaluate, restate nor
-# delete an event. There is deliberately no endpoint that enters, exits, sizes,
-# promotes or arms anything, and no order path is reachable from the module they
-# import. The production BUY/SELL/WAIT signal is not read, not written and not
-# affected by anything below.
-# ---------------------------------------------------------------------------
 _P45_VEHICLES = {"FUTURES", "CE", "PE"}
+
+
 _P45_ACTIONS = {"SHADOW_BUY", "SHADOW_SELL", "SHADOW_WAIT", "SHADOW_UNMEASURED"}
+
+
 _P45_DIRECTIONS = {"LONG", "SHORT"}
 
 
@@ -5139,15 +4885,6 @@ async def phase45_status() -> dict:
     return await loop.run_in_executor(None, p45.stats)
 
 
-# --------------------------------------------------------------------------
-# Phase 46 — the research overlay beside the production signal board.
-#
-# Additive, and only additive: the Option Signal endpoints above are untouched,
-# nothing here is read by the engine, and a client that never calls these
-# routes sees exactly the board it saw before. Each payload carries its own
-# PAPER_ONLY / NO_ORDER_PATH / PRODUCTION_UNCHANGED labels so a row cannot be
-# quoted out of the context that makes it honest.
-# --------------------------------------------------------------------------
 def _p46_instrument(instrument: str | None) -> str | None:
     """A validated instrument name, or None. Never interpolated into SQL."""
     if (
@@ -5230,15 +4967,6 @@ async def phase46_status() -> dict:
     return await loop.run_in_executor(None, p46.stats)
 
 
-# --------------------------------------------------------------------------
-# Phase 47 — the research call board. Read-only, additive, paper only.
-#
-# Prices the calls Phase 46 already admitted against the latest measured quote
-# for the same contract, so "is the research making money" is a number that
-# moves during the session instead of a claim. Nothing here admits a call,
-# changes a signal or reaches an order path, and every payload carries the
-# PAPER_ONLY / NO_ORDER_PATH labels.
-# --------------------------------------------------------------------------
 @app.get("/api/phase47/callboard")
 async def phase47_callboard(
     instrument: str | None = None,
@@ -5288,13 +5016,6 @@ async def phase47_status() -> dict:
     return await loop.run_in_executor(None, p47.status)
 
 
-# --------------------------------------------------------------------------
-# PHASE 48 — ADMISSION FUNNEL (read-only attribution over the Phase 46 journal)
-# Why an instant was not admitted, counted per stage in the same order Phase 46
-# asks the questions. It re-classifies nothing, holds no threshold of its own,
-# writes to no journal, and has no order path. A funnel that admits more
-# instants is a wider funnel, not a better one, and every payload says so.
-# --------------------------------------------------------------------------
 @app.get("/api/phase48/funnel")
 async def phase48_funnel(
     instrument: str | None = None,
@@ -5339,14 +5060,6 @@ async def phase48_status() -> dict:
     return await loop.run_in_executor(None, p48.status)
 
 
-# --------------------------------------------------------------------------
-# PHASE 49 — EVENT COUNTS AND THE SUPERSESSION REGISTRY (read-only here)
-# The board's own payloads already carry the event counts. What this block
-# exposes is the correction record: which recorded tally was superseded, by
-# which, and why. Read-only — the supersession itself is written by the CLI,
-# deliberately, so a correction to the durable record is an act someone took
-# rather than something a dashboard poll can do on its own.
-# --------------------------------------------------------------------------
 @app.get("/api/phase49/registry")
 async def phase49_registry(session: str | None = None, limit: int = 50) -> dict:
     """Every tally correction on the record, oldest first, nothing removed."""
@@ -5373,14 +5086,6 @@ async def phase49_status() -> dict:
     return await loop.run_in_executor(None, p49.status)
 
 
-# --------------------------------------------------------------------------
-# PHASE 50 — EVENTS, THEIR SESSION STATUS AND THEIR RESOLVED OUTCOMES
-#
-# Read-only, all four. The event journal and the tally reading are written by
-# the CLI and not by a dashboard poll: a durable row that a page refresh can
-# create is a row nobody chose to write, and this phase exists because an
-# unattributable count is expensive to explain later.
-# --------------------------------------------------------------------------
 def _p50_session(session: str | None) -> str | None:
     """A session filter accepted only in the journal's own date form."""
     if session and len(session) <= 10 and session.replace("-", "").isdigit():

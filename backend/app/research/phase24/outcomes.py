@@ -265,26 +265,6 @@ def resolve(
     return o
 
 
-def cost_points_per_trade(
-    instrument: str,
-    entry: np.ndarray,
-    exit_price: np.ndarray,
-    *,
-    lot_size: int,
-    slippage_points: float | None = None,
-) -> np.ndarray:
-    """Public name for the per-trade round-trip cost, for other research phases.
-
-    Additive wrapper around the same reconstruction this module already uses, so
-    a later study charges cost from ``phase19.futcosts`` rather than re-deriving
-    a cost model of its own and drifting away from this one.
-    """
-    return _cost_points_per_trade(
-        instrument, entry, exit_price,
-        lot_size=lot_size, slippage_points=slippage_points,
-    )
-
-
 def cost_note(instrument: str, entry: float, exit_price: float) -> dict:
     """The cost decomposition for one representative trade, for the report."""
     return futcosts.round_trip(

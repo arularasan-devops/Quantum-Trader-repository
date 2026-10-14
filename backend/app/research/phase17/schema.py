@@ -76,18 +76,9 @@ class Quote:
 
     bid: float | None = None
     ask: float | None = None
-    # Quantity resting at the top of each side, when the feed published it. A
-    # spread of one paisa on one lot and the same spread on fifty are different
-    # executable books, and without the sizes a later reader cannot tell which
-    # one was quoted. Absent stays absent rather than becoming zero.
     bid_size: int | None = None
     ask_size: int | None = None
     premium: float | None = None
-
-    # Contract multiplier at the capture instant, from the feed's own scrip
-    # master. Recorded beside the book because a cost is a flat fee divided by
-    # this quantity: a book captured without it cannot be costed later, and the
-    # value published today is not necessarily the value published next series.
     lot_size: int | None = None
 
     oi: float | None = None
@@ -107,10 +98,6 @@ class Quote:
 
     source: str = quality.UNKNOWN_SOURCE
     feed_age_ms: float | None = None
-    # Age of THIS bid/ask at the capture instant, which is not the tick age:
-    # the provider cache carries a book forward across ticks that arrive with
-    # no depth. ``None`` means the feed never dated the book, so its freshness
-    # cannot be proved and no study may treat it as an executable price.
     book_age_ms: float | None = None
     signal_to_snapshot_ms: float | None = None
     snapshot_ts: float | None = None

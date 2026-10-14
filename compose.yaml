@@ -1,0 +1,34 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      QT_HOST: "0.0.0.0"
+      QT_PORT: "8000"
+      QT_CORS_ORIGINS: "http://localhost:3000"
+      QT_DATA_DIR: "/app/data"
+      QT_DATA_PROVIDER: "${QT_DATA_PROVIDER:-simulated}"
+      QT_TRADE_MODE: "paper"
+      QT_PAPER_MODE: "true"
+      QT_AUTO_TRADE_ENABLED: "false"
+    volumes:
+      - ./backend/data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: "http://localhost:8000"
+        NEXT_PUBLIC_WS_BASE: "ws://localhost:8000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped

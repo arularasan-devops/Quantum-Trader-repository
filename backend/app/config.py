@@ -136,23 +136,11 @@ class Settings(BaseSettings):
     orders_on_primary_only: bool = True
 
     # --- Risk management / position sizing ---
-    # Single strategy-capital source of truth (QT_CAPITAL). Runtime API changes
-    # may only lower it; broker balance never raises it (execution/live_control).
-    capital: float = 500000.0            # trading capital used for sizing (₹5L)
-    # Shared secret required (X-QT-Live-Token) to arm anything that can reach a
-    # broker. Empty = live arming refused. Never commit a real value.
-    live_arm_token: str = ""
-    # How long a live order may stay acknowledged-but-unfilled before the entry
-    # is treated as pending (no position opened, no duplicate order).
-    order_fill_timeout_sec: float = 5.0
+    capital: float = 100000.0            # trading capital used for sizing
+
+    # Journal v2 is opt-in; keep disabled until explicitly validated.
+    journal_v2_enabled: bool = False
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
-    # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
-    # change the engine's actual quantity (see app/journal/sizing.py).
-    journal_v2_enabled: bool = True
-    sim_starting_capital: float = 500000.0      # QT_SIM_STARTING_CAPITAL
-    sizing_capital_fraction_pct: float = 10.0   # capital-based: % of equity per trade
-    sizing_aggressive_multiplier: float = 2.0   # aggressive = capital-based x this
-    sizing_risk_budget_pct: float = 1.0         # risk-budget: % of equity lost at stop
     # These three are ACCOUNT-WIDE and persisted across restarts (see
     # app/engine/account_risk.py). They used to be per-instrument and in-memory,
     # which made the cap meaningless: measured 13 Aug, the book lost Rs16,834
@@ -173,7 +161,7 @@ class Settings(BaseSettings):
     # it refuses to run whenever trade_mode is 'live'. Safety caps reuse the risk
     # limits above (max_daily_loss, max_trades_per_day, max_consecutive_losses).
     auto_trade_enabled: bool = False
-    auto_trade_min_confidence: float = 80.0   # only auto-buy at/above this %
+    auto_trade_min_confidence: float = 90.0   # only auto-buy at/above this %
     auto_trade_max_lots: int = 1              # hard upper cap on lots per auto entry
     # Multi-instrument concurrency: hold positions in up to N DIFFERENT instruments
     # at once (each instrument still gets one position). New entries are additionally
@@ -185,12 +173,6 @@ class Settings(BaseSettings):
     #  * no-chase: skip when the move looks already-extended / trap-like, using the
     #    engine's own buy-trap probability and premium-health read.
     auto_trade_momentum_entry: bool = False
-    # Strategy gate (trade_journal analysis, 17 Aug-29 Sep paper): only PULLBACK
-    # entries in a TRENDING regime were profitable; every other trigger/regime lost.
-    # Auto-buy fires only when BOTH hold; everything else is recorded as SKIPPED.
-    auto_trade_strategy_gate: bool = True
-    auto_trade_allowed_triggers: list[str] = ["PULLBACK"]
-    auto_trade_allowed_regimes: list[str] = ["TRENDING"]
     auto_trade_no_chase: bool = True
     auto_trade_no_chase_trap_prob: float = 60.0   # skip entry when buy_trap_prob >= this
     # Safe (risk-based) position sizing: size each auto entry from capital and
@@ -206,7 +188,7 @@ class Settings(BaseSettings):
     # risk-based sizer equalise the rupee risk across instruments, still bounded
     # by the capital guard and the ceiling below. Default OFF: it increases
     # position size, so it should be switched on deliberately.
-    auto_trade_risk_balanced_lots: bool = True
+    auto_trade_risk_balanced_lots: bool = False
     auto_trade_balanced_max_lots: int = 10    # hard ceiling when balanced sizing is on
     # Per-instrument overrides for capital budget and lots. Keyed by instrument
     # name (e.g. "NIFTY", "CRUDEOIL"). When an instrument has an entry here it
@@ -326,18 +308,6 @@ class Settings(BaseSettings):
     # valid day and the board is allowed to be empty.
     phase17_board_preferred: int = 5
     phase17_board_watch: int = 5
-
-    # --- Phase 50 research-recorder tier cadence ------------------------------
-    # The sampled tier (the four expensive MCX books, CRUDEOIL excluded) may be
-    # re-read every 15 seconds instead of every 60. Research capture only: the
-    # production scanner, the signal, the broker and the order path do not read
-    # this flag. Measured over 2026-09-17 the 60-second gate left 47 of 86
-    # eligible events unable to answer a 15-second observation grid, and the
-    # replayed 15-second schedule cost fewer attempts and a lower peak minute
-    # than the capture already spends, so the change reduces rather than adds
-    # feed work. Set False to restore the 60-second gate without a code change —
-    # the documented rollback for tick-latency, stall or resource pressure.
-    phase50_shadow_slow_tier: bool = True
 
     # --- Phase 18 closing-auction (CAS) research + paper ----------------------
     # SEBI's Closing Auction Session discovers the closing price between 15:15
@@ -1096,37 +1066,6 @@ class Settings(BaseSettings):
     # touched. Without it the floor sat at the T1 lock and every winner was
     # booked at ~0.5R however far it ran (measured: three of three on 13 Aug).
     futures_post_t1_trail_r: float = 0.5
-    # Pre-T1 profit protection. Until this existed the futures floor was only
-    # created AFTER T1 was touched, so a trade that ran part of the way and
-    # reversed had nothing holding it and walked to the full stop. Measured on
-    # the recorded paper book: 12 of the losing futures trades were green first
-    # and Rs16,481 of shown profit was handed back, including +Rs2,960 -> -Rs3,600
-    # and +Rs1,610 -> -Rs1,990. The ladder below mirrors what the option path has
-    # had all along. It reduces the SIZE of losses; it does not create an edge
-    # (Phase 26 measured trail variants on 156,949 option books: -0.3061R ->
-    # -0.2921R, 0 of 50 instruments positive).
-    futures_pre_t1_trail: bool = True
-    # Arm once the favourable excursion reaches this fraction of R. Below the T1
-    # lock's own trigger, so it can only ever fire before T1.
-    futures_pre_t1_arm_r: float = 0.5
-    # Once armed, exit on giving back this % of the run from entry to the peak.
-    # OFF by default, and deliberately: on the recorded book the ratchet alone can
-    # avoid at most Rs13,942 of loss, while Rs22,356 of recorded WINNERS reached
-    # the arm threshold and would have been exposed to this exit. Whether it
-    # clips more than it saves cannot be answered without tick paths, which are
-    # only now being captured — so it stays off until the counterfactual can be
-    # graded rather than guessed.
-    futures_pre_t1_giveback_exit: bool = False
-    futures_pre_t1_giveback_pct: float = 40.0
-    # Once armed, ratchet the hard stop up to entry + round-trip cost, so a trade
-    # that showed real profit can no longer become a full-stop loss. Entry itself
-    # is NOT break-even on futures: closing there loses the whole round trip.
-    futures_pre_t1_breakeven: bool = True
-    # Refuse a plan whose T1 is not at least this multiple of the round-trip cost.
-    # Measured: a NATURALGAS plan carried T1 0.2 pts away against 2.2 pts of risk
-    # and ~2.1 pts of cost — the target was inside the cost, so even hitting it
-    # booked -Rs2,580. 0 = gate off.
-    futures_min_t1_cost_multiple: float = 2.0
     # Maximum round-trip cost as a % of the stop distance. Above this the trade
     # cannot pay for itself: every trade taken between 12% and 25% lost money.
     futures_max_cost_to_risk_pct: float = 12.0
@@ -1146,17 +1085,6 @@ class Settings(BaseSettings):
     futures_ctt_sell_pct: float = 0.01         # CTT, sell side only, MCX commodities
     futures_txn_pct: float = 0.0035            # exchange + SEBI + stamp + GST, both sides
     futures_no_entry_minutes: float = 45.0     # no new entry inside the last N min
-
-    # --- Frozen pair capture (research only, no order path) --------------------
-    # Records BANKNIFTY and NIFTY futures books at the SAME bar timestamp and
-    # paper-trades the one frozen relative-value configuration. The first result
-    # was REQUIRES_MORE_DATA because the futures spread was never measured and
-    # the sample was one six-week window; both are fixed only by capturing.
-    pair_capture_enabled: bool = True
-    # Also quote the NEXT futures expiry on the same refresh, so the near/next
-    # basis (Test B) becomes measurable. One extra token on an existing quote
-    # call; it feeds no signal and no order.
-    pair_next_expiry_capture: bool = True
 
     # --- Futures risk governor -------------------------------------------------
     # The option engine has a daily-loss cap, a trade cap and a consecutive-loss
@@ -1251,14 +1179,8 @@ class Settings(BaseSettings):
     # instruments all evening — the exact cost that slows the names still trading.
     equity_close_ist: str = "15:30"
     market_days: str = "0-4"  # 0=Mon … 6=Sun
-    # Simulated demo runs 24/7. Only honoured for the simulator: a real broker
-    # feed always respects exchange hours (see hours_ignored).
+    # Simulated demo runs 24/7; set false with a live feed to respect hours.
     ignore_market_hours: bool = True
-
-    def hours_ignored(self) -> bool:
-        return self.ignore_market_hours and self.data_provider.lower() in (
-            "simulated", "sim", "demo",
-        )
 
     def minutes_to_close(self, now_utc: float) -> int:
         """Minutes left in the IST session (0 once it has closed).
@@ -1287,6 +1209,7 @@ class Settings(BaseSettings):
                 days.add(int(part))
         return days or {0, 1, 2, 3, 4}
 
+    pair_capture_enabled: bool = False
     # --- Phase 6 AI engine (LIVE PAPER ONLY) -----------------------------------
     # A second, independent engine that runs beside the existing one and trades
     # only the paper book. The existing engine is untouched and stays the
@@ -1325,25 +1248,6 @@ class Settings(BaseSettings):
     # AI cannot emit BUY_NOW — it never falls back to a guessed probability.
     ai_model_path: str = ""
 
-    # --- Phase 45 shadow board + paper journal (research only) ---------------
-    # Evaluates the observation Phase 17 has ALREADY captured and persisted, and
-    # writes what a research definition would have said into its own database.
-    # It cannot change a production signal, arms no gate and has no import path
-    # to an order or a broker. On by default because a board that only runs when
-    # someone remembers to switch it on accrues no sample; set false to stop the
-    # extra write entirely.
-    phase45_shadow: bool = True
-    # Paper outcomes are resolved this long after the decision instant, so an
-    # event is not graded on the two forward quotes that exist a minute later.
-    phase45_resolve_after_minutes: int = 15
-    # Phase 46 — the research overlay beside the production signal board. It
-    # classifies the Phase 45 row that was already journalled for an instant
-    # and records one word for where the research evidence stood; it changes no
-    # signal, filters nothing and has no import path to an order or a broker.
-    # Separate from the Phase 45 switch so switching the view off never
-    # switches the evidence off.
-    phase46_overlay: bool = True
-
     def session_window_ist(self, exchange: str | None = None) -> tuple[str, str]:
         """The open/close bells for an exchange, as "HH:MM" strings.
 
@@ -1379,6 +1283,19 @@ class Settings(BaseSettings):
         if not is_day:
             return False, f"Market CLOSED · weekend ({ist:%a} IST)"
         return False, f"Market CLOSED · session {open_ist}–{close_ist} IST"
+
+    # Restored missing research and futures settings from reference.
+    phase50_shadow_slow_tier: bool = True
+    futures_pre_t1_trail: bool = True
+    futures_pre_t1_arm_r: float = 0.5
+    futures_pre_t1_giveback_exit: bool = False
+    futures_pre_t1_giveback_pct: float = 40.0
+    futures_pre_t1_breakeven: bool = True
+    futures_min_t1_cost_multiple: float = 2.0
+    pair_next_expiry_capture: bool = True
+    phase45_shadow: bool = True
+    phase45_resolve_after_minutes: int = 15
+    phase46_overlay: bool = True
 
 
 settings = Settings()

@@ -1,28 +1,16 @@
-# syntax=docker/dockerfile:1
-# Pinned base image (version + SHA256 digest) per security policy.
-FROM python:3.11.9-slim-bookworm@sha256:8fb099199b9f2d70342674bd9dbccd3ed03a258f26bbd1d556822c6dfc60c317 AS base
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONPATH=/app
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt .
+COPY docker_vendor/ /usr/local/lib/python3.12/site-packages/
 
-# Create a dedicated non-root user and drop privileges.
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
-COPY --chown=appuser:appgroup app/ ./app/
-# Pre-create the data dir so a mounted named volume inherits appuser ownership.
-# The SmartAPI SDK writes its own logs to ./logs (relative to /app) on login.
-RUN mkdir -p /app/data /app/logs && chown appuser:appgroup /app/data /app/logs
-USER appuser
+COPY app/ ./app/
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=240s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -95,3 +95,48 @@ backend/data/
 # Local historical market datasets
 backend/CRUDEOIL_ONE_MINUTE.jsonl
 backend/*_ONE_MINUTE.jsonl
+
+# Local environments and generated output
+.venv*/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.next/
+node_modules/
+*.py[cod]
+*.tsbuildinfo
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data and research captures
+backend/data/
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+*.jsonl.gz
+
+# Local backups and archives
+*.bak
+*.bak-*
+*.bak_*
+*.tar
+*.tar.gz
+*.zip
+
+# One-off recovery copies
+backend/Dockerfile.pre_vendor_backup
+backend/app/main.py.recovery-*
+
+# Vendored runtime packages: exclude tests and development assets
+backend/docker_vendor/**/tests/
+backend/docker_vendor/**/test/
+backend/docker_vendor/**/testing/
+backend/docker_vendor/**/__pycache__/
+backend/docker_vendor/**/*.pyc
+backend/docker_vendor/**/*.pyo

@@ -1,6 +1,12 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import AiPaperTrading from "@/components/AiPaperTrading";
+import HurdleShadowPanel from "@/components/HurdleShadowPanel";
+import CapturedOptionStudyPanel from "@/components/CapturedOptionStudyPanel";
+import ExitStudyPanel from "@/components/ExitStudyPanel";
+import FiveYearDiscoveryPanel from "@/components/FiveYearDiscoveryPanel";
+import HigherTimeframePanel from "@/components/HigherTimeframePanel";
+import MultiDayPanel from "@/components/MultiDayPanel";
 import MarketOpportunities from "@/components/MarketOpportunities";
 import SignalDiagnostics from "@/components/SignalDiagnostics";
 import {
@@ -296,6 +302,37 @@ export default function ResearchDashboard({ instrument }: { instrument: string }
 
       {/* Setup Library — every completed paper trade captured with MFE/MAE */}
       <SetupLibraryPanel instrument={instrument} />
+
+      {/* Phase 23 — break-even hurdle PAPER SHADOW. Record-only: it observes
+          auto BUY opportunities with the measured book and scores three arms on
+          the engine's own trades. No threshold reaches the live order path. */}
+      <HurdleShadowPanel />
+
+      {/* Phase 24 — the five-year discovery study, read-only. Separate from the
+          Phase 23 shadow: it reads artefacts a CLI run wrote and can neither
+          start a study nor promote anything. */}
+      <FiveYearDiscoveryPanel />
+
+      {/* Phase 25 — the captured-window CE/PE study, read-only. Its own
+          artefacts: entry at the stored ask, exit at the stored bid, and a
+          verdict that can never exceed RESEARCH_LEAD. */}
+      <CapturedOptionStudyPanel />
+
+      {/* Phase 26 — exit variants on the same captured books, plus the measured
+          tradability advisory. Advisory only: no row here is wired to a live
+          refusal, and the ceiling is still RESEARCH_LEAD. */}
+      <ExitStudyPanel />
+
+      {/* Phase 27 — the final futures branch on 5-minute and 15-minute bars,
+          read-only. Option strategy logic and the option-book capture are
+          untouched by it, and the ceiling is still RESEARCH_LEAD. */}
+      <HigherTimeframePanel />
+
+      {/* Phase 28 — the first study that holds overnight: multi-day futures and
+          cash-equity delivery on daily bars, benchmarked against buy-and-hold.
+          A stock with no five-year history reads INSUFFICIENT_HISTORY, which is
+          unanswered rather than failed. Read-only, ceiling RESEARCH_LEAD. */}
+      <MultiDayPanel />
 
       {/* controls */}
       <div className="card p-3 flex flex-wrap items-center gap-2">

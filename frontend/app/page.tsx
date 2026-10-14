@@ -19,37 +19,46 @@ import {
   setSoundScope,
   startAlerts,
 } from "@/lib/alerts";
-import RiskCard from "@/components/RiskCard";
-import LearningCard from "@/components/LearningCard";
 import BacktestModal from "@/components/BacktestModal";
 import PerformanceModal from "@/components/PerformanceModal";
-import AiEngine from "@/components/AiEngine";
-import DecisionHero from "@/components/DecisionHero";
-import MiniCharts from "@/components/MiniCharts";
-import PositionCard from "@/components/PositionCard";
-import EntryZoneCard from "@/components/EntryZoneCard";
-import TargetsCard from "@/components/TargetsCard";
-import StopLossCard from "@/components/StopLossCard";
-import AiStatusCard from "@/components/AiStatusCard";
-import DecisionStack from "@/components/DecisionStack";
-import ReasonsCard from "@/components/ReasonsCard";
-import TradeMeterCard from "@/components/TradeMeterCard";
-import NewsFeed from "@/components/NewsFeed";
-import MarketContext from "@/components/MarketContext";
 import ProDashboard from "@/components/ProDashboard";
 import MomentumBoard from "@/components/MomentumBoard";
 import FlowBoard from "@/components/FlowBoard";
 import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
 import JournalBoard from "@/components/JournalBoard";
-import BuySignalsPanel from "@/components/BuySignalsPanel";
-import CommandCenter from "@/components/CommandCenter";
+import AplusPaperBoard from "@/components/AplusPaperBoard";
+import DailyBestBoard from "@/components/DailyBestBoard";
+import VehicleEvidencePanel from "@/components/VehicleEvidencePanel";
+import CasBoard from "@/components/CasBoard";
+import ProductionReadiness from "@/components/ProductionReadiness";
+import ReportsBoard from "@/components/ReportsBoard";
 import QuantumSignal from "@/components/QuantumSignal";
-import TopMovers from "@/components/TopMovers";
+import FuturesSignalBoard from "@/components/FuturesSignalBoard";
+import CoreAplusPaper from "@/components/CoreAplusPaper";
 import ResearchDashboard from "@/components/ResearchDashboard";
 import AccountDashboard from "@/components/AccountDashboard";
 import PositionSizingModal from "@/components/PositionSizingModal";
 import WatchlistModal from "@/components/WatchlistModal";
+
+type View =
+  | "signal" | "futsignal" | "decision" | "momentum" | "flow" | "spreads"
+  | "futures" | "journal" | "reports" | "oneaday" | "aplus" | "evidence"
+  | "cas" | "readiness" | "core" | "research" | "account";
+
+// One row per tab, so the bar is described once instead of sixteen near-identical
+// buttons. Order is the order on screen.
+const TABS: { key: View; label: string; badge?: string; title?: string }[] = [
+  { key: "signal", label: "Option Signal", title: "Option Signal — the single-page CE/PE decision tool (regime/volatility-gated BUY/WAIT/HOLD/EXIT)" },
+  { key: "futsignal", label: "Futures Signal", badge: "RESEARCH", title: "Futures Signal — point-based futures research. No order path, paper or live." },
+  { key: "decision", label: "Decision" },
+  { key: "spreads", label: "Spreads", badge: "RESEARCH" },
+  { key: "futures", label: "Futures", badge: "PAPER" },
+  { key: "journal", label: "Journal" },
+  { key: "reports", label: "Reports" },
+  { key: "cas", label: "CAS", title: "Closing auction session, 15:10-15:30 IST. PAPER ONLY — no order path, kept apart from the Option Signal." },
+  { key: "account", label: "Account" },
+];
 
 type PendingOrder = {
   side: "BUY" | "SELL";
@@ -77,7 +86,7 @@ export default function Page() {
   const [showPerformance, setShowPerformance] = useState(false);
   const [showSizing, setShowSizing] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "journal" | "movers" | "analysis" | "research" | "account">("signal");
+  const [view, setView] = useState<View>("signal");
 
   // Restore this tab's instrument on load/refresh: prefer the ?instrument= URL
   // param (so each tab keeps its own selection and survives a refresh), then the
@@ -192,7 +201,6 @@ export default function Page() {
 
   const t = themeFor(snap.decision.signal);
   const inPosition = !!snap.position.option_symbol;
-  const selSymbol = snap.position.option_symbol || snap.decision.recommended_option;
   const up = snap.futures_change >= 0;
   const live = snap.trade_mode === "live";
 
@@ -266,7 +274,7 @@ export default function Page() {
   return (
     <div
       className="h-screen w-screen p-3 flex flex-col gap-3 overflow-hidden"
-      style={{ "--accent": t.accent, "--accent-dim": t.accentDim } as React.CSSProperties}
+      style={{ ["--accent" as any]: t.accent, ["--accent-dim" as any]: t.accentDim }}
     >
       {view !== "decision" && <Alerts alerts={snap.alerts} />}
 
@@ -386,63 +394,6 @@ export default function Page() {
           >
             {live ? "● LIVE ORDERS" : "○ PAPER"}
           </span>
-          <div className="flex rounded-lg border border-white/15 overflow-hidden text-xs font-semibold">
-            <button
-              onClick={() => setView("signal")}
-              className={view === "signal" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-              title="Quantum Signal — the single-page decision tool (regime/volatility-gated BUY/WAIT/HOLD/EXIT)"
-            >
-              Signal
-            </button>
-            <button
-              onClick={() => setView("decision")}
-              className={view === "decision" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Decision
-            </button>
-            <button
-              onClick={() => setView("momentum")}
-              className={view === "momentum" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Momentum
-            </button>
-            <button
-              onClick={() => setView("flow")}
-              className={view === "flow" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Flow
-            </button>
-            <button
-              onClick={() => setView("spreads")}
-              className={view === "spreads" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Spreads <span className="text-[9px] text-amber-300/80">RESEARCH</span>
-            </button>
-            <button
-              onClick={() => setView("futures")}
-              className={view === "futures" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Futures <span className="text-[9px] text-amber-300/80">PAPER</span>
-            </button>
-            <button
-              onClick={() => setView("journal")}
-              className={view === "journal" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Journal
-            </button>
-            <button
-              onClick={() => setView("research")}
-              className={view === "research" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Research
-            </button>
-            <button
-              onClick={() => setView("account")}
-              className={view === "account" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Account
-            </button>
-          </div>
           {/* Sound controls, and sound itself, belong to the Signal dashboard —
               the screen you trade from. Hidden elsewhere, so the switches are not
               offered on screens that deliberately stay silent. */}
@@ -477,49 +428,82 @@ export default function Page() {
         </div>
       </div>
 
+      {/* Tab bar, on its own row. It used to sit inside the top bar's right-hand
+          cluster, where sixteen tabs could not fit: the group had a fixed content
+          width and `overflow-hidden`, so on any screen narrower than the whole
+          row the last tabs were clipped away with no way to reach them. Here it
+          gets the full width and scrolls horizontally when it still does not fit,
+          so every tab stays reachable at any window size. */}
+      <div
+        className="card card-scroll-x px-2 py-1 flex items-center gap-1 shrink-0 text-xs font-semibold"
+        role="tablist"
+        onWheel={(e) => {
+          // A bar that only scrolls sideways: a mouse without a tilt wheel would
+          // otherwise have no way to reach the last tabs, because the browser
+          // does not turn a vertical wheel into horizontal scroll by itself.
+          const el = e.currentTarget;
+          if (el.scrollWidth <= el.clientWidth || e.deltaY === 0) return;
+          // No preventDefault: React's wheel listener is passive, and the bar sits
+          // outside the page scroller, so nothing else moves anyway.
+          el.scrollLeft += e.deltaY;
+        }}
+      >
+        {TABS.map((tb) => (
+          <button
+            key={tb.key}
+            role="tab"
+            aria-selected={view === tb.key}
+            onClick={() => setView(tb.key)}
+            title={tb.title}
+            className={`shrink-0 whitespace-nowrap px-3 py-1.5 rounded-lg border ${
+              view === tb.key
+                ? "bg-white/10 text-white border-white/25"
+                : "text-white/60 border-transparent hover:bg-white/5"
+            }`}
+          >
+            {tb.label}
+            {tb.badge && (
+              <span className="ml-1 text-[9px] text-amber-300/80">{tb.badge}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* One scroll container for every screen. Each board used to be responsible
+          for its own scrolling inside a viewport-height page with
+          `overflow-hidden`, and the ones whose root box is content-height (A+
+          Paper, Evidence, CAS, Readiness, Account, Reports) therefore ran off the
+          bottom of the window with nothing to scroll. */}
+      <div className="flex-1 min-h-0 overflow-y-auto pr-1 flex flex-col gap-3">
       {view === "signal" ? (
         /* Quantum Signal — the single-page decision tool. Read-only: the frozen
            engine's call gated by a regime + ADX + expected-move filter so
            signals stop firing in chop. Paper/advisory only. */
-        <div className="flex-1 min-h-0 overflow-y-auto">
-          <QuantumSignal instrument={instrument} onInstrument={onSelectInstrument} />
-        </div>
-      ) : view === "command" ? (
-        /* AI Command Center (V4) — a read-only glanceable page that aggregates
-           the REAL signals the engines already compute (regime, VIX/breadth,
-           ranked opportunities, lifecycle, position health, exit). Feature-
-           flagged (QT_AI_COMMAND_CENTER); shows a disabled card when off. Never
-           changes the frozen engine and never places an order. */
-        <CommandCenter
-          snap={snap}
-          onPick={(sym) => {
-            if (typeof window !== "undefined") {
-              window.open(`/?instrument=${encodeURIComponent(sym)}`, "_blank", "noopener");
-            }
-          }}
+        <QuantumSignal instrument={instrument} onInstrument={onSelectInstrument} />
+      ) : view === "futsignal" ? (
+        /* Futures Signal — the futures research board: risk in points, one point
+           worth the lot size in rupees, mandatory stop. Research only: no paper
+           or live order route, and it never replaces an option BUY. */
+        <FuturesSignalBoard
+          instrument={instrument}
+          instruments={snap.instruments}
+          onInstrument={onSelectInstrument}
         />
       ) : view === "account" ? (
         /* Paper-account overview: balance/equity, trades per day, P&L, and a
            downloadable monthly statement. Paper-only. */
         <AccountDashboard />
+      ) : view === "core" ? (
+        /* CORE A+ PAPER — the single candidate strategy: selective pullback +
+           continuation, then CE vs PE vs FUTURES on whichever of them actually
+           had a two-sided book. Paper only; the verdict on it belongs to the
+           chronological holdout study, not to this screen. */
+        <CoreAplusPaper />
       ) : view === "research" ? (
         /* Research & validation platform (data / replay / analytics / shadow /
-           data-quality / Phase 7). Given the page-level scroll container here so
-           the last panels are reachable: the board is taller than any viewport,
-           and its own flex-1 box could only ever show one screenful. */
-        <div className="flex-1 min-h-0 overflow-y-auto pr-1">
-          <ResearchDashboard instrument={instrument} />
-        </div>
-      ) : view === "movers" ? (
-        /* Today's auto-picked top F&O movers with details. Clicking a row opens
-           that instrument in a new Decision tab. */
-        <TopMovers
-          onPick={(sym) => {
-            if (typeof window !== "undefined") {
-              window.open(`/?instrument=${encodeURIComponent(sym)}`, "_blank");
-            }
-          }}
-        />
+           data-quality / Phase 7). Taller than any viewport; the page-level
+           scroll container above is what makes the last panels reachable. */
+        <ResearchDashboard instrument={instrument} />
       ) : view === "momentum" ? (
         /* Early Momentum board — a SEPARATE advisory engine with its own full
            trade plan (EARLY BUY CE/PE · entry/stop/targets/exit). Never changes
@@ -541,60 +525,45 @@ export default function Page() {
            option engine and has NO live order route. */
         <FuturesBoard snap={snap} />
       ) : view === "journal" ? (
-        /* Complete trade journal — the full persisted record of every closed
-           paper/live trade with reason, confidence, P&L and analyst note. */
-        <>
-          <JournalBoard />
-          <BuySignalsPanel />
-        </>
-      ) : view === "decision" ? (
+        /* Journal — the paper/live trades that were actually opened and closed. */
+        <JournalBoard />
+      ) : view === "reports" ? (
+        /* Reports — the BUY calls the board made, in full, with a date range and a
+           CSV download. Read-only over the append-only journal; no order path. */
+        <ReportsBoard />
+      ) : view === "oneaday" ? (
+        /* One a Day — the record of what a one-trade-a-day schedule would have
+           produced, graded by whether the day's signal reached target. Read-only
+           over the journal and outcome ledgers: it caps nothing, ranks nothing
+           and routes nothing, and every R in it is gross of costs. */
+        <DailyBestBoard />
+      ) : view === "aplus" ? (
+        /* A+ Paper — the research ranking and the costed paper book behind it.
+           PAPER ONLY: the score is not the production Signal Score, no row on
+           this screen has an order path, and an empty board is a valid day. */
+        <AplusPaperBoard />
+      ) : view === "evidence" ? (
+        /* Vehicle Evidence — the measured option book for EVERY eligible
+           candidate, both sides at the same timestamp. Read-only research; A+ is
+           a label over this feed, not the filter that produced it. */
+        <VehicleEvidencePanel />
+      ) : view === "cas" ? (
+        /* CAS — the closing auction window. Its own screen on purpose: a
+           different mechanism, a few weeks of evidence, and paper only. Nothing
+           on it can place, size or promote anything. */
+        <CasBoard />
+      ) : view === "readiness" ? (
+        /* Production Readiness — Option A+, Futures A+ and CAS in one shape,
+           plus the T1 calibration verdict and the futures paper book behind it.
+           Read-only: PRODUCTION_CANDIDATE means a human should review, never that
+           anything has been activated, and no order path exists below it. */
+        <ProductionReadiness />
+      ) : (
         /* Clean, decision-first dashboard: should I trade, which option, entry,
            stop, targets, hold time, risk, opportunity, why. */
         <ProDashboard snap={snap} onCalculate={() => setShowSizing(true)} />
-      ) : (
-        <>
-          {/* Row 1 — hero */}
-          <div className="grid grid-cols-12 gap-3 min-h-0" style={{ flex: "1.3" }}>
-            <div className="col-span-3 min-h-0">
-              <AiEngine ind={snap.indicators} signal={snap.decision.signal} votes={snap.score_breakdown.length} />
-            </div>
-            <div className="col-span-6 min-h-0">
-              <DecisionHero decision={snap.decision} />
-            </div>
-            <div className="col-span-3 min-h-0">
-              <MiniCharts candles={snap.selected_option_candles} decision={snap.decision} symbol={selSymbol} />
-            </div>
-          </div>
-
-          {/* Row 2 — trade plan */}
-          <div className="grid grid-cols-12 gap-3 min-h-0" style={{ flex: "1.05" }}>
-            <div className="col-span-3 min-h-0"><PositionCard position={snap.position} expectedHoldMinutes={snap.decision.expected_holding_minutes} averageNote={snap.decision.average_ok ? snap.decision.average_note : null} /></div>
-            <div className="col-span-4 min-h-0"><EntryZoneCard decision={snap.decision} /></div>
-            <div className="col-span-2 min-h-0"><TargetsCard decision={snap.decision} /></div>
-            <div className="col-span-3 min-h-0"><StopLossCard decision={snap.decision} position={snap.position} /></div>
-          </div>
-
-          {/* Row 3 — decision evidence stack + why + scores */}
-          <div className="grid grid-cols-12 gap-3 min-h-0" style={{ flex: "1.25" }}>
-            <div className="col-span-5 min-h-0"><DecisionStack ind={snap.indicators} breakdown={snap.score_breakdown} /></div>
-            <div className="col-span-4 min-h-0"><ReasonsCard decision={snap.decision} /></div>
-            <div className="col-span-3 min-h-0 flex flex-col gap-3">
-              <div className="flex-1 min-h-0"><TradeMeterCard decision={snap.decision} /></div>
-              <div className="flex-1 min-h-0"><AiStatusCard ind={snap.indicators} decision={snap.decision} /></div>
-            </div>
-          </div>
-
-          {/* Row 4 — risk, learning, news & market context */}
-          <div className="grid grid-cols-12 gap-3 min-h-0" style={{ flex: "0.95" }}>
-            <div className="col-span-3 min-h-0"><RiskCard risk={snap.risk} /></div>
-            <div className="col-span-2 min-h-0"><LearningCard stats={snap.learning} /></div>
-            <div className="col-span-4 min-h-0">
-              <NewsFeed news={snap.news} sentiment={snap.news_sentiment} score={snap.news_score} />
-            </div>
-            <div className="col-span-3 min-h-0"><MarketContext instrument={instrument} /></div>
-          </div>
-        </>
       )}
+      </div>
 
       {showBacktest && (
         <BacktestModal instrument={instrument} onClose={() => setShowBacktest(false)} />

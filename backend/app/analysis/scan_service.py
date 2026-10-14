@@ -38,7 +38,7 @@ _handoff: deque[dict] = deque(maxlen=_HANDOFF_MAX)
 
 
 def _exchange_open(instrument: str) -> bool:
-    if settings.hours_ignored():
+    if settings.ignore_market_hours:
         return True
     from app.market.instruments import get_spec
 

@@ -169,17 +169,10 @@ def moneyness(vehicle: str, strike: float | None, spot: float | None) -> str | N
 
 
 def book_age_ms(book_ts: float | None, capture_ts: float) -> float | None:
-    """How old this bid/ask was when it was captured, in milliseconds.
-
-    ``None`` when the feed did not date the book: a provider that carries a book
-    forward across depthless ticks cannot prove the quote existed at the
-    decision instant, and an unproven age must stay unproven rather than
-    default to zero.
-    """
+    """Return the age of the bid/ask book at capture time, in milliseconds."""
     if not isinstance(book_ts, (int, float)) or float(book_ts) <= 0:
         return None
-    return round(max(0.0, (float(capture_ts) - float(book_ts))) * 1000.0, 3)
-
+    return round(max(0.0, float(capture_ts) - float(book_ts)) * 1000.0, 3)
 
 def to_quote(
     q: OptionQuote,
@@ -219,10 +212,7 @@ def to_quote(
         expiry_class=expiry_class(days_to_expiry),
         bid=q.bid,
         ask=q.ask,
-        bid_size=int(q.bid_size) if q.bid_size else None,
-        ask_size=int(q.ask_size) if q.ask_size else None,
         premium=float(q.premium) if q.premium else None,
-        lot_size=int(q.lot_size) if q.lot_size else None,
         oi=float(q.oi) if q.oi is not None else None,
         oi_change=float(q.oi_change) if q.oi_change is not None else None,
         volume=float(q.volume) if q.volume is not None else None,
@@ -238,7 +228,6 @@ def to_quote(
         delta_band=delta_band(q.delta),
         source=source,
         feed_age_ms=quote_age_ms,
-        book_age_ms=book_age_ms(getattr(q, "book_ts", None), capture_ts),
         signal_to_snapshot_ms=round((capture_ts - signal_ts) * 1000.0, 3),
         snapshot_ts=capture_ts,
         data_quality=quality.classify(
