@@ -882,7 +882,7 @@ class Settings(BaseSettings):
     data_dir: str = "data"
     # Notional starting capital for the PAPER account (Account tab equity is
     # this + cumulative realised paper P&L). Paper-only; never a real balance.
-    paper_capital: float = 100000.0
+    paper_capital: float = 500000.0  # QT_PAPER_CAPITAL (₹5L, same as QT_CAPITAL)
     # Record live futures candles + option-chain snapshots so the backtest can
     # replay REAL captured history instead of a fresh synthetic series.
     store_history: bool = True
