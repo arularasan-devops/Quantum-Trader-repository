@@ -195,7 +195,7 @@ took, why = attempt(eng, buy(sym, prem))
 check("lifecycle fixture entered", took and eng._auto_stop is not None,
       why or (eng._auto_last_action or ""))
 stop = eng._auto_stop or prem * 0.92
-eng.position.current_premium = round(stop - 1.0, 2)
+eng._mark_position(round(stop - 1.0, 2))  # what a tick does: reprice + recompute P&L
 eng._auto_trade(buy(sym, prem), True, int(time.time()))
 check("stop hit -> position closed", took and not eng.position.option_symbol,
       eng._auto_last_action or "")
