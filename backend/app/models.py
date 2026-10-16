@@ -1097,7 +1097,7 @@ class FeedHealth(BaseModel):
     # Explicit provenance so a synthetic or dead feed can never read as live.
     provider: str = ""               # configured QT_DATA_PROVIDER
     source: str = "UNKNOWN"          # LIVE | SIMULATED | UNAVAILABLE | UNKNOWN
-    state: str = "UNKNOWN"           # CONNECTED | DEGRADED | DISCONNECTED | SIMULATED
+    state: str = "UNKNOWN"           # CONNECTED | DEGRADED | RECONNECTING | DISCONNECTED | SIMULATED
     checked_at: float | None = None  # local wall-clock time of this reading
 
 

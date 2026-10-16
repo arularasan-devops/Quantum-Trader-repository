@@ -158,7 +158,7 @@ class Settings(BaseSettings):
     # which made the cap meaningless: measured 13 Aug, the book lost Rs16,834
     # with a Rs5,000 cap enabled because each of seven instruments carried its
     # own Rs5,000 allowance and a mid-session restart zeroed all of them.
-    max_daily_loss: float = 5000.0       # halt the whole book once day P&L <= -this
+    max_daily_loss: float = 0.0          # 0 = off; halt the book once day P&L <= -this
     max_trades_per_day: int = 10         # cap on entries per session, all instruments
     max_consecutive_losses: int = 3      # stand down after N losing trades in a row
     # How long that losing streak stands the book down. A streak in chop says
@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     # limits above (max_daily_loss, max_trades_per_day, max_consecutive_losses).
     auto_trade_enabled: bool = False
     auto_trade_min_confidence: float = 80.0   # only auto-buy at/above this %
-    auto_trade_max_lots: int = 1              # hard upper cap on lots per auto entry
+    auto_trade_max_lots: int = 2              # hard upper cap on lots per auto entry (risk sizer may trim)
     # Multi-instrument concurrency: hold positions in up to N DIFFERENT instruments
     # at once (each instrument still gets one position). New entries are additionally
     # gated by a GLOBAL capital check so total deployed never exceeds ``capital``.
@@ -206,6 +206,7 @@ class Settings(BaseSettings):
     auto_trade_metal_risk_caps: list[float] = [4.0, 5.0, 6.0]
     # Tiered exits: PRE-T1 peak trail (auto_trade_pre_t1_*) -> T1 lock -> T2 ratchet -> T3 runner.
     auto_trade_tiered_exit: bool = True
+    tier_t1_giveback_pct: float = 60.0       # T1->T2: floor = peak - 60% of (peak - T1), never below T1
     tier_t2_giveback_pct: float = 50.0       # after T2: floor = peak - 50% of (peak - T1)
     tier_t3_runner_trail_pct: float = 8.0    # after T3: floor = peak * (1 - 8%), never below T3
     auto_trade_no_chase: bool = True
@@ -653,7 +654,16 @@ class Settings(BaseSettings):
     # Daily profit GOAL (₹). When day P&L >= this, the bot stops opening NEW trades
     # for the day (locks the gain). 0 = disabled. This is a stop-FOR-the-day, NOT a
     # guaranteed minimum — losing days are normal and cannot be ruled out.
-    daily_profit_target: float = 0.0
+    daily_profit_target: float = 10000.0
+    # Profit lock: once the day's equity (realized + open MTM) reaches the target,
+    # the lock = day peak - this giveback (never below the target). Falling under
+    # it stops auto-buy for the day. 0 = lock at the exact peak.
+    daily_peak_giveback: float = 0.0
+    # After reaching the target, equity back under the target closes open auto
+    # positions (paper exits at the bid) to keep what is left.
+    profit_lock_flatten: bool = True
+    # Auto-buy lots from free capital (no fixed lot cap) in PAPER.
+    auto_trade_capital_sizing: bool = True
     # --- LIVE auto-execution arm (DANGER: real money) ---
     # The auto-trader places REAL Angel orders ONLY when ALL of these hold:
     # trade_mode == 'live'  AND  auto_trade_enabled  AND  auto_trade_allow_live.

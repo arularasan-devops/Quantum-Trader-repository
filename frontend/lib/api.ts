@@ -645,6 +645,16 @@ export interface TriggerStats {
 /** Which book to score: everything, the option engine, or the futures paper tool. */
 export type JournalBook = "all" | "options" | "futures";
 
+export interface JournalOpenPosition {
+  instrument: string;
+  option: string;
+  lots: number;
+  entry: number | null;
+  current: number | null;
+  unrealized_pnl: number;
+  stop: number | null;
+}
+
 export async function getTradeJournal(limit = 500, book: JournalBook = "all") {
   const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}`);
   return res.json() as Promise<{
@@ -652,6 +662,12 @@ export async function getTradeJournal(limit = 500, book: JournalBook = "all") {
     wins: number;
     losses: number;
     net_pnl: number;
+    gross_pnl?: number;
+    charges?: number;
+    win_rate?: number;
+    profit_factor?: number | null;
+    unrealized_pnl?: number;
+    open_positions?: JournalOpenPosition[];
     trades: JournalTrade[];
     by_trigger: Record<string, TriggerStats>;
   }>;

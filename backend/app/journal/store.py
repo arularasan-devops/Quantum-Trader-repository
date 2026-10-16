@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.config import settings
 from app.research.db import Database
 
 SCHEMA_VERSION = 1
@@ -456,9 +457,23 @@ class JournalStore:
         where, params = self._where(filters, "ts", SIGNAL_FILTERS)
         page, page_size = self._page(page, page_size)
         total = self.db.query_one(f"SELECT COUNT(*) AS n FROM jr_signals{where}", params)["n"]
+        # The signal row is the original snapshot; the linked paper trade's
+        # current status / realized P&L are joined in, never written back.
         rows = self.db.query(
-            f"SELECT * FROM jr_signals{where} ORDER BY ts DESC, event_id ASC LIMIT ? OFFSET ?",
+            "SELECT jr_signals.*, "
+            "(SELECT t.status FROM jr_trades t WHERE t.trade_id = jr_signals.trade_id) "
+            "AS trade_status, "
+            "(SELECT t.net_pnl FROM jr_trades t WHERE t.trade_id = jr_signals.trade_id "
+            "AND t.status = 'CLOSED') AS trade_net_pnl, "
+            "(SELECT t.exit_reason FROM jr_trades t WHERE t.trade_id = jr_signals.trade_id) "
+            f"AS trade_exit_reason FROM jr_signals{where} "
+            "ORDER BY ts DESC, event_id ASC LIMIT ? OFFSET ?",
             [*params, page_size, (page - 1) * page_size])
+        for r in rows:
+            r["auto_eligible"] = (
+                (r.get("setup") or "").upper() in {t.upper() for t in settings.auto_trade_allowed_triggers}
+                and (r.get("regime") or "").upper() in {g.upper() for g in settings.auto_trade_allowed_regimes}
+            )
         return {"items": rows, "total": int(total), "page": page, "page_size": page_size}
 
     def signals_csv(self, filters: dict | None = None) -> str:

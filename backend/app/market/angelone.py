@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 import random
 import re as _re
@@ -1150,6 +1151,7 @@ class AngelOneProvider(MarketDataProvider):
         from app.market.instruments import REGISTRY
 
         # history.db keys bars by registry name ("BAJAJAUTO"), not the scrip root.
+        self._ooo_dropped = 0
         self._store_key = next((k for k, v in REGISTRY.items() if v is spec), self._root)
         # This instrument is assigned to one Angel key (shard); all its live
         # data (login session, WebSocket, historical rate limiter) comes from it.
@@ -1254,10 +1256,18 @@ class AngelOneProvider(MarketDataProvider):
             seq=_as_int(meta.get("seq")),
             source="push",
         )
-        if ltp <= 0:
+        if not math.isfinite(ltp) or ltp <= 0:
+            return
+        # A late packet must not overwrite a newer price the socket already gave.
+        if verdict == "OUT_OF_ORDER":
+            self._ooo_dropped += 1
             return
         prev = self._quotes.get(token) or {}
         bid, ask = meta.get("bid"), meta.get("ask")
+        if bid is not None and ask is not None and (
+            not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask < bid
+        ):
+            bid = ask = None  # crossed / invalid book: keep the price, not the book
         bid_size, ask_size = meta.get("bid_size"), meta.get("ask_size")
         now = time.time()
         fresh_book = bid is not None or ask is not None
@@ -1589,6 +1599,7 @@ class AngelOneProvider(MarketDataProvider):
             "subscribed_tokens": len(self._subscribed_tokens),
             "push_pct_today": round(100.0 * self._push_sec / total, 1) if total > 0 else None,
             "fallbacks_today": self._fallbacks,
+            "out_of_order_dropped": self._ooo_dropped,
             "note": note,
         }
 

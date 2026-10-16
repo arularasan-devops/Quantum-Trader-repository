@@ -160,6 +160,8 @@ def _mark_feed_stage(instrument: str, stage: str) -> None:
         pass
 
 
+_WS_SEND_TIMEOUT = 1.5  # seconds a single client may hold a broadcast
+
 class Hub:
     # How many screener-only (unwatched) instruments to refresh per background
     # turn. Small, so the instrument you're viewing always ticks first and fast.
@@ -248,6 +250,7 @@ class Hub:
         return round(n_scanned / per_cycle * cycle_sec, 1)
 
     def __init__(self) -> None:
+        self.ws_send_drops = 0
         # ws -> instrument it subscribed to
         self.clients: dict[WebSocket, str] = {}
         # instrument -> latest snapshot
@@ -349,16 +352,22 @@ class Hub:
         for ws, sub in list(self.clients.items()):
             if sub != inst:
                 continue
+            # One stalled browser tab must not hold every other client's LTP
+            # back: a send that cannot complete promptly drops that client,
+            # whose own watchdog then reconnects it.
             try:
-                await ws.send_json(payload)
+                await asyncio.wait_for(ws.send_json(payload), timeout=_WS_SEND_TIMEOUT)
             except Exception:
                 dead.append(ws)
+                self.ws_send_drops += 1
                 continue
             # This signal reached a client. Recorded once per signal, so a
             # missing dashboard signal can be told from one nobody was watching.
             signal_visibility.mark_user_visible(inst, snapshot.decision, "ws")
         for ws in dead:
             self.clients.pop(ws, None)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ws.close(), timeout=0.5)
         # Close the timestamp chain: this is the moment the price the engine used
         # actually left the server. Observability only.
         _mark_feed_stage(inst, "render")
@@ -3517,11 +3526,33 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
             round(b["gross_win"] / b["gross_loss"], 3) if b["gross_loss"] > 0 else None
         )
 
+    gross_win = sum(float(r["net_pnl"] or 0.0) for r in rows if float(r["net_pnl"] or 0.0) > 0)
+    gross_loss = -sum(float(r["net_pnl"] or 0.0) for r in rows if float(r["net_pnl"] or 0.0) < 0)
+    charges = round(sum(float(r.get("cost_rupees") or 0.0) for r in rows), 1)
+    # Open positions are MTM only and never mixed into the realized totals.
+    open_pos: list[dict] = []
+    if book.lower() in ("all", "options"):
+        for st in registry.active():
+            p = st.position
+            if not p.option_symbol:
+                continue
+            open_pos.append({
+                "instrument": st.instrument, "option": p.option_symbol,
+                "lots": p.quantity_lots, "entry": p.entry_premium,
+                "current": p.current_premium, "unrealized_pnl": round(float(p.net_pnl or 0.0), 1),
+                "stop": getattr(p, "stop_loss", None),
+            })
     return {
         "count": len(rows),
         "wins": wins,
         "losses": len(rows) - wins,
         "net_pnl": net,
+        "gross_pnl": round(net + charges, 1),
+        "charges": charges,
+        "win_rate": round(wins / len(rows) * 100, 1) if rows else 0.0,
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+        "open_positions": open_pos,
+        "unrealized_pnl": round(sum(o["unrealized_pnl"] for o in open_pos), 1),
         "by_trigger": by_trigger,
         "provenance": provenance,
         # Which book these figures are drawn from, so a number can never be
@@ -3661,7 +3692,15 @@ async def feed_health() -> dict:
         )
     except Exception as exc:
         return {"provider": provider_name, "angel_active": False, "error": str(exc)[:200]}
-    return {"provider": provider_name, "angel_active": True, **health}
+    return {"provider": provider_name, "angel_active": True, **health, "hub": _hub_counters()}
+
+
+def _hub_counters() -> dict:
+    return {
+        "ws_clients": len(hub.clients),
+        "ws_send_drops": hub.ws_send_drops,
+        "ticks_abandoned": hub._ticks_abandoned,
+    }
 
 
 @app.get("/api/feed-quality")

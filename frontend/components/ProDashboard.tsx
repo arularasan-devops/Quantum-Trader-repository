@@ -948,7 +948,7 @@ function Row({ l, v, vc }: { l: string; v: string; vc?: string }) {
  * never SIMULATED by default.
  */
 export function feedView(h: FeedHealth | null | undefined): {
-  label: "LIVE" | "DELAYED" | "SIMULATED" | "DISCONNECTED" | "UNAVAILABLE" | "UNKNOWN";
+  label: "LIVE" | "STALE" | "RECONNECTING" | "SIMULATED" | "DISCONNECTED" | "UNAVAILABLE" | "UNKNOWN";
   color: string;
   age: number | null;
 } {
@@ -960,12 +960,13 @@ export function feedView(h: FeedHealth | null | undefined): {
   const age = Math.max(h.underlying_age_sec ?? 0, h.option_age_sec ?? 0);
   if (src === "UNAVAILABLE") return { label: "UNAVAILABLE", color: RED, age: null };
   if (st === "DISCONNECTED") return { label: "DISCONNECTED", color: RED, age: null };
+  if (st === "RECONNECTING") return { label: "RECONNECTING", color: AMBER, age };
   if (src === "SIMULATED" && st === "SIMULATED") return { label: "SIMULATED", color: MUTED, age: null };
   if (src === "LIVE" && st === "CONNECTED") {
     const stale = h.stale_after_sec != null && age > h.stale_after_sec;
-    return stale ? { label: "DELAYED", color: AMBER, age } : { label: "LIVE", color: GREEN, age };
+    return stale ? { label: "STALE", color: AMBER, age } : { label: "LIVE", color: GREEN, age };
   }
-  if (src === "LIVE" && st === "DEGRADED") return { label: "DELAYED", color: AMBER, age };
+  if (src === "LIVE" && st === "DEGRADED") return { label: "STALE", color: AMBER, age };
   return { label: "UNKNOWN", color: AMBER, age: null };
 }
 

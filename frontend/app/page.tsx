@@ -37,8 +37,6 @@ import TradeMeterCard from "@/components/TradeMeterCard";
 import NewsFeed from "@/components/NewsFeed";
 import MarketContext from "@/components/MarketContext";
 import ProDashboard from "@/components/ProDashboard";
-import MomentumBoard from "@/components/MomentumBoard";
-import FlowBoard from "@/components/FlowBoard";
 import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
 import OptionsBoard from "@/components/OptionsBoard";
@@ -78,7 +76,7 @@ export default function Page() {
   const [showPerformance, setShowPerformance] = useState(false);
   const [showSizing, setShowSizing] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "options" | "journal" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
+  const [view, setView] = useState<"signal" | "command" | "decision" | "spreads" | "futures" | "options" | "journal" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
 
   // Restore this tab's instrument on load/refresh: prefer the ?instrument= URL
   // param (so each tab keeps its own selection and survives a refresh), then the
@@ -402,18 +400,6 @@ export default function Page() {
               Decision
             </button>
             <button
-              onClick={() => setView("momentum")}
-              className={view === "momentum" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Momentum
-            </button>
-            <button
-              onClick={() => setView("flow")}
-              className={view === "flow" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Flow
-            </button>
-            <button
               onClick={() => setView("spreads")}
               className={view === "spreads" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
             >
@@ -533,16 +519,6 @@ export default function Page() {
             }
           }}
         />
-      ) : view === "momentum" ? (
-        /* Early Momentum board — a SEPARATE advisory engine with its own full
-           trade plan (EARLY BUY CE/PE · entry/stop/targets/exit). Never changes
-           the frozen Decision engine. Uses the shared instrument selector. */
-        <MomentumBoard snap={snap} />
-      ) : view === "flow" ? (
-        /* Candle-Flow board — a SEPARATE advisory engine that rides the 1-min
-           candle (BUY green · HOLD · EXIT red · SWITCH CE↔PE). Never changes the
-           frozen Decision engine. Uses the shared instrument selector. */
-        <FlowBoard snap={snap} />
       ) : view === "spreads" ? (
         /* Premium-SELLING board — defined-risk credit spreads, PAPER ONLY. A
            SEPARATE advisory engine with no order path; never touches the frozen

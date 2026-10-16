@@ -143,17 +143,48 @@ check("  paper entry filled at the ask (not LTP)",
       took and abs(eng.position.entry_premium - ask) < 1e-6,
       f"entry={eng.position.entry_premium} ask={ask} ltp={prem}")
 
-# 9. risk governor: bypassed by the PAPER pullback engine, enforced without it
+# 9. RISK_GATE: the pullback engine is governed like every other entry
 eng, sym, prem = fresh()
 eng.risk.can_open = lambda t: (False, "daily loss cap reached")
 took, why = attempt(eng, buy(sym, prem))
-check("pullback engine ignores the risk governor (paper)", took, why)
+check("failed risk gate rejected (pullback engine)", not took and why == "RISK_GOVERNOR", why)
 eng, sym, prem = fresh()
 settings.auto_trade_pullback_engine = False
 eng.risk.can_open = lambda t: (False, "daily loss cap reached")
 took, why = attempt(eng, buy(sym, prem))
 settings.auto_trade_pullback_engine = True
 check("failed risk gate rejected (engine off)", not took and why == "RISK_GOVERNOR", why)
+from app.execution import live_control as _lc  # noqa: E402
+eng, sym, prem = fresh()
+_orig_ks = _lc.kill_switch_engaged
+_lc.kill_switch_engaged = lambda: True
+took, why = attempt(eng, buy(sym, prem))
+_lc.kill_switch_engaged = _orig_ks
+check("manual pause / kill switch blocks paper auto-buy", not took, why)
+from app.engine import account_risk as _ar  # noqa: E402
+_acct = _ar.AccountRisk()
+_acct._loaded = True
+_acct._save = lambda: None
+_now = 1_790_000_000.0
+_acct._roll(_now)
+_acct.day_pnl = 10_000.0
+check("₹10,000 target alone does NOT stop auto-buy", _acct.blocked(_now) is None, _acct.blocked(_now))
+_acct.day_pnl = 12_000.0
+_acct.note_equity(_now, 8_000.0)           # peak 20,000 -> lock 20,000 (giveback 0)
+check("lock ratchets up to the day peak", _acct.lock_level() == 20_000.0, str(_acct.lock_level()))
+_acct.note_equity(_now, 7_000.0)           # 19,000 < 20,000 lock
+check("falling below the locked peak stops auto-buy",
+      _acct.giveback_tripped and "profit lock" in (_acct.blocked(_now) or ""), _acct.blocked(_now))
+check("above target: no flatten yet", not _acct.must_flatten(19_000.0))
+check("back under ₹10,000 after reaching it: flatten auto positions", _acct.must_flatten(9_500.0))
+_b = _ar.AccountRisk()
+_b._loaded = True
+_b._save = lambda: None
+_b._roll(_now)
+_b.day_pnl = -20_000.0
+check("no daily loss cap by default", _b.blocked(_now) is None and _b.lock_level() is None, _b.blocked(_now))
+_acct.note_equity(_now + 86400, 0.0)
+check("new IST day resets profit protection", not _acct.giveback_tripped and _acct.day_peak_equity == 0)
 
 # 9b. SPREAD OK? / RISK ACCEPTABLE? of the pullback engine
 eng, sym, prem = fresh()

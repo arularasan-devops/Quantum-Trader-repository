@@ -4,6 +4,10 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import { API_BASE } from "@/lib/api";
 
 type SignalRow = {
+  trade_status?: string | null;
+  trade_net_pnl?: number | null;
+  trade_exit_reason?: string | null;
+  auto_eligible?: boolean;
   event_id: string;
   ts_iso: string;
   instrument: string;
@@ -284,6 +288,12 @@ export default function ReportsBoard() {
                       <td colSpan={14} className="px-2 py-2 text-white/70">
                         <div><b>Why the engine signalled:</b> {s.explanation ?? "—"}</div>
                         {s.trade_id && <div><b>Trade:</b> {s.trade_id} (see Journal tab)</div>}
+                        {s.trade_id && s.trade_status && (
+                          <div><b>Trade result:</b> {s.trade_status}
+                            {s.trade_net_pnl != null ? ` · net ₹${Number(s.trade_net_pnl).toLocaleString()}` : ""}
+                            {s.trade_exit_reason ? ` · ${s.trade_exit_reason}` : ""}</div>
+                        )}
+                        <div><b>Auto-buy eligible setup:</b> {s.auto_eligible ? "yes (PULLBACK + TRENDING)" : "no"}</div>
                         <div className="text-white/40">event {s.event_id}</div>
                       </td>
                     </tr>

@@ -8,6 +8,7 @@ scaling out (see DEPLOYMENT.md).
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from datetime import datetime, timezone
 
@@ -188,6 +189,8 @@ def classify_feed(health: FeedHealth, provider: MarketDataProvider) -> FeedHealt
         health.state = "CONNECTED"
     else:
         health.state = "DEGRADED"
+    if health.state == "DEGRADED" and not health.ws_connected and health.mode != "rest":
+        health.state = "RECONNECTING"
     return health
 
 
@@ -565,15 +568,13 @@ class AppState:
                     message=refused,
                 )
 
-        paper_engine = (not manual and settings.auto_trade_pullback_engine
-                        and not self.is_live)
-        if adopted is None and not paper_engine and live_control.kill_switch_engaged():
+        if adopted is None and live_control.kill_switch_engaged():
             if manual:
                 self._add_alert("KILL_SWITCH", "Entry refused: kill switch engaged", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
                                option_symbol=q.symbol, lots=lots,
                                message="Kill switch engaged — new entries blocked.")
-        can, reason = ((True, "") if adopted is not None or paper_engine
+        can, reason = ((True, "") if adopted is not None
                        else self.risk.can_open(time.time()))
         if not can:
             self._add_alert("RISK_BLOCK", f"Trade blocked: {reason}", "warning")
@@ -2176,6 +2177,23 @@ class AppState:
             prem = p.current_premium
             if prem is None:
                 return
+            if not live and self._auto_entry_prem is not None:
+                with contextlib.suppress(Exception):
+                    acct = account_risk.account
+                    equity = acct.day_pnl + sum(
+                        float(o.position.net_pnl or 0.0)
+                        for o in registry.active() if o.position.option_symbol
+                    )
+                    if acct.must_flatten(equity):
+                        self._pending_exit_reason = "PROFIT LOCK"
+                        self.sell(confirm=False)
+                        self._auto_last_action = (
+                            f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · PROFIT LOCK "
+                            f"(day ₹{equity:,.0f} fell under ₹{settings.daily_profit_target:,.0f})"
+                        )
+                        self._auto_last_action_ts = now
+                        self._reset_auto_trade_marks()
+                        return
             if not settings.auto_trade_ride_trail:
                 stop = max(self._auto_stop or 0.0, p.trailing_stop or 0.0)
                 if self._auto_target1 is not None and prem >= self._auto_target1:
@@ -2208,6 +2226,8 @@ class AppState:
                     lvl = "T2 RATCHET"
                 elif t2 is not None and abs(prev_floor - t2) < 1e-6:
                     lvl = "TARGET 2"
+                elif t1 is not None and prev_floor > t1 + 1e-6:
+                    lvl = "T1 RATCHET"
                 else:
                     lvl = "TARGET 1"
                 self._pending_exit_reason = f"{lvl} lock"
@@ -2250,6 +2270,14 @@ class AppState:
                 if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
                     self._auto_tgt_floor = floor
             elif t1 is not None and prem >= t1:
+                # Stage C (T1 -> T2): once T1 is locked, trail the peak while
+                # never dropping below the T1 floor.
+                if (settings.auto_trade_tiered_exit and self._auto_tgt_floor is not None
+                        and self._auto_tgt_floor >= t1 - 1e-9):
+                    self._auto_peak = max(self._auto_peak or prem, prem)
+                    f_c = self._auto_peak - (self._auto_peak - t1) * settings.tier_t1_giveback_pct / 100.0
+                    if f_c > self._auto_tgt_floor:
+                        self._auto_tgt_floor = f_c
                 if self._auto_tgt_floor is None or t1 > self._auto_tgt_floor:
                     self._auto_tgt_floor = t1
                     # SCALE-OUT: bank part of the position at T1 and let the rest
@@ -2696,7 +2724,16 @@ class AppState:
                 )
                 return
 
-        can, _reason = (True, "") if eng else self.risk.can_open(time.time())
+        # RISK_GATE: the pullback engine is gated like every other entry —
+        # daily loss, daily profit target, giveback from the day's equity peak,
+        # trade cap, loss streak, max concurrent and the manual kill switch.
+        with contextlib.suppress(Exception):
+            account_risk.account.note_equity(
+                now, sum(float(o.position.net_pnl or 0.0) for o in registry.active()
+                         if o.position.option_symbol))
+        can, _reason = self.risk.can_open(time.time())
+        if can and live_control.kill_switch_engaged():
+            can, _reason = False, "kill switch / manual pause engaged"
         if not can:
             exec_funnel.blocked(
                 "RISK", "RISK_GOVERNOR", instrument=self._instrument, option=opt,
@@ -2724,7 +2761,7 @@ class AppState:
             deployed += val
             if other.instrument == self._instrument:
                 deployed_self += val
-        if not eng and open_positions >= max(1, settings.auto_trade_max_concurrent):
+        if open_positions >= max(1, settings.auto_trade_max_concurrent):
             self._auto_last_action = (
                 f"AUTO SKIP {decision.recommended_option}: max concurrent positions "
                 f"({open_positions}/{settings.auto_trade_max_concurrent})"
@@ -2849,7 +2886,10 @@ class AppState:
                     reason="not enough free capital for a single lot",
                 )
                 return
-            if affordable < lots:
+            if eng and settings.auto_trade_capital_sizing:
+                # PAPER: as many lots as the free capital pays for at the ask.
+                lots = affordable
+            elif affordable < lots:
                 lots = affordable
 
         exec_funnel.reached("EXECUTION")

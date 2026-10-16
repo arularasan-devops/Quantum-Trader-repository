@@ -75,6 +75,11 @@ class AccountRisk:
         self.last_exit: dict[str, float] = {}
         self.last_stop: dict[str, float] = {}
         self.stand_down_until: float = 0.0
+        # Profit protection: the day's peak equity (realized + open MTM) and
+        # whether giving back ``daily_peak_giveback`` from it has blocked entries.
+        self.day_peak_equity: float = 0.0
+        self.giveback_tripped: bool = False
+        self.target_hit_at: float = 0.0
         self._loaded = False
 
     # --- persistence ------------------------------------------------------
@@ -94,6 +99,9 @@ class AccountRisk:
         self.trades_today = int(raw.get("trades_today") or 0)
         self.consecutive_losses = int(raw.get("consecutive_losses") or 0)
         self.stand_down_until = float(raw.get("stand_down_until") or 0.0)
+        self.day_peak_equity = float(raw.get("day_peak_equity") or 0.0)
+        self.giveback_tripped = bool(raw.get("giveback_tripped") or False)
+        self.target_hit_at = float(raw.get("target_hit_at") or 0.0)
         self.last_exit = {str(k): float(v) for k, v in (raw.get("last_exit") or {}).items()}
         self.last_stop = {str(k): float(v) for k, v in (raw.get("last_stop") or {}).items()}
 
@@ -104,6 +112,9 @@ class AccountRisk:
             "trades_today": self.trades_today,
             "consecutive_losses": self.consecutive_losses,
             "stand_down_until": self.stand_down_until,
+            "day_peak_equity": self.day_peak_equity,
+            "giveback_tripped": self.giveback_tripped,
+            "target_hit_at": self.target_hit_at,
             "last_exit": self.last_exit,
             "last_stop": self.last_stop,
         }
@@ -136,7 +147,57 @@ class AccountRisk:
         self.last_exit.clear()
         self.last_stop.clear()
         self.stand_down_until = 0.0
+        self.day_peak_equity = 0.0
+        self.giveback_tripped = False
+        self.target_hit_at = 0.0
         self._save()
+
+    def lock_level(self) -> float | None:
+        """Equity the day may not fall below once the target was reached: the
+        day's peak minus ``daily_peak_giveback`` (0 = the exact peak), never
+        below the target itself. None until the target has been reached."""
+        tgt = settings.daily_profit_target
+        if tgt <= 0 or self.day_peak_equity < tgt:
+            return None
+        return max(tgt, self.day_peak_equity - max(0.0, settings.daily_peak_giveback))
+
+    def lock_breached(self, equity: float) -> bool:
+        lvl = self.lock_level()
+        return lvl is not None and equity < lvl - 1e-6
+
+    def must_flatten(self, equity: float) -> bool:
+        """Equity fell under the target after reaching it: close auto positions."""
+        tgt = settings.daily_profit_target
+        return (settings.profit_lock_flatten and tgt > 0
+                and self.day_peak_equity >= tgt and equity < tgt)
+
+    def note_equity(self, now: float, unrealized: float) -> None:
+        """Track the day's equity peak (realized + open MTM, kept separate in
+        the inputs) and trip profit protection on a giveback from that peak.
+        Tripping only blocks NEW entries; open positions keep their stops."""
+        self._roll(now)
+        equity = self.day_pnl + unrealized
+        changed = False
+        if equity > self.day_peak_equity:
+            self.day_peak_equity = equity
+            changed = True
+        if not self.giveback_tripped and self.lock_breached(equity):
+            self.giveback_tripped = True
+            changed = True
+            _log.warning(
+                "PROFIT_LOCK: equity ₹%.0f fell ₹%.0f below the day peak ₹%.0f "
+                "(realized ₹%.0f, open ₹%.0f) — auto-buy stopped for the day",
+                equity, self.day_peak_equity - equity, self.day_peak_equity,
+                self.day_pnl, unrealized)
+        if (settings.daily_profit_target > 0 and not self.target_hit_at
+                and equity >= settings.daily_profit_target):
+            self.target_hit_at = now
+            changed = True
+            _log.warning("DAILY_TARGET: equity ₹%.0f >= ₹%.0f — profit lock armed; "
+                         "auto-buy continues while the day stays at its peak",
+                         equity, settings.daily_profit_target)
+        if changed:
+            self._save()
 
     # --- recording --------------------------------------------------------
     def record_entry(self, instrument: str, now: float) -> None:
@@ -173,9 +234,10 @@ class AccountRisk:
                 f"account daily loss cap hit (₹{self.day_pnl:,.0f} of "
                 f"₹{settings.max_daily_loss:,.0f}) — flat for the day"
             )
-        if settings.daily_profit_target > 0 and self.day_pnl >= settings.daily_profit_target:
+        if self.giveback_tripped:
             return (
-                f"daily profit goal reached (₹{self.day_pnl:,.0f}) — locking gains"
+                f"profit lock: the day peaked at ₹{self.day_peak_equity:,.0f} and fell "
+                f"below the lock — auto-buy stopped for today"
             )
         if settings.max_trades_per_day > 0 and self.trades_today >= settings.max_trades_per_day:
             return f"account trade cap reached ({self.trades_today} today)"
