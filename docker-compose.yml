@@ -82,7 +82,8 @@ services:
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       EVERY_MIN: ${QT_BACKUP_EVERY_MIN:-5}
-      KEEP: ${QT_BACKUP_KEEP:-288}
+      KEEP: ${QT_BACKUP_KEEP:-12}
+      KEEP_DAYS: ${QT_BACKUP_KEEP_DAYS:-7}
     volumes:
       - ./backups:/backups
     entrypoint: ["/bin/sh", "-c"]
@@ -90,8 +91,9 @@ services:
       - |
         while true; do
           f=/backups/quantum_$$(date +%Y%m%d_%H%M%S).dump
-          if pg_dump -h postgres -U quantum -d quantum -Fc -f "$$f.tmp"; then mv "$$f.tmp" "$$f"; cp "$$f" /backups/quantum_latest.dump; else rm -f "$$f.tmp"; fi
+          if pg_dump -h postgres -U quantum -d quantum -Fc -f "$$f.tmp"; then mv "$$f.tmp" "$$f"; cp "$$f" /backups/quantum_latest.dump; cp "$$f" /backups/quantum_daily_$$(date +%Y%m%d).dump; else rm -f "$$f.tmp"; fi
           ls -1t /backups/quantum_2*.dump 2>/dev/null | tail -n +$$((KEEP + 1)) | xargs -r rm -f
+          ls -1t /backups/quantum_daily_*.dump 2>/dev/null | tail -n +$$((KEEP_DAYS + 1)) | xargs -r rm -f
           sleep $$((EVERY_MIN * 60))
         done
     depends_on:
