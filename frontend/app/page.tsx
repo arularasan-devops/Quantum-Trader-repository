@@ -43,6 +43,7 @@ import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
 import JournalBoard from "@/components/JournalBoard";
 import BuySignalsPanel from "@/components/BuySignalsPanel";
+import ReportsBoard from "@/components/ReportsBoard";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
 import TopMovers from "@/components/TopMovers";
@@ -77,7 +78,7 @@ export default function Page() {
   const [showPerformance, setShowPerformance] = useState(false);
   const [showSizing, setShowSizing] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "journal" | "movers" | "analysis" | "research" | "account">("signal");
+  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "journal" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
 
   // Restore this tab's instrument on load/refresh: prefer the ?instrument= URL
   // param (so each tab keeps its own selection and survives a refresh), then the
@@ -431,6 +432,12 @@ export default function Page() {
               Journal
             </button>
             <button
+              onClick={() => setView("reports")}
+              className={view === "reports" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
+            >
+              Reports
+            </button>
+            <button
               onClick={() => setView("research")}
               className={view === "research" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
             >
@@ -547,6 +554,9 @@ export default function Page() {
           <JournalBoard />
           <BuySignalsPanel />
         </>
+      ) : view === "reports" ? (
+        /* Every BUY signal persisted in journal v2, executed or skipped, with reason. */
+        <ReportsBoard />
       ) : view === "decision" ? (
         /* Clean, decision-first dashboard: should I trade, which option, entry,
            stop, targets, hold time, risk, opportunity, why. */

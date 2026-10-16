@@ -1899,6 +1899,35 @@ async def journal_v2_sessions(instrument: str | None = None, mode: str | None = 
         instrument=instrument, mode=mode, since=since, until=until), page, page_size)
 
 
+@app.get("/api/journal/v2/signals.csv")
+async def journal_v2_signals_csv(instrument: str | None = None, mode: str | None = None,
+                                 outcome: str | None = None, signal: str | None = None,
+                                 setup: str | None = None, regime: str | None = None,
+                                 session_id: str | None = None, since: float | None = None,
+                                 until: float | None = None) -> PlainTextResponse:
+    from app.journal.store import store as jr_store
+
+    body = jr_store().signals_csv(_jr_filters(
+        instrument=instrument, mode=mode, outcome=outcome, signal=signal, setup=setup,
+        regime=regime, session_id=session_id, since=since, until=until))
+    return PlainTextResponse(body, media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="journal_signals.csv"'})
+
+
+@app.get("/api/journal/v2/signals/summary")
+async def journal_v2_signals_summary(instrument: str | None = None, mode: str | None = None,
+                                     outcome: str | None = None, signal: str | None = None,
+                                     setup: str | None = None, regime: str | None = None,
+                                     session_id: str | None = None,
+                                     since: float | None = None,
+                                     until: float | None = None) -> dict:
+    from app.journal.store import store as jr_store
+
+    return jr_store().signal_summary(_jr_filters(
+        instrument=instrument, mode=mode, outcome=outcome, signal=signal, setup=setup,
+        regime=regime, session_id=session_id, since=since, until=until))
+
+
 @app.get("/api/journal/v2/signals")
 async def journal_v2_signals(instrument: str | None = None, mode: str | None = None,
                              outcome: str | None = None, signal: str | None = None,

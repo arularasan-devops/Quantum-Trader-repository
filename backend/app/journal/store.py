@@ -177,6 +177,14 @@ ROLLBACK_SQL = [
     "DROP TABLE IF EXISTS jr_schema_migrations",
 ]
 
+SIGNAL_CSV_COLUMNS = [
+    "event_id", "ts_iso", "session_id", "instrument", "mode", "signal", "outcome",
+    "reason", "strategy", "setup", "regime", "htf_trend", "confidence", "option_symbol",
+    "quote_ltp", "bid", "ask", "expected_entry", "stop", "target1", "target2", "target3",
+    "trade_id", "data_quality", "explanation", "strategy_version", "config_fingerprint",
+]
+SIGNAL_FILTERS = ("instrument", "mode", "outcome", "signal", "setup", "regime", "session_id")
+
 TRADE_CSV_COLUMNS = [
     "trade_id", "session_id", "instrument", "mode", "strategy", "setup", "regime",
     "option_symbol", "lot_size", "entry_ts_iso", "entry_price", "lots", "capital_used",
@@ -443,14 +451,55 @@ class JournalStore:
     def list_signals(self, filters: dict | None = None, page: int = 1,
                      page_size: int = 50) -> dict:
         filters = dict(filters or {})
-        where, params = self._where(filters, "ts", (
-            "instrument", "mode", "outcome", "signal", "setup", "regime", "session_id"))
+        where, params = self._where(filters, "ts", SIGNAL_FILTERS)
         page, page_size = self._page(page, page_size)
         total = self.db.query_one(f"SELECT COUNT(*) AS n FROM jr_signals{where}", params)["n"]
         rows = self.db.query(
             f"SELECT * FROM jr_signals{where} ORDER BY ts DESC, event_id ASC LIMIT ? OFFSET ?",
             [*params, page_size, (page - 1) * page_size])
         return {"items": rows, "total": int(total), "page": page, "page_size": page_size}
+
+    def signals_csv(self, filters: dict | None = None) -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(SIGNAL_CSV_COLUMNS)
+        page = 1
+        while True:
+            chunk = self.list_signals(filters, page=page, page_size=MAX_PAGE_SIZE)
+            for r in chunk["items"]:
+                writer.writerow(["" if r.get(c) is None else r.get(c) for c in SIGNAL_CSV_COLUMNS])
+            if page * MAX_PAGE_SIZE >= chunk["total"]:
+                break
+            page += 1
+        return buf.getvalue()
+
+    def signal_summary(self, filters: dict | None = None, top_reasons: int = 10) -> dict:
+        """Counts of recorded signals by outcome / setup / regime, plus the most
+        frequent skip reasons, over the same filters as list_signals."""
+        where, params = self._where(dict(filters or {}), "ts", SIGNAL_FILTERS)
+
+        def group(col: str) -> dict:
+            rows = self.db.query(
+                f"SELECT COALESCE({col}, '') AS k, COUNT(*) AS n FROM jr_signals{where} "
+                f"GROUP BY COALESCE({col}, '') ORDER BY n DESC", params)
+            return {(r["k"] or "—"): int(r["n"]) for r in rows}
+
+        reason_where = (where + " AND " if where else " WHERE ") + "outcome <> ?"
+        reasons = self.db.query(
+            f"SELECT COALESCE(reason, '') AS reason, COUNT(*) AS n FROM jr_signals{reason_where} "
+            "GROUP BY COALESCE(reason, '') ORDER BY n DESC LIMIT ?",
+            [*params, "EXECUTED", int(top_reasons)])
+        span = self.db.query_one(
+            f"SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM jr_signals{where}",
+            params)
+        return {
+            "total": int(span["n"]),
+            "first_ts_iso": iso(span["first_ts"]), "last_ts_iso": iso(span["last_ts"]),
+            "by_outcome": group("outcome"), "by_setup": group("setup"),
+            "by_regime": group("regime"),
+            "top_skip_reasons": [{"reason": r["reason"] or "—", "count": int(r["n"])}
+                                 for r in reasons],
+        }
 
     def counts(self) -> dict:
         out = {}
