@@ -1367,10 +1367,13 @@ class AngelOneProvider(MarketDataProvider):
         # Use the PER-INSTRUMENT strike spacing (Nifty 50, Sensex 100, Crude 50),
         # not the global default — otherwise Sensex's ATM window is computed on
         # the wrong grid and can miss the real strikes.
-        step = self._strike_step
-        atm = round(spot / step) * step
+        # Window over the strikes the exchange actually LISTS (n each side of
+        # the nearest one), so a stale configured spacing (e.g. GOLD 100 when
+        # MCX lists every 500/1000) cannot leave the window empty.
         n = settings.strikes_each_side
-        lo, hi = atm - n * step, atm + n * step
+        strikes = sorted({o.strike for o in self._options})
+        i = min(range(len(strikes)), key=lambda k: abs(strikes[k] - spot))
+        lo, hi = strikes[max(0, i - n)], strikes[min(len(strikes) - 1, i + n)]
         return [o.token for o in self._options if lo <= o.strike <= hi]
 
     def _next_future(self) -> "_Instrument | None":

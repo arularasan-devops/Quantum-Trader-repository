@@ -70,7 +70,7 @@ export default function JournalBoard() {
           <div className="text-lg font-black tracking-tight">TRADE JOURNAL</div>
           <span className="text-[10px] uppercase tracking-widest rounded-full px-2 py-0.5 font-bold"
             style={{ color: MUTED, border: `1px solid ${MUTED}55` }}>
-            Signal + Auto-Buy · paper + live · saved locally
+            Auto-bought trades · PostgreSQL (persistent volume + backups/ on C:)
           </span>
         </div>
         <div className="flex items-center gap-1 rounded-lg border border-white/15 p-0.5">
@@ -136,7 +136,7 @@ export default function JournalBoard() {
         </div>
         <div className="card p-4">
           <div className="text-[10px] uppercase tracking-widest text-white/40">Source</div>
-          <div className="text-sm font-semibold mt-1">Local database</div>
+          <div className="text-sm font-semibold mt-1">PostgreSQL</div>
           <div className="text-[11px] text-white/40">all closed trades, not just this page</div>
         </div>
       </div>

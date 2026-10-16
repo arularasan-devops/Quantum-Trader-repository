@@ -568,7 +568,7 @@ class AppState:
                     message=refused,
                 )
 
-        if adopted is None and live_control.kill_switch_engaged():
+        if adopted is None and self.is_live and live_control.kill_switch_engaged():
             if manual:
                 self._add_alert("KILL_SWITCH", "Entry refused: kill switch engaged", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
@@ -2732,8 +2732,8 @@ class AppState:
                 now, sum(float(o.position.net_pnl or 0.0) for o in registry.active()
                          if o.position.option_symbol))
         can, _reason = self.risk.can_open(time.time())
-        if can and live_control.kill_switch_engaged():
-            can, _reason = False, "kill switch / manual pause engaged"
+        if can and live and live_control.kill_switch_engaged():
+            can, _reason = False, "kill switch engaged (live)"
         if not can:
             exec_funnel.blocked(
                 "RISK", "RISK_GOVERNOR", instrument=self._instrument, option=opt,

@@ -182,22 +182,6 @@ export default function ReportsBoard() {
         </div>
       </div>
 
-      {summary && summary.top_skip_reasons.length > 0 && (
-        <div className="card p-3 shrink-0">
-          <div className="text-[10px] uppercase tracking-widest text-white/50 mb-2">
-            Why signals were not taken
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {summary.top_skip_reasons.map((r) => (
-              <span key={r.reason} className="text-xs rounded-md border border-white/15 px-2 py-1">
-                <span className="font-bold tabular-nums mr-1">{r.count}</span>
-                {r.reason}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
       <div className="card p-3 flex flex-col min-h-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap mb-2 text-xs">
           <div className="flex rounded-md border border-white/15 overflow-hidden">

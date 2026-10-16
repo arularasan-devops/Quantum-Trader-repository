@@ -160,7 +160,7 @@ _orig_ks = _lc.kill_switch_engaged
 _lc.kill_switch_engaged = lambda: True
 took, why = attempt(eng, buy(sym, prem))
 _lc.kill_switch_engaged = _orig_ks
-check("manual pause / kill switch blocks paper auto-buy", not took, why)
+check("kill switch no longer blocks PAPER auto-buy (live only)", took, why)
 from app.engine import account_risk as _ar  # noqa: E402
 _acct = _ar.AccountRisk()
 _acct._loaded = True
