@@ -1147,6 +1147,10 @@ class AngelOneProvider(MarketDataProvider):
     def __init__(self, spec=None) -> None:
         self._exchange = (spec.exchange if spec else None) or settings.angel_exchange or self.EXCHANGE
         self._root = (spec.symbol if spec else None) or settings.angel_symbol_root or "CRUDEOIL"
+        from app.market.instruments import REGISTRY
+
+        # history.db keys bars by registry name ("BAJAJAUTO"), not the scrip root.
+        self._store_key = next((k for k, v in REGISTRY.items() if v is spec), self._root)
         # This instrument is assigned to one Angel key (shard); all its live
         # data (login session, WebSocket, historical rate limiter) comes from it.
         self._shard = _shard_for(self._root)
@@ -1205,6 +1209,31 @@ class AngelOneProvider(MarketDataProvider):
         self._refresh_futures_candles(allow_blocking=True)
         self._last_fut_candles_at = time.time()  # avoid an immediate re-fetch in step()
         self.step()
+
+    def _seed_candles_from_disk(self) -> None:
+        """Start from the 1-minute bars already saved in history.db.
+
+        They are the same REST candles, recorded every pass, so a restart no
+        longer queues every instrument behind the key's history rate limit. The
+        next REST refresh replaces the seed as usual.
+        """
+        if self._fut_candles or not settings.store_history:
+            return
+        try:
+            from app import storage
+
+            stored = storage.store.candles(self._store_key, 600)
+        except Exception as exc:  # a broken store must never stop the feed
+            _log.warning("%s: candle seed skipped: %s", self._root, exc)
+            return
+        try:
+            max_age = float(os.environ.get("QT_ANGEL_HIST_SEED_MAX_AGE_HOURS", "72") or 72) * 3600
+        except ValueError:
+            max_age = 72 * 3600
+        if len(stored) >= 60 and time.time() - float(stored[-1].time) <= max_age:
+            self._fut_candles = stored
+            self._fut_candles_cached_at = 0.0
+            self._candle_diag = ""
 
     # --------------------------------------------------------- live streaming
     def _start_stream(self) -> None:
