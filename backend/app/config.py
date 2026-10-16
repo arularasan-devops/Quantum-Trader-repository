@@ -625,6 +625,10 @@ class Settings(BaseSettings):
     # rolls over before it ever gets close to T1 — so the trade is cut in profit
     # instead of drifting all the way back to the hard stop.
     auto_trade_pre_t1_trail_arm_profit_pct: float = 6.0
+    # Also arm once the trade's peak open profit in RUPEES reaches this. With
+    # capital-sized lots a +3% premium move can already be ₹15k+ open profit
+    # that the % rules above never protect. 0 = off.
+    auto_trade_pre_t1_trail_arm_rupees: float = 10000.0
     # Once the pre-T1 trail has armed (we've seen real profit), ratchet the hard
     # stop up to at least break-even (entry). A trade that went green can then
     # never turn into a full stop-loss — worst case is roughly flat.

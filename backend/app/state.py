@@ -2384,7 +2384,15 @@ class AppState:
                         peak is not None
                         and peak >= entry * (1.0 + settings.auto_trade_pre_t1_trail_arm_profit_pct / 100.0)
                     )
-                    if peak is not None and (arm_by_t1 or arm_by_profit):
+                    arm_rs = settings.auto_trade_pre_t1_trail_arm_rupees
+                    qty = int(get_spec(self._instrument).lot_size or 0) * int(
+                        self._auto_entry_lots or p.quantity_lots or 0
+                    )
+                    arm_by_rupees = (
+                        arm_rs > 0 and peak is not None and qty > 0
+                        and (peak - entry) * qty >= arm_rs
+                    )
+                    if peak is not None and (arm_by_t1 or arm_by_profit or arm_by_rupees):
                         # Once we've seen real profit, ratchet the hard stop up to
                         # break-even so a green trade can't become a full loss.
                         if settings.auto_trade_breakeven_after_arm:
