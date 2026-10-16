@@ -1855,10 +1855,10 @@ async def journal_v2_trades(instrument: str | None = None, mode: str | None = No
                             regime: str | None = None, status: str | None = None,
                             result: str | None = None, since: float | None = None,
                             until: float | None = None, page: int = Query(1, ge=1),
-                            page_size: int = Query(50, ge=1, le=500)) -> dict:
+                            page_size: int = Query(50, ge=1, le=500), auto: bool = False) -> dict:
     from app.journal.store import store as jr_store
 
-    return jr_store().list_trades(_jr_filters(
+    return jr_store().list_trades(_jr_filters(auto="1" if auto else None, 
         instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
         status=status, result=result, since=since, until=until), page, page_size)
 
@@ -1868,10 +1868,10 @@ async def journal_v2_trades_csv(instrument: str | None = None, mode: str | None 
                                 strategy: str | None = None, setup: str | None = None,
                                 regime: str | None = None, status: str | None = None,
                                 result: str | None = None, since: float | None = None,
-                                until: float | None = None) -> PlainTextResponse:
+                                until: float | None = None, auto: bool = False) -> PlainTextResponse:
     from app.journal.store import store as jr_store
 
-    body = jr_store().trades_csv(_jr_filters(
+    body = jr_store().trades_csv(_jr_filters(auto="1" if auto else None, 
         instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
         status=status, result=result, since=since, until=until))
     return PlainTextResponse(body, media_type="text/csv", headers={

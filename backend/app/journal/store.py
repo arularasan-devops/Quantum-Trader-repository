@@ -390,6 +390,8 @@ class JournalStore:
         filters = dict(filters or {})
         where, params = self._where(filters, "entry_ts", (
             "instrument", "mode", "strategy", "setup", "regime", "status"))
+        if str(filters.get("auto") or "").lower() in ("1", "true", "yes"):
+            where += (" AND " if where else " WHERE ") + "substr(entry_explanation, 1, 11) = 'auto entry;'"
         result = (filters.get("result") or "").upper()
         if result in ("WIN", "LOSS"):
             where += (" AND " if where else " WHERE ") + "status = 'CLOSED' AND net_pnl " + (

@@ -565,13 +565,16 @@ class AppState:
                     message=refused,
                 )
 
-        if adopted is None and live_control.kill_switch_engaged():
+        paper_engine = (not manual and settings.auto_trade_pullback_engine
+                        and not self.is_live)
+        if adopted is None and not paper_engine and live_control.kill_switch_engaged():
             if manual:
                 self._add_alert("KILL_SWITCH", "Entry refused: kill switch engaged", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
                                option_symbol=q.symbol, lots=lots,
                                message="Kill switch engaged — new entries blocked.")
-        can, reason = (True, "") if adopted is not None else self.risk.can_open(time.time())
+        can, reason = ((True, "") if adopted is not None or paper_engine
+                       else self.risk.can_open(time.time()))
         if not can:
             self._add_alert("RISK_BLOCK", f"Trade blocked: {reason}", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
@@ -2084,6 +2087,60 @@ class AppState:
         auto-trader on + the explicit second live switch. Any one missing → paper."""
         return bool(self.is_live and settings.auto_trade_enabled and settings.auto_trade_allow_live)
 
+    def _pullback_spread_and_risk_ok(self, decision: Decision, opt: str, now: float) -> bool:
+        """SPREAD OK? and RISK ACCEPTABLE? of the PAPER pullback engine."""
+        try:
+            q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+        except Exception:
+            q = None
+        bid = float(getattr(q, "bid", 0) or 0)
+        ask = float(getattr(q, "ask", 0) or 0)
+        spread = None
+        if bid > 0 and ask >= bid:
+            spread = (ask - bid) / ((ask + bid) / 2.0) * 100.0
+            if spread > settings.auto_trade_max_spread_pct:
+                self._auto_last_action = f"AUTO SKIP {opt}: spread {spread:.1f}% too wide"
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "VALIDATION", "SPREAD_TOO_WIDE", instrument=self._instrument, option=opt,
+                    value=round(spread, 2), threshold=settings.auto_trade_max_spread_pct,
+                    where="state.py:_pullback_spread_and_risk_ok", reason="bid/ask spread too wide",
+                )
+                return False
+        entry = ask if ask > 0 else float(decision.current_premium or 0.0)
+        stop = decision.stop_loss
+        if entry <= 0 or stop is None or stop >= entry:
+            exec_funnel.blocked(
+                "RISK", "INVALID_STOP", instrument=self._instrument, option=opt,
+                value=stop, where="state.py:_pullback_spread_and_risk_ok",
+                reason="stop is missing or not below the entry price",
+            )
+            return False
+        risk_pct = (entry - stop) / entry * 100.0
+        metals = {m.upper() for m in settings.auto_trade_metal_roots}
+        if self._instrument.upper() in metals and settings.auto_trade_metal_risk_caps:
+            caps = settings.auto_trade_metal_risk_caps
+            cap = float(caps[int(now // 60) % len(caps)])
+            label = f"metal cap {cap:g}%"
+        else:
+            cap = float(settings.auto_trade_max_structural_risk_pct)
+            label = f"risk cap {cap:g}%"
+        if cap > 0 and risk_pct > cap:
+            self._auto_last_action = (
+                f"AUTO SKIP {opt}: structural risk {risk_pct:.1f}% > {label}")
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "RISK", "STRUCTURAL_RISK", instrument=self._instrument, option=opt,
+                value=round(risk_pct, 2), threshold=cap,
+                where="state.py:_pullback_spread_and_risk_ok",
+                reason=f"natural stop {risk_pct:.1f}% away exceeds the {label}",
+            )
+            return False
+        self._auto_entry_note = (
+            f"pullback engine: spread {spread:.1f}%" if spread is not None else "pullback engine: spread n/a"
+        ) + f", structural risk {risk_pct:.1f}% within {label}"
+        return True
+
     def _auto_trade(self, decision: Decision, in_pos: bool, now: int) -> None:
         """Auto-trader: auto-enter on a BUY at/above the gate and auto-exit on the
         ratcheting trailing stop / target / hard stop. Reuses buy()/sell() so every
@@ -2147,6 +2204,8 @@ class AppState:
                     lvl = "T3+ RATCHET"
                 elif t3 is not None and abs(prev_floor - t3) < 1e-6:
                     lvl = "TARGET 3"
+                elif t2 is not None and prev_floor > t2 + 1e-6:
+                    lvl = "T2 RATCHET"
                 elif t2 is not None and abs(prev_floor - t2) < 1e-6:
                     lvl = "TARGET 2"
                 else:
@@ -2176,11 +2235,20 @@ class AppState:
                     )
                     if step > 0:
                         floor = t3 + int((prem - t3) // step) * step
+                if settings.auto_trade_tiered_exit:
+                    self._auto_peak = max(self._auto_peak or prem, prem)
+                    runner = self._auto_peak * (1.0 - settings.tier_t3_runner_trail_pct / 100.0)
+                    floor = max(floor, t3, runner)
                 if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
                     self._auto_tgt_floor = floor
             elif t2 is not None and prem >= t2:
-                if self._auto_tgt_floor is None or t2 > self._auto_tgt_floor:
-                    self._auto_tgt_floor = t2
+                floor = t2
+                if settings.auto_trade_tiered_exit and t1 is not None:
+                    self._auto_peak = max(self._auto_peak or prem, prem)
+                    floor = max(t2, self._auto_peak - (self._auto_peak - t1)
+                                * settings.tier_t2_giveback_pct / 100.0)
+                if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
+                    self._auto_tgt_floor = floor
             elif t1 is not None and prem >= t1:
                 if self._auto_tgt_floor is None or t1 > self._auto_tgt_floor:
                     self._auto_tgt_floor = t1
@@ -2347,15 +2415,9 @@ class AppState:
             return
         opt = decision.recommended_option or ""
         exec_funnel.reached("SIGNAL")
-        if decision.confidence < settings.auto_trade_min_confidence:
-            exec_funnel.blocked(
-                "RISK", "CONFIDENCE_FLOOR", instrument=self._instrument, option=opt,
-                value=round(decision.confidence, 1),
-                threshold=settings.auto_trade_min_confidence,
-                where="state.py:_auto_trade",
-                reason="confidence below the auto-entry floor",
-            )
-            return
+        # PAPER pullback engine: TRENDING -> PULLBACK -> quote -> spread -> risk -> BUY.
+        eng = settings.auto_trade_pullback_engine and not live
+        self._auto_entry_note = ""
         if settings.auto_trade_strategy_gate:
             trig = (decision.entry_trigger or "").upper()
             regime = (getattr(self, "_last_market_status", "") or "").upper()
@@ -2376,11 +2438,20 @@ class AppState:
                     reason="not a pullback entry in a trending market",
                 )
                 return
+        if decision.confidence < settings.auto_trade_min_confidence:
+            exec_funnel.blocked(
+                "RISK", "CONFIDENCE_FLOOR", instrument=self._instrument, option=opt,
+                value=round(decision.confidence, 1),
+                threshold=settings.auto_trade_min_confidence,
+                where="state.py:_auto_trade",
+                reason="confidence below the auto-entry floor",
+            )
+            return
         # Confidence CEILING (default 100 = off). Measured three sessions running,
         # the score inverts at the top end: 13 Aug, >=95% produced 8 trades, 2
         # wins, -Rs10,712, while <80% lost a tenth of that. The knob exists so
         # that can be acted on without silently rewriting the score.
-        if decision.confidence > settings.auto_trade_max_confidence:
+        if not eng and decision.confidence > settings.auto_trade_max_confidence:
             self._auto_last_action = (
                 f"AUTO SKIP {decision.recommended_option}: confidence "
                 f"{decision.confidence:.0f}% is above the "
@@ -2410,7 +2481,7 @@ class AppState:
         open_block = account_risk.account.opening_window_block(
             now, account_risk.session_open_min(get_spec(self._instrument).exchange)
         )
-        if open_block:
+        if open_block and not eng:
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {open_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(
@@ -2461,6 +2532,8 @@ class AppState:
                 where="state.py:_auto_trade", reason="contract lot size unknown",
             )
             return
+        if eng and not self._pullback_spread_and_risk_ok(decision, opt, now):
+            return
         prem_now = float(decision.current_premium or 0.0)
 
         # --- stale feed guard: a premium that has not moved a single tick is not
@@ -2487,7 +2560,7 @@ class AppState:
             )
             return
 
-        if prem_now < settings.auto_trade_min_premium:
+        if not eng and prem_now < settings.auto_trade_min_premium:
             self._auto_last_action = (
                 f"AUTO SKIP {decision.recommended_option}: premium {prem_now:.1f} is "
                 f"below the ₹{settings.auto_trade_min_premium:g} floor — too cheap to "
@@ -2503,7 +2576,7 @@ class AppState:
 
         # --- opportunity gate: the SAME test the signal board shows, so the bot
         # never buys a contract the board is calling too quiet to pay for.
-        if settings.opportunity_gate_enabled:
+        if not eng and settings.opportunity_gate_enabled:
             ind_now = self._last_indicators
             opp = opportunity.score(
                 self._instrument,
@@ -2530,7 +2603,7 @@ class AppState:
         # restart — an in-memory cooldown handed the bot a fresh ladder every
         # time the backend came back up mid-session.
         cool_block = account_risk.account.instrument_blocked(self._instrument, now)
-        if cool_block:
+        if cool_block and not eng:
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {cool_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(
@@ -2541,7 +2614,8 @@ class AppState:
 
         # --- instrument allowlist: only trade what has a measured positive edge
         if (
-            settings.instrument_allowlist
+            not eng
+            and settings.instrument_allowlist
             and self._instrument not in settings.instrument_allowlist
         ):
             self._auto_last_action = f"AUTO SKIP {self._instrument}: not in the allowlist"
@@ -2554,7 +2628,7 @@ class AppState:
         # --- time-of-day filter: block the hours whose measured profit factor is
         # below 1 for this instrument (walk-forward validated; see config).
         blocked = settings.blocked_entry_hours.get(self._instrument) or []
-        if blocked:
+        if blocked and not eng:
             hour_ist = time.gmtime(now + 19800).tm_hour
             if hour_ist in blocked:
                 self._auto_last_action = (
@@ -2574,7 +2648,7 @@ class AppState:
         # says "wait for a pullback" we do NOT consume the episode — we can still enter
         # once the trigger actually fires.
         exec_funnel.reached("VALIDATION")
-        if settings.auto_trade_momentum_entry:
+        if not eng and settings.auto_trade_momentum_entry:
             trig = (decision.entry_trigger or "").upper()
             if trig in ("WAIT_PULLBACK", "NONE", ""):
                 self._auto_last_action = (
@@ -2602,7 +2676,7 @@ class AppState:
 
         # --- B) no-chase filter: skip an already-extended / trap-like move so we don't
         # buy the top. Uses the engine's own buy-trap probability + premium health.
-        if settings.auto_trade_no_chase:
+        if not eng and settings.auto_trade_no_chase:
             if (
                 decision.buy_trap_prob >= settings.auto_trade_no_chase_trap_prob
                 or (decision.premium_health or "").upper() == "DANGEROUS"
@@ -2622,7 +2696,7 @@ class AppState:
                 )
                 return
 
-        can, _reason = self.risk.can_open(time.time())
+        can, _reason = (True, "") if eng else self.risk.can_open(time.time())
         if not can:
             exec_funnel.blocked(
                 "RISK", "RISK_GOVERNOR", instrument=self._instrument, option=opt,
@@ -2650,7 +2724,7 @@ class AppState:
             deployed += val
             if other.instrument == self._instrument:
                 deployed_self += val
-        if open_positions >= max(1, settings.auto_trade_max_concurrent):
+        if not eng and open_positions >= max(1, settings.auto_trade_max_concurrent):
             self._auto_last_action = (
                 f"AUTO SKIP {decision.recommended_option}: max concurrent positions "
                 f"({open_positions}/{settings.auto_trade_max_concurrent})"

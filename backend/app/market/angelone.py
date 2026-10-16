@@ -219,7 +219,7 @@ _scrip_master_cache: list | None = None
 # from that key's endpoint, so without coordination they race and trip the
 # limit. Each shard (Angel key) owns its OWN limiter, so with multiple keys the
 # historical warm-up runs in parallel (N keys -> ~N times the throughput).
-_HIST_MIN_INTERVAL = 3.5   # min seconds between historical calls, per key
+_HIST_MIN_INTERVAL = float(os.environ.get("QT_ANGEL_HIST_MIN_INTERVAL", "3.5") or 3.5)  # per key
 _HIST_COOLDOWN = 12.0      # base pause after a rate-limit (grows exponentially)
 _HIST_COOLDOWN_MAX = 90.0  # cap the exponential back-off here
 _HIST_JITTER = 0.75        # random spread (s) added to spacing to de-sync shards
@@ -1201,7 +1201,8 @@ class AngelOneProvider(MarketDataProvider):
         self._was_streaming = False
         self._start_stream()
 
-        self._refresh_futures_candles()
+        self._seed_candles_from_disk()
+        self._refresh_futures_candles(allow_blocking=True)
         self._last_fut_candles_at = time.time()  # avoid an immediate re-fetch in step()
         self.step()
 
@@ -1399,7 +1400,7 @@ class AngelOneProvider(MarketDataProvider):
         if self._future and self._future.token in self._quotes:
             self._spot = self._quotes[self._future.token]["ltp"] or self._spot
 
-    def _refresh_futures_candles(self) -> None:
+    def _refresh_futures_candles(self, allow_blocking: bool = False) -> None:
         if not self._future:
             return
         limiter = self._shard.hist
@@ -1427,8 +1428,11 @@ class AngelOneProvider(MarketDataProvider):
         # so it would pay the blocking budget on every tick for the whole
         # session. After the first few passes it refreshes non-blocking like any
         # other instrument and keeps reporting that it has no candles.
+        # Only the constructor may block. A blocking wait inside a tick holds the
+        # serial hub loop, which is what froze the on-screen LTP during warm-up.
         blocking = (
-            not self._fut_candles
+            allow_blocking
+            and not self._fut_candles
             and self._fut_rest_attempts < _HIST_BLOCKING_PASSES
         )
         self._fut_rest_attempts += 1

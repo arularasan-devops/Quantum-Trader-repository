@@ -191,6 +191,23 @@ class Settings(BaseSettings):
     auto_trade_strategy_gate: bool = True
     auto_trade_allowed_triggers: list[str] = ["PULLBACK"]
     auto_trade_allowed_regimes: list[str] = ["TRENDING"]
+    # Dedicated PAPER pullback auto-buy engine. Entry path is exactly:
+    # TRENDING -> PULLBACK (>= min confidence) -> QUOTE VALID -> SPREAD OK ->
+    # RISK ACCEPTABLE -> AUTO BUY. Discretionary gates (kill switch, cooldown,
+    # risk governor, opportunity, no-chase, hours, ceiling, concurrency) are
+    # bypassed in PAPER only; live mode keeps every gate.
+    auto_trade_pullback_engine: bool = True
+    auto_trade_max_spread_pct: float = 5.0          # (ask-bid)/mid
+    auto_trade_max_structural_risk_pct: float = 40.0  # (entry-stop)/entry, non-metals
+    # Gold/Silver: reject trades whose natural structural stop is wider than the cap;
+    # the cap arm (4/5/6%) is assigned per signal so the replay can compare them.
+    auto_trade_metal_roots: list[str] = ["GOLD", "GOLDM", "GOLDPETAL", "GOLDGUINEA",
+                                         "SILVER", "SILVERM", "SILVERMIC"]
+    auto_trade_metal_risk_caps: list[float] = [4.0, 5.0, 6.0]
+    # Tiered exits: PRE-T1 peak trail (auto_trade_pre_t1_*) -> T1 lock -> T2 ratchet -> T3 runner.
+    auto_trade_tiered_exit: bool = True
+    tier_t2_giveback_pct: float = 50.0       # after T2: floor = peak - 50% of (peak - T1)
+    tier_t3_runner_trail_pct: float = 8.0    # after T3: floor = peak * (1 - 8%), never below T3
     auto_trade_no_chase: bool = True
     auto_trade_no_chase_trap_prob: float = 60.0   # skip entry when buy_trap_prob >= this
     # Safe (risk-based) position sizing: size each auto entry from capital and

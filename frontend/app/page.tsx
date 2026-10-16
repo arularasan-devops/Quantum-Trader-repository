@@ -43,7 +43,6 @@ import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
 import OptionsBoard from "@/components/OptionsBoard";
 import JournalBoard from "@/components/JournalBoard";
-import BuySignalsPanel from "@/components/BuySignalsPanel";
 import ReportsBoard from "@/components/ReportsBoard";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
@@ -561,7 +560,7 @@ export default function Page() {
            paper/live trade with reason, confidence, P&L and analyst note. */
         <>
           <JournalBoard />
-          <BuySignalsPanel />
+          
         </>
       ) : view === "reports" ? (
         /* Every BUY signal persisted in journal v2, executed or skipped, with reason. */

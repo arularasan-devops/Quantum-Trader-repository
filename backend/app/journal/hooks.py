@@ -187,7 +187,8 @@ def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
             "initial_stop": stop, "target1": d.target1 if d else None,
             "target2": d.target2 if d else None, "target3": d.target3 if d else None,
             "entry_explanation": ("manual entry; " if manual else "auto entry; ") + (
-                "; ".join((d.reasons or [])[:4]) if d else ""),
+                (getattr(st, "_auto_entry_note", "") + "; ") if not manual and getattr(st, "_auto_entry_note", "") else ""
+            ) + ("; ".join((d.reasons or [])[:4]) if d else ""),
             "mfe_mae_status": "PREMIUM_PEAK_TROUGH_FROM_LIVE_MARKS",
             "strategy_version": STRATEGY_VERSION, "config_fingerprint": config_fingerprint(),
         })

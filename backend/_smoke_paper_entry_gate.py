@@ -143,11 +143,32 @@ check("  paper entry filled at the ask (not LTP)",
       took and abs(eng.position.entry_premium - ask) < 1e-6,
       f"entry={eng.position.entry_premium} ask={ask} ltp={prem}")
 
-# 9. failed risk gate
+# 9. risk governor: bypassed by the PAPER pullback engine, enforced without it
 eng, sym, prem = fresh()
 eng.risk.can_open = lambda t: (False, "daily loss cap reached")
 took, why = attempt(eng, buy(sym, prem))
-check("failed risk gate rejected", not took and why == "RISK_GOVERNOR", why)
+check("pullback engine ignores the risk governor (paper)", took, why)
+eng, sym, prem = fresh()
+settings.auto_trade_pullback_engine = False
+eng.risk.can_open = lambda t: (False, "daily loss cap reached")
+took, why = attempt(eng, buy(sym, prem))
+settings.auto_trade_pullback_engine = True
+check("failed risk gate rejected (engine off)", not took and why == "RISK_GOVERNOR", why)
+
+# 9b. SPREAD OK? / RISK ACCEPTABLE? of the pullback engine
+eng, sym, prem = fresh()
+q0 = next(q for q in eng.provider.option_chain() if q.symbol == sym)
+wide = [q.model_copy(update={"bid": round(prem * 0.80, 2), "ask": round(prem * 1.20, 2)})
+        if q.symbol == sym else q for q in eng.provider.option_chain()]
+eng.provider.option_chain = lambda: wide
+took, why = attempt(eng, buy(sym, prem))
+check("wide spread rejected", not took and why == "SPREAD_TOO_WIDE", why)
+eng, sym, prem = fresh()
+d = buy(sym, prem)
+d = d.model_copy(update={"stop_loss": round(prem * 0.40, 2)})
+took, why = attempt(eng, d)
+check("structural risk beyond cap rejected", not took and why == "STRUCTURAL_RISK", why)
+
 
 # 10. sizing: whole lots, within capital
 eng, sym, prem = fresh()

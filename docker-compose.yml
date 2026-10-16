@@ -75,6 +75,30 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # Copies the PostgreSQL journal to ./backups on the host (your Windows disk)
+  # every QT_BACKUP_EVERY_MIN minutes; keeps the newest QT_BACKUP_KEEP dumps.
+  db-backup:
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      EVERY_MIN: ${QT_BACKUP_EVERY_MIN:-15}
+      KEEP: ${QT_BACKUP_KEEP:-96}
+    volumes:
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          f=/backups/quantum_$$(date +%Y%m%d_%H%M%S).dump
+          if pg_dump -h postgres -U quantum -d quantum -Fc -f "$$f.tmp"; then mv "$$f.tmp" "$$f"; cp "$$f" /backups/quantum_latest.dump; else rm -f "$$f.tmp"; fi
+          ls -1t /backups/quantum_2*.dump 2>/dev/null | tail -n +$$((KEEP + 1)) | xargs -r rm -f
+          sleep $$((EVERY_MIN * 60))
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis-data:
   pg-data:
