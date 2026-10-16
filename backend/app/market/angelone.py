@@ -245,6 +245,14 @@ _HIST_BLOCKING_BUDGET_SEC = 6.0
 # acquires the cache that would take it off this path, so without a cap it pays
 # the full budget on every tick for the whole session.
 _HIST_BLOCKING_PASSES = 3
+# One key serves ~17 history calls a minute; the watchlist asks for more. An
+# instrument with NO candles cannot signal at all, so while any instrument on
+# the key is still warming, instruments that already hold a recent cache skip
+# their routine refresh and leave the slot to it. Bounded so no cache is held
+# back longer than this.
+_HIST_YIELD_MAX_AGE = 180.0
+# A warming instrument retries this often instead of once a minute.
+_HIST_WARMUP_RETRY_SEC = 5.0
 
 
 class _HistLimiter:
@@ -267,6 +275,18 @@ class _HistLimiter:
         self._deferrals = 0
         self._trips = 0
         self._successes = 0
+        self._warming: set[int] = set()
+
+    def set_warming(self, key: int, warming: bool) -> None:
+        with self._lock:
+            if warming:
+                self._warming.add(key)
+            else:
+                self._warming.discard(key)
+
+    def warming_count(self) -> int:
+        with self._lock:
+            return len(self._warming)
 
     def stats(self) -> dict:
         with self._lock:
@@ -279,6 +299,7 @@ class _HistLimiter:
                     max(0.0, self._cooldown_until - time.time()), 1),
                 "consecutive_rate_limits": self._consecutive_trips,
                 "min_interval_sec": _HIST_MIN_INTERVAL,
+                "instruments_warming": len(self._warming),
             }
 
     def note_deferral(self) -> None:
@@ -1381,6 +1402,10 @@ class AngelOneProvider(MarketDataProvider):
     def _refresh_futures_candles(self) -> None:
         if not self._future:
             return
+        limiter = self._shard.hist
+        if (self._fut_candles and limiter.warming_count()
+                and time.time() - self._fut_candles_cached_at < _HIST_YIELD_MAX_AGE):
+            return
         # 48h IST lookback: enough 1-minute bars for the indicators even right
         # after the open (covers the previous session), and in IST so the window
         # actually overlaps daytime-only markets (Nifty/Sensex).
@@ -1416,11 +1441,20 @@ class AngelOneProvider(MarketDataProvider):
             self._candle_diag = ""
         elif diag.startswith("deferred"):
             self._fut_rest_deferred += 1
+        limiter.set_warming(id(self), not self._fut_candles)
         if not candles and not self._fut_candles:
             # No cached data yet — surface WHY (rate-limit / token / permission),
             # never a silently-blank instrument. No credentials are ever logged.
-            self._candle_diag = f"{self._root}/{self._exchange}: {diag}"
-            _log.warning(self._candle_diag)
+            if diag.startswith("deferred"):
+                # Not an error: queued behind the key's history rate limit.
+                self._candle_diag = (
+                    f"{self._root}/{self._exchange}: loading price history, queued for "
+                    f"Angel One rate limit ({limiter.warming_count()} instruments waiting)"
+                )
+                _log.debug("%s/%s: %s", self._root, self._exchange, diag)
+            else:
+                self._candle_diag = f"{self._root}/{self._exchange}: {diag}"
+                _log.warning(self._candle_diag)
 
     # ------------------------------------------------- provider interface
     def step(self) -> None:
@@ -1449,7 +1483,8 @@ class AngelOneProvider(MarketDataProvider):
             self._refresh_quotes()
             self._last_quote_at = now
         # Candles (for indicators) always come from the 1-minute historical API.
-        if now - self._last_fut_candles_at >= 60.0:
+        interval = 60.0 if self._fut_candles else _HIST_WARMUP_RETRY_SEC
+        if now - self._last_fut_candles_at >= interval:
             self._refresh_futures_candles()
             self._last_fut_candles_at = now
 

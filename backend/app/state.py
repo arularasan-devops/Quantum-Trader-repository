@@ -578,6 +578,9 @@ class AppState:
                                option_symbol=q.symbol, lots=lots, message=f"Risk limit: {reason}")
 
         entry = q.premium
+        # Paper fills pay the ask when a two-sided book exists (never LTP/mid).
+        if adopted is None and not self.is_live and q.bid and q.ask and 0 < q.bid <= q.ask:
+            entry = float(q.ask)
         order_id = None
         if adopted is not None:
             entry = float(adopted.fill_premium)
@@ -1123,6 +1126,14 @@ class AppState:
             order_id = res.order_id
             lots = int(res.filled_lots or lots)
             exit_px = res.fill_premium
+        else:
+            # Paper exits receive the bid when a two-sided book exists.
+            try:
+                q = next((x for x in self.provider.option_chain() if x.symbol == sym), None)
+            except Exception:
+                q = None
+            if q is not None and q.bid and q.ask and 0 < q.bid <= q.ask:
+                exit_px = float(q.bid)
         return self._book_exit(lots, order_id, exit_px)
 
     def _book_exit(self, lots: int, order_id: str | None,
@@ -2413,6 +2424,43 @@ class AppState:
         # ticks on a ₹7 option is a ~28% move, so no stop is meaningful there and
         # a capital-based size buys an absurd number of lots. Journal evidence:
         # 10 lots of a ₹7.2 option lost 28% in 18 minutes.
+        # --- execution eligibility: data, quote and contract metadata ---
+        if not self._feed_ready():
+            self._auto_last_action = f"AUTO SKIP {opt}: feed not ready (stale or disconnected)"
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "VALIDATION", "FEED_NOT_READY", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade", reason="market data is stale or disconnected",
+            )
+            return
+        if self._feed_health().source != "SIMULATED":
+            try:
+                q_now = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+            except Exception:
+                q_now = None
+            bid = getattr(q_now, "bid", None)
+            ask = getattr(q_now, "ask", None)
+            if not bid or not ask or bid <= 0 or ask < bid:
+                self._auto_last_action = f"AUTO SKIP {opt}: no executable two-sided quote"
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "VALIDATION", "NO_TWO_SIDED_QUOTE", instrument=self._instrument,
+                    option=opt, value=f"bid={bid} ask={ask}",
+                    where="state.py:_auto_trade", reason="no executable two-sided quote",
+                )
+                return
+        try:
+            lot_ok = int(get_spec(self._instrument).lot_size or 0) > 0
+        except Exception:
+            lot_ok = False
+        if not lot_ok:
+            self._auto_last_action = f"AUTO SKIP {opt}: contract lot size unknown"
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "VALIDATION", "MISSING_METADATA", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade", reason="contract lot size unknown",
+            )
+            return
         prem_now = float(decision.current_premium or 0.0)
 
         # --- stale feed guard: a premium that has not moved a single tick is not

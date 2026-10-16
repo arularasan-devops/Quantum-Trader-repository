@@ -2553,6 +2553,93 @@ async def vehicle_comparison(instrument: str | None = None) -> dict:
     }
 
 
+@app.get("/api/options-board")
+async def options_board(instrument: str | None = None) -> dict:
+    """OPTIONS board: the current chain with its executable book, liquidity, OI
+    and model Greeks, beside the engine's call and the paper position. Read-only;
+    there is no order path here."""
+    import time as _time
+
+    from app.analysis import intelligence, options_analytics
+    from app.market.instruments import get_spec
+    from app.models import OptionType
+
+    loop = asyncio.get_event_loop()
+    st = await loop.run_in_executor(None, registry.get, _norm_instrument(instrument))
+    snap = hub.latest.get(st.instrument)
+    if snap is None:
+        snap = await loop.run_in_executor(None, st.tick)
+        hub.latest[st.instrument] = snap
+    chain = await loop.run_in_executor(None, st.provider.option_chain)
+    spec = get_spec(st.instrument)
+    lot = int(getattr(spec, "lot_size", 0) or 0) or None
+    days = float(getattr(spec, "days_to_expiry", 0) or 0) or None
+    spot = snap.futures_price
+    now = _time.time()
+    rows = []
+    for q in sorted(chain, key=lambda x: (x.strike, x.option_type.value)):
+        two_sided = bool(q.bid and q.ask and 0 < q.bid <= q.ask)
+        spread = round(q.ask - q.bid, 2) if two_sided else None
+        mid = (q.bid + q.ask) / 2 if two_sided else None
+        rows.append({
+            "symbol": q.symbol, "strike": q.strike, "type": q.option_type.value,
+            "ltp": q.premium, "bid": q.bid, "ask": q.ask,
+            "bid_size": q.bid_size, "ask_size": q.ask_size,
+            "spread": spread,
+            "spread_pct": round(spread / mid * 100, 2) if spread is not None and mid else None,
+            "book_age_sec": round(now - q.book_ts, 1) if q.book_ts else None,
+            "executable": two_sided,
+            "cost_per_lot_at_ask": round(q.ask * lot, 2) if two_sided and lot else None,
+            "iv": q.iv, "delta": q.delta, "gamma": q.gamma, "theta": q.theta, "vega": q.vega,
+            "oi": q.oi, "oi_change": q.oi_change, "volume": q.volume,
+        })
+    calls = [q for q in chain if q.option_type == OptionType.CALL]
+    puts = [q for q in chain if q.option_type == OptionType.PUT]
+    try:
+        em = options_analytics.expected_move(spot, chain, days) if days else None
+    except Exception:
+        em = None
+    d = snap.decision
+    sig = getattr(d.signal, "value", d.signal)
+    return {
+        "instrument": st.instrument,
+        "exchange": getattr(spec, "exchange", None),
+        "spot": spot,
+        "lot_size": lot,
+        "days_to_expiry": days,
+        "is_real_feed": settings.data_provider.lower() == "angelone",
+        "trade_mode": "live" if st.is_live else "paper",
+        "feed_mode": snap.feed_mode,
+        "feed": snap.feed_health.model_dump() if snap.feed_health else None,
+        "greeks_source": (
+            "Model-computed: IV is solved from each option's LTP with Black-Scholes, "
+            "then delta/gamma/theta/vega are computed from that IV "
+            "(app/market/options.py). Not exchange-published values."
+        ),
+        "pcr": intelligence.pcr_reading(chain).model_dump(),
+        "max_pain": intelligence.max_pain(chain, spot).model_dump(),
+        "max_oi_call_strike": max(calls, key=lambda q: q.oi).strike if calls else None,
+        "max_oi_put_strike": max(puts, key=lambda q: q.oi).strike if puts else None,
+        "expected_move": round(em, 2) if em else None,
+        "signal": {
+            "signal": sig, "confidence": d.confidence,
+            "recommended_option": d.recommended_option,
+            "entry_trigger": d.entry_trigger, "regime": getattr(st, "_last_market_status", None),
+            "current_premium": d.current_premium, "stop_loss": d.stop_loss,
+            "target1": d.target1, "target2": d.target2, "target3": d.target3,
+        },
+        "auto_entry_rule": (
+            f"PAPER auto-entry only on {'/'.join(settings.auto_trade_allowed_triggers)} in "
+            f"{'/'.join(settings.auto_trade_allowed_regimes)} at confidence >= "
+            f"{settings.auto_trade_min_confidence:g}%, with a fresh feed and a two-sided quote; "
+            "paper buys fill at the ask and sell at the bid."
+        ),
+        "position": snap.position.model_dump(),
+        "executable_count": sum(1 for r in rows if r["executable"]),
+        "rows": rows,
+    }
+
+
 @app.get("/api/instruments")
 async def instruments() -> dict:
     from app.market.instruments import universe_specs

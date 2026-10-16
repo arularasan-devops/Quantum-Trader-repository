@@ -41,6 +41,7 @@ import MomentumBoard from "@/components/MomentumBoard";
 import FlowBoard from "@/components/FlowBoard";
 import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
+import OptionsBoard from "@/components/OptionsBoard";
 import JournalBoard from "@/components/JournalBoard";
 import BuySignalsPanel from "@/components/BuySignalsPanel";
 import ReportsBoard from "@/components/ReportsBoard";
@@ -78,7 +79,7 @@ export default function Page() {
   const [showPerformance, setShowPerformance] = useState(false);
   const [showSizing, setShowSizing] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "journal" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
+  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "options" | "journal" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
 
   // Restore this tab's instrument on load/refresh: prefer the ?instrument= URL
   // param (so each tab keeps its own selection and survives a refresh), then the
@@ -426,6 +427,12 @@ export default function Page() {
               Futures <span className="text-[9px] text-amber-300/80">PAPER</span>
             </button>
             <button
+              onClick={() => setView("options")}
+              className={view === "options" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
+            >
+              Options <span className="text-[9px] text-amber-300/80">PAPER</span>
+            </button>
+            <button
               onClick={() => setView("journal")}
               className={view === "journal" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
             >
@@ -547,6 +554,8 @@ export default function Page() {
            pot and point-based risk. Shares no sizing/stop/exit logic with the
            option engine and has NO live order route. */
         <FuturesBoard snap={snap} />
+      ) : view === "options" ? (
+        <OptionsBoard snap={snap} />
       ) : view === "journal" ? (
         /* Complete trade journal — the full persisted record of every closed
            paper/live trade with reason, confidence, P&L and analyst note. */
