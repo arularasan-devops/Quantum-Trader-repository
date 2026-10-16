@@ -731,6 +731,13 @@ async def _startup() -> None:
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
 
+    mode_error = live_control.verify_trade_mode()
+    if mode_error:
+        _log.error("trade mode check failed: %s", mode_error)
+    else:
+        _log.info("trade mode: %s (auto-trade %s)", settings.trade_mode.strip().lower(),
+                  "enabled" if settings.auto_trade_enabled else "disabled")
+
     loop = asyncio.get_event_loop()
     # Re-apply a user-saved manual watchlist first (survives restarts). If one is
     # active it governs the universe (auto-pick becomes a no-op below).
@@ -966,6 +973,7 @@ async def health() -> dict:
         "data_source": "SIMULATED" if (settings.data_provider or "").lower() == "simulated"
         else "LIVE_PROVIDER",
         "trade_mode": "live" if registry.get(DEFAULT_INSTRUMENT).is_live else "paper",
+        "mode_error": live_control.trade_mode_error() or None,
     }
 
 
@@ -1102,10 +1110,12 @@ async def auto_trade(req: AutoTradeRequest,
         live_control.require_live_auth(x_qt_live_token)
     if req.enabled and live_control.kill_switch_engaged():
         raise HTTPException(409, "Kill switch is engaged; release it before enabling the bot.")
+    if req.enabled and live_control.trade_mode_error():
+        raise HTTPException(409, live_control.trade_mode_error())
     if req.enabled is not None:
         settings.auto_trade_enabled = bool(req.enabled)
     if req.min_confidence is not None:
-        settings.auto_trade_min_confidence = max(75.0, min(99.0, float(req.min_confidence)))
+        settings.auto_trade_min_confidence = max(80.0, min(99.0, float(req.min_confidence)))
     if req.max_lots is not None:
         settings.auto_trade_max_lots = max(1, min(50, int(req.max_lots)))
     if req.safe_sizing is not None:
@@ -1209,6 +1219,8 @@ async def auto_buy(req: AutoBuyRequest,
         live_control.require_live_auth(x_qt_live_token)
         if live_control.kill_switch_engaged():
             raise HTTPException(409, "Kill switch is engaged; release it before arming.")
+        if live_control.trade_mode_error():
+            raise HTTPException(409, live_control.trade_mode_error())
     balance: float | None = None
     try:
         balance = angelone.available_cash(ttl=5.0)
@@ -1307,6 +1319,7 @@ async def get_settings() -> dict:
         "beyond_t3_min_step": settings.auto_trade_beyond_t3_min_step,
         "auto_trade": {
             "enabled": settings.auto_trade_enabled,
+            "mode_error": live_control.trade_mode_error() or None,
             "min_confidence": settings.auto_trade_min_confidence,
             "max_lots": settings.auto_trade_max_lots,
             "safe_sizing": settings.auto_trade_safe_sizing,

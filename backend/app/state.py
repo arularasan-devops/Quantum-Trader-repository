@@ -2827,6 +2827,9 @@ class AppState:
         # the bot is intentionally standing down rather than silently broken.
         if not reason and self.is_live and not settings.auto_trade_allow_live and settings.auto_trade_enabled:
             reason = "Live feed — bot NOT armed for live orders (set auto_trade_allow_live)"
+        mode_error = live_control.trade_mode_error()
+        if mode_error:
+            reason = mode_error
 
         # Persistent entry snapshot so the UI can always show what the bot took, even
         # after the BUY signal card has cleared once a position is open.
