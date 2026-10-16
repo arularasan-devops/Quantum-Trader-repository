@@ -61,6 +61,19 @@ def _today(now: float) -> str:
     return _time.strftime("%Y-%m-%d", _time.gmtime(int(now) + _IST_OFFSET))
 
 
+
+def day_lock_level(day_peak_equity: float) -> float | None:
+    """Day profit lock: None until equity reached ``daily_profit_target``; then
+    ``daily_lock_keep_pct`` of the day's peak (75% -> peak 40k locks 30k), or
+    with keep 0 the peak minus ``daily_peak_giveback``. Never below the target."""
+    tgt = settings.daily_profit_target
+    if tgt <= 0 or day_peak_equity < tgt:
+        return None
+    keep = settings.daily_lock_keep_pct
+    if keep > 0:
+        return max(tgt, day_peak_equity * min(keep, 100.0) / 100.0)
+    return max(tgt, day_peak_equity - max(0.0, settings.daily_peak_giveback))
+
 class AccountRisk:
     """Shared, disk-persisted daily risk state for the whole option book."""
 
@@ -153,23 +166,17 @@ class AccountRisk:
         self._save()
 
     def lock_level(self) -> float | None:
-        """Equity the day may not fall below once the target was reached: the
-        day's peak minus ``daily_peak_giveback`` (0 = the exact peak), never
-        below the target itself. None until the target has been reached."""
-        tgt = settings.daily_profit_target
-        if tgt <= 0 or self.day_peak_equity < tgt:
-            return None
-        return max(tgt, self.day_peak_equity - max(0.0, settings.daily_peak_giveback))
+        """Equity the day may not fall below once the target was reached (see
+        ``day_lock_level``). None until the target has been reached."""
+        return day_lock_level(self.day_peak_equity)
 
     def lock_breached(self, equity: float) -> bool:
         lvl = self.lock_level()
         return lvl is not None and equity < lvl - 1e-6
 
     def must_flatten(self, equity: float) -> bool:
-        """Equity fell under the target after reaching it: close auto positions."""
-        tgt = settings.daily_profit_target
-        return (settings.profit_lock_flatten and tgt > 0
-                and self.day_peak_equity >= tgt and equity < tgt)
+        """Equity fell to the day's lock after reaching the target: close auto positions."""
+        return settings.profit_lock_flatten and self.lock_breached(equity)
 
     def note_equity(self, now: float, unrealized: float) -> None:
         """Track the day's equity peak (realized + open MTM, kept separate in

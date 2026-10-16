@@ -170,13 +170,19 @@ _acct._roll(_now)
 _acct.day_pnl = 10_000.0
 check("₹10,000 target alone does NOT stop auto-buy", _acct.blocked(_now) is None, _acct.blocked(_now))
 _acct.day_pnl = 12_000.0
-_acct.note_equity(_now, 8_000.0)           # peak 20,000 -> lock 20,000 (giveback 0)
-check("lock ratchets up to the day peak", _acct.lock_level() == 20_000.0, str(_acct.lock_level()))
-_acct.note_equity(_now, 7_000.0)           # 19,000 < 20,000 lock
-check("falling below the locked peak stops auto-buy",
+_acct.note_equity(_now, 8_000.0)           # peak 20,000 -> lock 75% = 15,000
+check("lock keeps 75% of the day peak", _acct.lock_level() == 15_000.0, str(_acct.lock_level()))
+_acct.note_equity(_now, 4_000.0)           # 16,000 > 15,000 lock
+check("a dip above the lock keeps trading", not _acct.giveback_tripped and _acct.blocked(_now) is None,
+      _acct.blocked(_now))
+check("above the lock: no flatten", not _acct.must_flatten(16_000.0))
+_acct.note_equity(_now, 2_500.0)           # 14,500 < 15,000 lock
+check("falling to the lock stops auto-buy",
       _acct.giveback_tripped and "profit lock" in (_acct.blocked(_now) or ""), _acct.blocked(_now))
-check("above target: no flatten yet", not _acct.must_flatten(19_000.0))
-check("back under ₹10,000 after reaching it: flatten auto positions", _acct.must_flatten(9_500.0))
+check("falling to the lock flattens auto positions", _acct.must_flatten(14_500.0))
+_acct.day_peak_equity = 11_000.0
+check("lock never below the ₹10,000 target", _acct.lock_level() == 10_000.0, str(_acct.lock_level()))
+_acct.day_peak_equity = 20_000.0
 _b = _ar.AccountRisk()
 _b._loaded = True
 _b._save = lambda: None

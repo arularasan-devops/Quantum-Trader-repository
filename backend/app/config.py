@@ -663,9 +663,23 @@ class Settings(BaseSettings):
     # the lock = day peak - this giveback (never below the target). Falling under
     # it stops auto-buy for the day. 0 = lock at the exact peak.
     daily_peak_giveback: float = 0.0
-    # After reaching the target, equity back under the target closes open auto
-    # positions (paper exits at the bid) to keep what is left.
+    # Lock keeps this % of the day's peak profit once the target is reached
+    # (75: peak 20k -> lock 15k, peak 40k -> 30k; never below the target).
+    # 0 = use daily_peak_giveback instead.
+    daily_lock_keep_pct: float = 75.0
+    # Equity falling to the lock closes open auto positions (paper exits at the
+    # bid) and stops new auto-buys for the day.
     profit_lock_flatten: bool = True
+    # Parallel PAPER comparison books ("capital:FULL|RISK"): every book takes the
+    # same gated signals with its own capital, lots, exits, day lock and ledger
+    # (jr_book_trades). FULL = all lots free capital buys at the ask; RISK =
+    # lots so (entry - stop) x qty <= paper_books_risk_pct of the book capital.
+    paper_books_enabled: bool = True
+    paper_books: list[str] = [
+        "500000:FULL", "500000:RISK", "1000000:FULL",
+        "1000000:RISK", "1500000:FULL", "1500000:RISK",
+    ]
+    paper_books_risk_pct: float = 1.0
     # Auto-buy lots from free capital (no fixed lot cap) in PAPER.
     auto_trade_capital_sizing: bool = True
     # --- LIVE auto-execution arm (DANGER: real money) ---

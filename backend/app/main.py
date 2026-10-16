@@ -1897,6 +1897,22 @@ async def journal_v2_trade(trade_id: str) -> dict:
     return detail
 
 
+@app.get("/api/paper-books")
+async def paper_books_summary() -> dict:
+    from app.engine import paper_books
+
+    return paper_books.books().summary()
+
+
+@app.get("/api/paper-books/trades")
+async def paper_books_trades(book: str | None = None, status: str | None = None,
+                             page: int = Query(1, ge=1),
+                             page_size: int = Query(50, ge=1, le=500)) -> dict:
+    from app.engine import paper_books
+
+    return paper_books.books().trades(book, status, page, page_size)
+
+
 @app.get("/api/journal/v2/sessions")
 async def journal_v2_sessions(instrument: str | None = None, mode: str | None = None,
                               since: float | None = None, until: float | None = None,

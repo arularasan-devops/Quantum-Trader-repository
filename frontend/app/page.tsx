@@ -41,6 +41,7 @@ import FuturesBoard from "@/components/FuturesBoard";
 import OptionsBoard from "@/components/OptionsBoard";
 import JournalBoard from "@/components/JournalBoard";
 import ReportsBoard from "@/components/ReportsBoard";
+import PaperBooksBoard from "@/components/PaperBooksBoard";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
 import TopMovers from "@/components/TopMovers";
@@ -75,7 +76,7 @@ export default function Page() {
   const [showPerformance, setShowPerformance] = useState(false);
   const [showSizing, setShowSizing] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [view, setView] = useState<"signal" | "command" | "decision" | "futures" | "options" | "journal" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
+  const [view, setView] = useState<"signal" | "command" | "decision" | "futures" | "options" | "journal" | "books" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
 
   // Restore this tab's instrument on load/refresh: prefer the ?instrument= URL
   // param (so each tab keeps its own selection and survives a refresh), then the
@@ -453,6 +454,12 @@ export default function Page() {
           Journal
         </button>
         <button
+          onClick={() => setView("books")}
+          className={view === "books" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Books <span className="text-[9px] text-amber-300/80">PAPER</span>
+        </button>
+        <button
           onClick={() => setView("reports")}
           className={view === "reports" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
         >
@@ -529,6 +536,9 @@ export default function Page() {
           <JournalBoard />
           
         </>
+      ) : view === "books" ? (
+        /* Six parallel PAPER books (5L/10L/15L x FULL/RISK) on the same signals. */
+        <PaperBooksBoard />
       ) : view === "reports" ? (
         /* Every BUY signal persisted in journal v2, executed or skipped, with reason. */
         <ReportsBoard />

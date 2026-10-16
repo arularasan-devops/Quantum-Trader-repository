@@ -42,6 +42,7 @@ from app.engine import account_risk
 from app.engine import backtest as bt
 from app.engine import decision as eng
 from app.engine import learning as learn
+from app.engine import paper_books
 from app.engine import recovery as rec_eng
 from app.engine import risk_v2
 from app.engine import weights
@@ -1672,6 +1673,8 @@ class AppState:
 
         # Journal v2 (record only): session, signal outcome, stop/target changes.
         journal_hooks.after_tick(self, decision, chain, was_in_pos, now)
+        # Parallel PAPER comparison books (ledger only; never the broker).
+        paper_books.on_tick(self, decision, chain, now)
 
         # Phase 23 — the break-even hurdle shadow. It runs AFTER the auto-trader
         # has decided, records this BUY opportunity with the measured book, and
@@ -2189,7 +2192,7 @@ class AppState:
                         self.sell(confirm=False)
                         self._auto_last_action = (
                             f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · PROFIT LOCK "
-                            f"(day ₹{equity:,.0f} fell under ₹{settings.daily_profit_target:,.0f})"
+                            f"(day ₹{equity:,.0f} fell to the lock ₹{acct.lock_level() or 0:,.0f})"
                         )
                         self._auto_last_action_ts = now
                         self._reset_auto_trade_marks()
