@@ -1764,12 +1764,21 @@ class AppState:
 
         # selected option chart series
         sel_symbol = self.position.option_symbol or decision.recommended_option
-        sel_candles = self.provider.option_candles(sel_symbol) if sel_symbol else []
+        # Nothing recommended (WAIT/AVOID): follow the ATM option on the bias
+        # side so the option price, its day H/L and chart are never blank.
+        atm = self._atm_pair(chain, price)
+        disp_symbol, disp_premium = None, None
+        if not sel_symbol:
+            bear = (decision.htf_trend or "").upper() in ("DOWN", "BEARISH")
+            side = "pe" if bear else "ce"
+            disp_symbol, disp_premium = atm[f"atm_{side}_symbol"], atm[f"atm_{side}_premium"]
+        chart_symbol = sel_symbol or disp_symbol
+        sel_candles = self.provider.option_candles(chart_symbol) if chart_symbol else []
 
         # Official exchange day OHLC (matches the broker app). Falls back to
         # None on feeds that can't supply it; the UI then derives from candles.
         fut_ohlc = self.provider.day_ohlc()
-        opt_ohlc = self.provider.day_ohlc(sel_symbol) if sel_symbol else None
+        opt_ohlc = self.provider.day_ohlc(chart_symbol) if chart_symbol else None
         # Day change is measured against the PREVIOUS SESSION CLOSE (like the
         # broker) when available, not the previous 1-min bar.
         prev = candles[-2].close if len(candles) > 1 else price
@@ -1862,7 +1871,9 @@ class AppState:
             futures_prev_close=fut_ohlc.get("prev_close") if fut_ohlc else None,
             option_day_high=opt_ohlc.get("high") if opt_ohlc else None,
             option_day_low=opt_ohlc.get("low") if opt_ohlc else None,
-            **self._atm_pair(chain, price),
+            **atm,
+            display_option_symbol=disp_symbol,
+            display_option_premium=disp_premium,
             market_open=is_open,
             session_note=session_note,
             data_source=settings.data_provider,

@@ -827,6 +827,8 @@ export interface Snapshot {
   atm_ce_premium?: number | null;
   atm_pe_symbol?: string | null;
   atm_pe_premium?: number | null;
+  display_option_symbol?: string | null;
+  display_option_premium?: number | null;
   market_open: boolean;
   session_note: string | null;
   data_source: string;

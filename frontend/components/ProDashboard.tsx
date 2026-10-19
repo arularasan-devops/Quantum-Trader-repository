@@ -381,7 +381,7 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
   const liveP = d.current_premium ?? null;
   // today's high/low of the option premium — prefer the broker's OFFICIAL day
   // H/L (matches the broker app); fall back to candles+live price otherwise.
-  const premFallback = premiumHiLoToday(snap.selected_option_candles, liveP);
+  const premFallback = premiumHiLoToday(snap.selected_option_candles, liveP ?? snap.display_option_premium ?? null);
   const premHi = snap.option_day_high ?? premFallback.high;
   const premLo = snap.option_day_low ?? premFallback.low;
   // No-live-data guard (display-only): a BUY with no valid live option premium
@@ -583,18 +583,14 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
                 />{" "}
                 <span style={{ color: feed.color }}>{feed.label}</span>
               </span>
-              {d.current_premium == null && (snap.atm_ce_premium != null || snap.atm_pe_premium != null) ? (
-                <>
-                  <span className="text-[11px] uppercase tracking-wide text-white/40" title="No option recommended right now — live at-the-money prices">ATM</span>
-                  <span className="text-xl font-black tabular-nums" style={{ color: GREEN }} title={snap.atm_ce_symbol ?? ""}>CE {inr(snap.atm_ce_premium, 2)}</span>
-                  <span className="text-xl font-black tabular-nums" style={{ color: RED }} title={snap.atm_pe_symbol ?? ""}>PE {inr(snap.atm_pe_premium, 2)}</span>
-                </>
-              ) : (
-                <>
-                  <span className="text-[11px] uppercase tracking-wide text-white/40">Option LTP</span>
-                  <span className="text-2xl font-black tabular-nums" style={{ color: AMBER }}>{inr(d.current_premium, 2)}</span>
-                </>
-              )}
+              <span className="text-[11px] uppercase tracking-wide text-white/40">Option LTP</span>
+              <span
+                className="text-2xl font-black tabular-nums"
+                style={{ color: AMBER }}
+                title={d.current_premium == null ? `${snap.display_option_symbol ?? ""} (ATM, no recommendation)` : d.recommended_option ?? ""}
+              >
+                {inr(d.current_premium ?? snap.display_option_premium, 2)}
+              </span>
               <span className="flex items-center gap-2 pl-3 ml-1 border-l border-white/10">
                 <span className="text-[10px] uppercase tracking-wide text-white/40">Day</span>
                 <span className="text-sm font-black tabular-nums" style={{ color: GREEN }} title="Today's premium high">

@@ -1258,6 +1258,8 @@ class Snapshot(BaseModel):
     atm_ce_premium: float | None = None
     atm_pe_symbol: str | None = None
     atm_pe_premium: float | None = None
+    display_option_symbol: str | None = None
+    display_option_premium: float | None = None
     market_open: bool = True
     session_note: str | None = None
     data_source: str = "simulated"
