@@ -1252,6 +1252,12 @@ class Snapshot(BaseModel):
     futures_prev_close: float | None = None
     option_day_high: float | None = None
     option_day_low: float | None = None
+    # Live ATM CE/PE quotes, shown when no option is recommended (WAIT/AVOID)
+    # so the option price panel is never blank while the chain is live.
+    atm_ce_symbol: str | None = None
+    atm_ce_premium: float | None = None
+    atm_pe_symbol: str | None = None
+    atm_pe_premium: float | None = None
     market_open: bool = True
     session_note: str | None = None
     data_source: str = "simulated"

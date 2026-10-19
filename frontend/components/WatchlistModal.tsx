@@ -101,7 +101,12 @@ export default function WatchlistModal({ onClose }: { onClose: () => void }) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
       {/* Flex column with its own scroll region: the header and the Save button
           stay on screen while 60+ instrument rows scroll between them. */}
-      <div className="card w-full max-w-2xl max-h-[88vh] flex flex-col overflow-y-auto overscroll-contain">
+      {/* .card sets overflow:hidden after Tailwind's utilities, which silently
+          beat overflow-y-auto: the inline styles are what make it scroll. */}
+      <div
+        className="card w-full max-w-2xl max-h-[88vh] flex flex-col overscroll-contain"
+        style={{ overflowY: "auto" }}
+      >
         <div className="p-5 pb-3 shrink-0">
           <div className="flex items-center justify-between mb-1">
             <div className="text-lg font-bold">Watchlist</div>
@@ -268,7 +273,7 @@ export default function WatchlistModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
 
-        <div className="card-scroll flex-1 min-h-[240px] px-5">
+        <div className="flex-1 min-h-[240px] px-5 overscroll-contain" style={{ overflowY: "auto" }}>
           {!loaded ? (
             <div className="text-white/40 text-sm">Loading…</div>
           ) : (

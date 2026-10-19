@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import math
 import logging
 import os
 import threading
@@ -22,7 +23,7 @@ from collections.abc import Callable
 
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 
 from app.analysis import signal_visibility
@@ -161,6 +162,35 @@ def _mark_feed_stage(instrument: str, stage: str) -> None:
 
 
 _WS_SEND_TIMEOUT = 1.5  # seconds a single client may hold a broadcast
+_nan_logged: set[str] = set()
+
+
+def _finite(obj, path: str, bad: list[str]):
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        bad.append(path)
+        return None
+    if isinstance(obj, dict):
+        return {k: _finite(v, f"{path}.{k}", bad) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_finite(v, f"{path}[]", bad) for v in obj]
+    return obj
+
+
+def _json_text(payload: dict, inst: str = "") -> str:
+    """Strict JSON for the browser. NaN/Infinity are not JSON: the browser's
+    JSON.parse rejected the whole frame and that instrument's LTP stayed blank.
+    Non-finite numbers are sent as null (logged once per instrument)."""
+    try:
+        return json.dumps(payload, allow_nan=False, separators=(",", ":"))
+    except ValueError:
+        bad: list[str] = []
+        clean = _finite(payload, inst or "snapshot", bad)
+        if inst not in _nan_logged:
+            _nan_logged.add(inst)
+            _log.warning("non-finite numbers sent as null for %s: %s", inst, ", ".join(bad[:10]))
+        return json.dumps(clean, allow_nan=False, separators=(",", ":"))
 
 class Hub:
     # How many screener-only (unwatched) instruments to refresh per background
@@ -348,6 +378,7 @@ class Hub:
         self._ticked_at[inst] = time.monotonic()
         self.latest[inst] = snapshot
         payload = snapshot.model_dump(mode="json")
+        text = _json_text(payload, inst)
         dead = []
         for ws, sub in list(self.clients.items()):
             if sub != inst:
@@ -356,7 +387,7 @@ class Hub:
             # back: a send that cannot complete promptly drops that client,
             # whose own watchdog then reconnects it.
             try:
-                await asyncio.wait_for(ws.send_json(payload), timeout=_WS_SEND_TIMEOUT)
+                await asyncio.wait_for(ws.send_text(text), timeout=_WS_SEND_TIMEOUT)
             except Exception:
                 dead.append(ws)
                 self.ws_send_drops += 1
@@ -1085,7 +1116,7 @@ async def db_status() -> dict:
 
 
 @app.get("/api/snapshot")
-async def snapshot(instrument: str | None = None) -> dict:
+async def snapshot(instrument: str | None = None) -> Response:
     # Prefer the snapshot the background loop already produced for THIS
     # instrument. Only build one on demand when none exists yet, and do it OFF
     # the event loop — state.tick makes blocking broker calls, so running it
@@ -1105,7 +1136,8 @@ async def snapshot(instrument: str | None = None) -> dict:
     # point at which a signal actually reaches a client. Recorded once per
     # signal, and it cannot affect the response.
     signal_visibility.mark_user_visible(st.instrument, snap.decision)
-    return snap.model_dump(mode="json")
+    return Response(_json_text(snap.model_dump(mode="json"), st.instrument),
+                    media_type="application/json")
 
 
 @app.post("/api/buy")
@@ -4091,7 +4123,7 @@ async def ws(websocket: WebSocket, instrument: str | None = None) -> None:
     hub.clients[websocket] = st.instrument
     seed = hub.latest.get(st.instrument)
     if seed is not None:
-        await websocket.send_json(seed.model_dump(mode="json"))
+        await websocket.send_text(_json_text(seed.model_dump(mode="json"), st.instrument))
     try:
         while True:
             await websocket.receive_text()

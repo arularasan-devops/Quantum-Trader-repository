@@ -326,6 +326,26 @@ class AppState:
         self._providers[instrument] = provider
         return provider
 
+    @staticmethod
+    def _atm_pair(chain, price) -> dict:
+        """Nearest-strike CE and PE quotes (symbol + premium) for the panel."""
+        out = {"atm_ce_symbol": None, "atm_ce_premium": None,
+               "atm_pe_symbol": None, "atm_pe_premium": None}
+        try:
+            strikes = {q.strike for q in chain or []}
+            if not strikes or not price:
+                return out
+            k = min(strikes, key=lambda s: abs(s - float(price)))
+            for q in chain:
+                if q.strike != k or not q.premium:
+                    continue
+                side = "ce" if q.option_type == OptionType.CALL else "pe"
+                out[f"atm_{side}_symbol"] = q.symbol
+                out[f"atm_{side}_premium"] = float(q.premium)
+        except Exception:
+            pass
+        return out
+
     def _own_bid(self) -> float | None:
         """Best bid of the open option (None without a two-sided quote)."""
         sym = self.position.option_symbol
@@ -1842,6 +1862,7 @@ class AppState:
             futures_prev_close=fut_ohlc.get("prev_close") if fut_ohlc else None,
             option_day_high=opt_ohlc.get("high") if opt_ohlc else None,
             option_day_low=opt_ohlc.get("low") if opt_ohlc else None,
+            **self._atm_pair(chain, price),
             market_open=is_open,
             session_note=session_note,
             data_source=settings.data_provider,

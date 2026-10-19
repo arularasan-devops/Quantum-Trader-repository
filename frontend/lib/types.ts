@@ -823,6 +823,10 @@ export interface Snapshot {
   futures_prev_close: number | null;
   option_day_high: number | null;
   option_day_low: number | null;
+  atm_ce_symbol?: string | null;
+  atm_ce_premium?: number | null;
+  atm_pe_symbol?: string | null;
+  atm_pe_premium?: number | null;
   market_open: boolean;
   session_note: string | null;
   data_source: string;
