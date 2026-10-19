@@ -857,7 +857,9 @@ def _refresh_universe(force: bool = False) -> dict | None:
 # read off the screen instead of guessed at. Angel rate-limits the historical
 # candle API, so this is genuinely slow on a big universe and a cold instrument
 # is indistinguishable from a dead one until it lands.
-_warm_state: dict[str, int] = {"total": 0, "done": 0}
+_warm_state: dict = {"total": 0, "done": 0, "failed": {}, "retries": 0}
+_WARM_RETRY_SEC = 60.0
+_WARM_RETRY_MAX = 15
 
 
 async def _warm_all() -> None:
@@ -873,8 +875,17 @@ async def _warm_all() -> None:
         async with sem:
             try:
                 await loop.run_in_executor(None, registry.get, sym)
-            except Exception:
-                pass
+                _warm_state["failed"].pop(sym, None)
+            except Exception as exc:
+                # A failed warm-up used to be dropped silently, leaving the
+                # instrument with no LTP until the next restart. Remember why
+                # and retry it below.
+                why = str(exc)[:200]
+                with contextlib.suppress(Exception):
+                    from app.market.angelone import _redact_secrets
+                    why = _redact_secrets(why)
+                _warm_state["failed"][sym] = why
+                _log.warning("warm-up failed for %s (will retry): %s", sym, why)
             finally:
                 _warm_state["done"] += 1
 
@@ -900,6 +911,14 @@ async def _warm_all() -> None:
     await asyncio.gather(*[_one(sym) for sym in ordered], return_exceptions=True)
     _warm_state["done"] = _warm_state["total"]
     _log.info("warm-up finished: %d instrument(s) in %.0fs", len(ordered), time.monotonic() - began)
+    for attempt in range(1, _WARM_RETRY_MAX + 1):
+        failed = [s for s in list(_warm_state["failed"]) if s in UNIVERSE]
+        if not failed:
+            break
+        await asyncio.sleep(_WARM_RETRY_SEC)
+        _warm_state["retries"] = attempt
+        _log.info("warm-up retry %d for %d instrument(s): %s", attempt, len(failed), ", ".join(failed))
+        await asyncio.gather(*[_one(sym) for sym in failed], return_exceptions=True)
 
 
 async def _refresh_intelligence() -> None:
@@ -3708,7 +3727,20 @@ async def feed_health() -> dict:
         )
     except Exception as exc:
         return {"provider": provider_name, "angel_active": False, "error": str(exc)[:200]}
-    return {"provider": provider_name, "angel_active": True, **health, "hub": _hub_counters()}
+    return {"provider": provider_name, "angel_active": True, **health, "hub": _hub_counters(),
+            "warm_up": _warm_report()}
+
+
+def _warm_report() -> dict:
+    """Which active instruments have no price yet, and why (start-up warm-up)."""
+    from app.market.instruments import UNIVERSE
+
+    return {
+        "total": _warm_state["total"], "done": _warm_state["done"],
+        "retries": _warm_state["retries"],
+        "failed": dict(_warm_state["failed"]),
+        "no_price_yet": sorted(s for s in UNIVERSE if s not in hub.latest),
+    }
 
 
 def _hub_counters() -> dict:
