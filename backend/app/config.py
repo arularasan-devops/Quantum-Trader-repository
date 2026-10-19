@@ -1007,6 +1007,10 @@ class Settings(BaseSettings):
     option_rest_backfill_sec: float = 10.0
     # Account-wide cap on those polls (calls per second, shared by all instruments).
     option_rest_backfill_per_sec: float = 1.0
+    # Open PAPER positions are saved every N s and restored after a restart if
+    # younger than the max age (so a deploy mid-trade no longer drops the trade).
+    paper_position_save_sec: float = 2.0
+    paper_position_restore_max_age_sec: float = 43200.0
     days_to_expiry: float = 7.0
 
     # --- Brokerage (for net P&L) ---

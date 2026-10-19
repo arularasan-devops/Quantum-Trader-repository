@@ -210,8 +210,18 @@ def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
         sid = _session(st, now)
         mode = _mode(st)
         d = st._last_decision
-        existing = getattr(st, "_jr_trade_id", None) or store().find_open_trade(
-            st.instrument, q.symbol, mode, now - 86400)
+        existing = getattr(st, "_jr_trade_id", None)
+        if not existing:
+            # Reuse an OPEN row only when it is this same position (same fill and
+            # size); any other OPEN row for the contract lost its position (e.g. a
+            # restart before positions were saved) and is closed, not merged.
+            for row in store().open_trade_rows(st.instrument, q.symbol, mode, now - 86400):
+                same = (abs(float(row.get("entry_price") or 0) - float(entry)) < 0.01
+                        and int(row.get("lots") or 0) == int(lots))
+                if same and not existing:
+                    existing = row["trade_id"]
+                else:
+                    store().abandon_trade(row["trade_id"], now, "LOST ON RESTART")
         if existing:
             st._jr_trade_id = existing  # same position recorded again: no duplicate row
             return

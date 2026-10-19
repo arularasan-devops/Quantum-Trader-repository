@@ -8,6 +8,7 @@ scaling out (see DEPLOYMENT.md).
 """
 from __future__ import annotations
 
+import logging
 import contextlib
 import time
 from datetime import datetime, timezone
@@ -43,6 +44,7 @@ from app.engine import backtest as bt
 from app.engine import decision as eng
 from app.engine import learning as learn
 from app.engine import paper_books
+from app.engine import paper_positions
 from app.engine import recovery as rec_eng
 from app.engine import risk_v2
 from app.engine import weights
@@ -122,6 +124,8 @@ def _mark_stage(instrument: str, stage: str) -> None:
     except Exception:
         pass
 
+
+_log = logging.getLogger(__name__)
 
 class _UnavailableProvider(MarketDataProvider):
     """Stand-in used when a real provider cannot be constructed for an
@@ -309,6 +313,9 @@ class AppState:
         self._persist_error: str | None = None
         self._last_order_poll = 0.0
         self._restore_live_ledger()
+        self._paper_pos_saved_at = 0.0
+        self._paper_pos_saved = False
+        self._restore_paper_position()
 
     def _provider_for(self, instrument: str) -> MarketDataProvider:
         cached = self._providers.get(instrument)
@@ -680,6 +687,7 @@ class AppState:
         mode = "LIVE" if self.is_live else "paper"
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
         journal_hooks.on_entry(self, q, lots, entry, manual)
+        self._paper_pos_saved_at = 0.0
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
                            lots=lots, fill_premium=entry, order_id=order_id, message="Entered",
                            status="FILLED", filled_lots=lots)
@@ -986,6 +994,69 @@ class AppState:
             return (f"Order persistence failed ({self._persist_error}) — new live entries "
                     "blocked.")
         return None
+
+    _PAPER_SAVE_FIELDS = (
+        "_entry_time", "_entry_factors", "_entry_context", "_entry_book",
+        "_auto_last_key", "_auto_target1", "_auto_target2", "_auto_target3",
+        "_auto_stop", "_auto_tgt_floor", "_auto_scaled_out", "_auto_peak",
+        "_auto_entry_prem", "_auto_entry_active", "_auto_entry_strike",
+        "_auto_entry_conf", "_auto_entry_lots", "_z2h_is_sleeve", "_jr_trade_id",
+    )
+
+    def _save_paper_position(self, now: float) -> None:
+        """Keep the open PAPER position in the database so a restart resumes it
+        (exits keep running) instead of silently dropping the trade."""
+        if self.is_live or settings.trade_mode.lower() != "paper":
+            return
+        try:
+            if self.position.option_symbol and self.position.quantity_lots > 0:
+                if now - self._paper_pos_saved_at < settings.paper_position_save_sec:
+                    return
+                payload = {"position": self.position.model_dump(),
+                           "jr_levels": list(getattr(self, "_jr_levels", (None, None)))}
+                for f in self._PAPER_SAVE_FIELDS:
+                    payload[f] = getattr(self, f, None)
+                paper_positions.save(self._instrument, payload)
+                self._paper_pos_saved_at = now
+                self._paper_pos_saved = True
+            elif self._paper_pos_saved:
+                paper_positions.clear(self._instrument)
+                self._paper_pos_saved = False
+        except Exception:
+            _log.warning("could not save the open paper position for %s",
+                         self._instrument, exc_info=True)
+
+    def _restore_paper_position(self) -> None:
+        if settings.trade_mode.lower() != "paper":
+            return
+        try:
+            saved = paper_positions.load(self._instrument)
+            if not saved:
+                return
+            ts, payload = saved
+            pos = payload.get("position") or {}
+            if (time.time() - ts > settings.paper_position_restore_max_age_sec
+                    or not pos.get("option_symbol") or not pos.get("quantity_lots")):
+                paper_positions.clear(self._instrument)
+                return
+            self.position = Position(**pos)
+            for f in self._PAPER_SAVE_FIELDS:
+                if f in payload:
+                    setattr(self, f, payload[f])
+            if payload.get("jr_levels"):
+                self._jr_levels = tuple(payload["jr_levels"])
+            self._entry_context = dict(self._entry_context or {})
+            self._entry_factors = list(self._entry_factors or [])
+            self._paper_pos_saved = True
+            self._paper_pos_saved_at = time.time()
+            self._add_alert(
+                "POSITION_RESTORED",
+                f"[paper] Restored open {self.position.option_symbol} "
+                f"x{self.position.quantity_lots} @ {self.position.entry_premium} after restart",
+                "info")
+        except Exception:
+            _log.warning("could not restore the paper position for %s",
+                         self._instrument, exc_info=True)
 
     def _restore_live_ledger(self) -> None:
         """After a restart, saved live state is a CLAIM, not the broker's truth:
@@ -1338,6 +1409,7 @@ class AppState:
             self.position.quantity_lots = held - lots
             self._auto_entry_lots = max(0, self._auto_entry_lots - lots)
             self._ledger_after_exit(held - lots)
+            self._paper_pos_saved_at = 0.0
             self._add_alert(
                 "EXIT_NOW",
                 f"[{mode}] Scaled out {lots}/{held} {sym} net {pnl:+.0f}",
@@ -1353,6 +1425,8 @@ class AppState:
         self.position = Position()
         self._entry_time = None
         self._ledger_after_exit(0)
+        self._paper_pos_saved_at = 0.0
+        self._save_paper_position(time.time())
         return OrderResult(ok=True, mode=mode.lower(), side="SELL", option_symbol=sym,
                            lots=lots, fill_premium=exit_prem, order_id=order_id,
                            message=f"Exited net {pnl:+.0f}")
@@ -1379,6 +1453,7 @@ class AppState:
         provider_note = self.provider.reason if isinstance(self.provider, _UnavailableProvider) else None
         self.provider.step()
         self._poll_live_orders()
+        self._save_paper_position(time.time())
         _mark_stage(self._instrument, "cache")
         now = int(time.time())
         candles = self.provider.futures_candles(300)

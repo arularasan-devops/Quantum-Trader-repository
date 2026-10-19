@@ -329,6 +329,22 @@ class JournalStore:
             (instrument, option_symbol, mode, since_ts))
         return row["trade_id"] if row else None
 
+    def open_trade_rows(self, instrument: str, option_symbol: str | None,
+                        mode: str, since_ts: float) -> list[dict]:
+        return self.db.query(
+            "SELECT trade_id, entry_price, lots FROM jr_trades WHERE instrument = ? "
+            "AND option_symbol = ? AND mode = ? AND status = 'OPEN' AND entry_ts >= ? "
+            "ORDER BY entry_ts DESC",
+            (instrument, option_symbol, mode, since_ts))
+
+    def abandon_trade(self, trade_id: str, ts: float, reason: str) -> None:
+        """Close an OPEN row whose position no longer exists. No P&L is booked:
+        the exit price was never observed."""
+        self.db.execute(
+            "UPDATE jr_trades SET status = 'CLOSED', exit_ts = ?, exit_ts_iso = ?, "
+            "exit_reason = ? WHERE trade_id = ? AND status = 'OPEN'",
+            (float(ts), iso(ts), reason, trade_id))
+
     def record_trade_event(self, row: dict) -> str:
         _require(row, "trade_id", "instrument", "ts", "kind")
         if row["kind"] not in EVENT_KINDS:
