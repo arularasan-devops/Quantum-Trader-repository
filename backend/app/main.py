@@ -1959,6 +1959,25 @@ async def paper_books_summary() -> dict:
     return paper_books.books().summary()
 
 
+@app.get("/api/paper-books/trades.csv")
+async def paper_books_trades_csv(book: str | None = None, status: str | None = None,
+                                 since: float | None = None,
+                                 until: float | None = None) -> PlainTextResponse:
+    import csv
+    import io
+
+    from app.engine import paper_books
+    rows = paper_books.books().trades(book, status, 1, 0, since, until)["rows"]
+    buf = io.StringIO()
+    cols = list(rows[0].keys()) if rows else ["trade_id", "book", "instrument"]
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="paper_books_trades.csv"'})
+
+
 @app.get("/api/paper-books/trades")
 async def paper_books_trades(book: str | None = None, status: str | None = None,
                              page: int = Query(1, ge=1),
@@ -3634,8 +3653,29 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
     }
 
 
+def _row_epoch(ts) -> float | None:
+    """A journal row's time as epoch seconds (stored as a number or ISO text)."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        import datetime as _dt
+        d = _dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
+        return d.timestamp()
+    except Exception:
+        return None
+
+
+def _in_range(t: float | None, since: float | None, until: float | None) -> bool:
+    if t is None:
+        return False
+    return (since is None or t >= since) and (until is None or t < until)
+
+
 @app.get("/api/trade-journal.csv")
-async def trade_journal_csv(limit: int = 5000, book: str = "all"):
+async def trade_journal_csv(limit: int = 5000, book: str = "all",
+                            since: float | None = None, until: float | None = None):
     """Download the complete trade journal as CSV (spreadsheet-friendly).
     Read-only; same data as /api/journal."""
     import csv
@@ -3680,6 +3720,8 @@ async def trade_journal_csv(limit: int = 5000, book: str = "all"):
             "book", "cost_model", "brokerage", "brokerage_per_order", "statutory",
             "cost_status", "entry_bid", "entry_ask", "exit_bid", "exit_ask",
             "spread_cost_rupees"]
+    if since is not None or until is not None:
+        rows = [r for r in rows if _in_range(_row_epoch(r.get("ts")), since, until)]
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     w.writeheader()

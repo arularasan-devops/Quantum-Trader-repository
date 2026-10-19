@@ -427,8 +427,15 @@ class PaperBooks:
                     "books": out, "last_skip": dict(self.last_skip)}
 
     def trades(self, book: str | None = None, status: str | None = None,
-               page: int = 1, page_size: int = 50) -> dict:
+               page: int = 1, page_size: int = 50, since: float | None = None,
+               until: float | None = None) -> dict:
         where, args = [], []
+        if since is not None:
+            where.append("entry_ts >= ?")
+            args.append(float(since))
+        if until is not None:
+            where.append("entry_ts < ?")
+            args.append(float(until))
         if book:
             where.append("book = ?")
             args.append(book)
@@ -437,6 +444,9 @@ class PaperBooks:
             args.append(status.upper())
         w = (" WHERE " + " AND ".join(where)) if where else ""
         total = self.db.query_one(f"SELECT COUNT(*) AS n FROM jr_book_trades{w}", tuple(args))
+        if page_size <= 0:  # export: every matching row, oldest first
+            rows = self.db.query(f"SELECT * FROM jr_book_trades{w} ORDER BY entry_ts ASC", tuple(args))
+            return {"total": len(rows), "page": 1, "rows": rows}
         rows = self.db.query(
             f"SELECT * FROM jr_book_trades{w} ORDER BY entry_ts DESC LIMIT ? OFFSET ?",
             tuple(args) + (page_size, (page - 1) * page_size))

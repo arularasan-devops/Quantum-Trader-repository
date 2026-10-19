@@ -1,4 +1,5 @@
 "use client";
+import DateRangeDownload from "./DateRangeDownload";
 
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { API_BASE } from "@/lib/api";
@@ -145,14 +146,7 @@ export default function ReportsBoard() {
             Auto-entry gate: PULLBACK in TRENDING at ≥80% confidence (PAPER).
           </span>
         </div>
-        <a
-          href={`${API_BASE}/api/journal/v2/signals.csv?${query}`}
-          target="_blank"
-          rel="noreferrer"
-          className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-white/15 hover:bg-white/5"
-        >
-          Download CSV
-        </a>
+        <DateRangeDownload href={`${API_BASE}/api/journal/v2/signals.csv?${query}`} label="Download CSV" />
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-6 gap-3 shrink-0">

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import DateRangeDownload from "./DateRangeDownload";
 import { API_BASE } from "@/lib/api";
 
 type OpenPos = { instrument: string; option: string; lots: number; entry: number; mark: number | null; stop: number; floor: number | null; unrealized: number };
@@ -108,6 +109,9 @@ export default function PaperBooksBoard() {
             {(sum?.books || []).map((b) => <option key={b.book} value={b.book}>{b.book}</option>)}
           </select>
           <span className="text-xs text-white/50">{total} trades</span>
+          <span className="ml-auto">
+            <DateRangeDownload href={`${API_BASE}/api/paper-books/trades.csv${book ? `?book=${encodeURIComponent(book)}` : ""}`} />
+          </span>
         </div>
         <div className="mt-2 max-h-[60vh] overflow-auto">
           <table className="w-full text-xs tabular-nums">

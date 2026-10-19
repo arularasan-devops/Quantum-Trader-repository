@@ -1,4 +1,5 @@
 "use client";
+import DateRangeDownload from "./DateRangeDownload";
 
 import { useEffect, useState } from "react";
 import { API_BASE } from "@/lib/api";
@@ -65,8 +66,9 @@ export default function BuySignalsPanel() {
         <span style={{ margin: "0 6px", fontSize: 12 }}>page {page}/{pages}</span>
         <button onClick={() => setPage((p) => Math.min(pages, p + 1))} disabled={page >= pages}
                 style={{ fontSize: 12 }}>Next</button>
-        <a href={`${API_BASE}/api/journal/v2/trades.csv`}
-           style={{ marginLeft: 12, fontSize: 12 }} target="_blank" rel="noreferrer">Trades CSV</a>
+        <span style={{ marginLeft: 12 }}>
+          <DateRangeDownload href={`${API_BASE}/api/journal/v2/trades.csv`} label="Trades CSV" />
+        </span>
       </h3>
       {error && <div style={{ color: "#ef4444", fontSize: 12 }}>Signals unavailable: {error}</div>}
       <div style={{ overflow: "auto", minHeight: 0, flex: 1 }}>

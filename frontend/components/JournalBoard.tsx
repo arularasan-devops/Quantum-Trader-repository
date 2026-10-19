@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import DateRangeDownload from "./DateRangeDownload";
 import {
   getTradeJournal,
   tradeJournalCsvUrl,
@@ -89,12 +90,10 @@ export default function JournalBoard() {
             </button>
           ))}
         </div>
-        <a
+        <DateRangeDownload
           href={tradeJournalCsvUrl(5000, book)}
-          className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-white/15 hover:bg-white/5"
-        >
-          ⬇ Download CSV{book === "all" ? "" : ` (${book})`}
-        </a>
+          label={`⬇ Download CSV${book === "all" ? "" : ` (${book})`}`}
+        />
       </div>
 
       <div className="grid grid-cols-4 lg:grid-cols-8 gap-3 shrink-0">
