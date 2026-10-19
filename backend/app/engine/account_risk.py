@@ -74,6 +74,29 @@ def day_lock_level(day_peak_equity: float) -> float | None:
         return max(tgt, day_peak_equity * min(keep, 100.0) / 100.0)
     return max(tgt, day_peak_equity - max(0.0, settings.daily_peak_giveback))
 
+def entry_loss_budget(day_peak_equity: float, equity: float, *,
+                      per_trade_cap: float | None = None) -> float | None:
+    """Most a NEW trade may lose at its stop: the per-trade rupee cap and, once
+    the day lock is armed, ``daily_lock_room_share_pct`` of the room above it.
+    None means unlimited."""
+    caps: list[float] = []
+    if per_trade_cap is not None and per_trade_cap > 0:
+        caps.append(per_trade_cap)
+    lvl = day_lock_level(day_peak_equity)
+    share = settings.daily_lock_room_share_pct
+    if lvl is not None and share > 0:
+        caps.append(max(0.0, equity - lvl) * min(share, 100.0) / 100.0)
+    return min(caps) if caps else None
+
+
+def lots_for_budget(budget: float, entry: float, stop: float, lot_size: int) -> int:
+    """Lots whose stop-out loss plus the slippage buffer fits ``budget``."""
+    per_unit = max(0.0, entry - stop) + entry * max(0.0, settings.auto_trade_slippage_buffer_pct) / 100.0
+    if per_unit <= 0 or lot_size <= 0 or budget <= 0:
+        return 0
+    return int(budget // (per_unit * lot_size))
+
+
 class AccountRisk:
     """Shared, disk-persisted daily risk state for the whole option book."""
 

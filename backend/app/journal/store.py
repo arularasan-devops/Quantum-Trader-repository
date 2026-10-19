@@ -183,6 +183,7 @@ SIGNAL_CSV_COLUMNS = [
     "reason", "strategy", "setup", "regime", "htf_trend", "confidence", "option_symbol",
     "quote_ltp", "bid", "ask", "expected_entry", "stop", "target1", "target2", "target3",
     "trade_id", "data_quality", "explanation", "strategy_version", "config_fingerprint",
+    "repeat_count", "last_seen_iso",
 ]
 SIGNAL_FILTERS = ("instrument", "mode", "outcome", "signal", "setup", "regime", "session_id")
 
@@ -197,7 +198,11 @@ TRADE_CSV_COLUMNS = [
 
 SIGNAL_OUTCOMES = ("EXECUTED", "SKIPPED", "REJECTED", "NOT_EXECUTABLE", "FAILED_CONDITIONS")
 EVENT_KINDS = ("ENTRY", "EXIT", "PARTIAL_EXIT", "STOP_CHANGE", "TARGET_LEVEL",
-               "EXECUTION_FAILURE")
+               "EXECUTION_FAILURE", "PRICE")
+# Additive columns (v3.5): a repeated identical BUY signal updates its first row.
+_ADD_COLUMNS = (("jr_signals", "repeat_count", "INTEGER"),
+                ("jr_signals", "last_seen_ts", "DOUBLE PRECISION"),
+                ("jr_signals", "last_seen_iso", "TEXT"))
 
 
 def stable_id(*parts: Any) -> str:
@@ -232,6 +237,14 @@ class JournalStore:
             "ON CONFLICT (version) DO NOTHING",
             (1, int(time.time()), "jr_sessions/signals/trades/trade_events/sizing_decisions"),
         )
+        for table, col, typ in _ADD_COLUMNS:
+            try:
+                if self.db.is_postgres:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
+                else:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            except Exception:  # sqlite: column already exists
+                pass
 
     @property
     def backend(self) -> str:
@@ -280,8 +293,18 @@ class JournalStore:
                 "config_fingerprint", "data_quality", "explanation"]
         data = {"event_id": eid, "ts": float(row["ts"]), "ts_iso": iso(row["ts"])}
         data.update({c: row.get(c) for c in cols})
+        data["repeat_count"] = 1
+        data["last_seen_ts"] = data["ts"]
+        data["last_seen_iso"] = data["ts_iso"]
         self._insert("jr_signals", "event_id", data)
         return eid
+
+    def touch_signal(self, event_id: str, ts: float) -> None:
+        """The same BUY signal fired again with the same outcome and reason."""
+        self.db.execute(
+            "UPDATE jr_signals SET repeat_count = COALESCE(repeat_count, 1) + 1, "
+            "last_seen_ts = ?, last_seen_iso = ? WHERE event_id = ?",
+            (float(ts), iso(ts), event_id))
 
     def open_trade(self, row: dict) -> str:
         _require(row, "trade_id", "instrument", "mode", "entry_ts")
@@ -436,7 +459,13 @@ class JournalStore:
             (trade_id,))
         signals = self.db.query(
             "SELECT * FROM jr_signals WHERE trade_id = ? ORDER BY ts ASC", (trade_id,))
-        return {"trade": trade, "events": events, "sizing": sizing, "signals": signals}
+        path = [{"ts": e["ts"], "ltp": e["price"],
+                 "bid": (e.get("detail") or {}).get("bid") if isinstance(e.get("detail"), dict) else None,
+                 "ask": (e.get("detail") or {}).get("ask") if isinstance(e.get("detail"), dict) else None}
+                for e in events if e["kind"] == "PRICE"]
+        events = [e for e in events if e["kind"] != "PRICE"]
+        return {"trade": trade, "events": events, "sizing": sizing, "signals": signals,
+                "path": path}
 
     def list_sessions(self, filters: dict | None = None, page: int = 1,
                       page_size: int = 50) -> dict:

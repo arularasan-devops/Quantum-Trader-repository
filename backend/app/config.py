@@ -658,7 +658,7 @@ class Settings(BaseSettings):
     # Daily profit GOAL (₹). When day P&L >= this, the bot stops opening NEW trades
     # for the day (locks the gain). 0 = disabled. This is a stop-FOR-the-day, NOT a
     # guaranteed minimum — losing days are normal and cannot be ruled out.
-    daily_profit_target: float = 10000.0
+    daily_profit_target: float = 30000.0
     # Profit lock: once the day's equity (realized + open MTM) reaches the target,
     # the lock = day peak - this giveback (never below the target). Falling under
     # it stops auto-buy for the day. 0 = lock at the exact peak.
@@ -667,6 +667,20 @@ class Settings(BaseSettings):
     # (75: peak 20k -> lock 15k, peak 40k -> 30k; never below the target).
     # 0 = use daily_peak_giveback instead.
     daily_lock_keep_pct: float = 75.0
+    # Once the lock is armed a new trade's stop-out (+ slippage buffer) may use at
+    # most this % of the room between equity and the lock, so one trade cannot
+    # take the day through the lock.
+    daily_lock_room_share_pct: float = 50.0
+    # PAPER: most a single auto trade may lose at its stop (lots are cut to fit;
+    # 0 disables). Paper books keep their own FULL/RISK sizing.
+    auto_trade_max_loss_rupees: float = 10000.0
+    # Slippage buffer per unit (% of entry) added to the stop distance when sizing.
+    auto_trade_slippage_buffer_pct: float = 1.0
+    # PAPER: exits (stop, trails, targets, profit lock) are judged on the bid,
+    # the price a sell actually fills at, so a T1 exit fills at T1 or better.
+    auto_trade_exit_on_bid: bool = True
+    # Seconds between recorded bid/ask/LTP samples of an open trade (0 = off).
+    trade_path_record_sec: float = 5.0
     # Equity falling to the lock closes open auto positions (paper exits at the
     # bid) and stops new auto-buys for the day.
     profit_lock_flatten: bool = True

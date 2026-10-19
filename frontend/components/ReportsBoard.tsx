@@ -28,6 +28,8 @@ type SignalRow = {
   target3: number | null;
   trade_id: string | null;
   explanation: string | null;
+  repeat_count?: number | null;
+  last_seen_iso?: string | null;
 };
 
 type Summary = {
@@ -264,7 +266,14 @@ export default function ReportsBoard() {
                     <td className="pr-2 font-semibold" style={{ color: OUTCOME_COLOR[s.outcome] ?? "inherit" }}>
                       {s.outcome}
                     </td>
-                    <td className="pr-2">{s.reason ?? ""}</td>
+                    <td className="pr-2">
+                      {s.reason ?? ""}
+                      {(s.repeat_count ?? 1) > 1 && (
+                        <span className="ml-1 text-xs text-white/50" title={`last seen ${s.last_seen_iso ?? ""}`}>
+                          ×{s.repeat_count} · last {(s.last_seen_iso ?? "").slice(11, 16)}
+                        </span>
+                      )}
+                    </td>
                     <td className="uppercase">{s.mode ?? "—"}</td>
                   </tr>
                   {open === s.event_id && (

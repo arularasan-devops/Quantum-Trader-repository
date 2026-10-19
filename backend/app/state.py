@@ -326,6 +326,30 @@ class AppState:
         self._providers[instrument] = provider
         return provider
 
+    def _own_bid(self) -> float | None:
+        """Best bid of the open option (None without a two-sided quote)."""
+        sym = self.position.option_symbol
+        if not sym:
+            return None
+        try:
+            q = next((x for x in self.provider.option_chain() if x.symbol == sym), None)
+        except Exception:
+            return None
+        if q is None or not q.bid or not q.ask or not (0 < q.bid <= q.ask):
+            return None
+        return float(q.bid)
+
+    def _liq_pnl(self) -> float:
+        """Open P&L valued at the bid (what closing now pays) in PAPER."""
+        p = self.position
+        pnl = float(p.net_pnl or 0.0)
+        if self.is_live or not settings.auto_trade_exit_on_bid or not p.option_symbol:
+            return pnl
+        bid, mark = self._own_bid(), p.current_premium
+        if bid is not None and mark is not None and bid < mark:
+            pnl -= (mark - bid) * get_spec(self._instrument).lot_size * p.quantity_lots
+        return pnl
+
     def _feed_ready(self) -> bool:
         """Whether the prices behind the current plan are current enough to act on.
 
@@ -2180,12 +2204,15 @@ class AppState:
             prem = p.current_premium
             if prem is None:
                 return
+            if not live and settings.auto_trade_exit_on_bid:
+                bid = self._own_bid()
+                if bid is not None:
+                    prem = bid  # judge every exit on the price a sell fills at
             if not live and self._auto_entry_prem is not None:
                 with contextlib.suppress(Exception):
                     acct = account_risk.account
                     equity = acct.day_pnl + sum(
-                        float(o.position.net_pnl or 0.0)
-                        for o in registry.active() if o.position.option_symbol
+                        o._liq_pnl() for o in registry.active() if o.position.option_symbol
                     )
                     if acct.must_flatten(equity):
                         self._pending_exit_reason = "PROFIT LOCK"
@@ -2740,7 +2767,7 @@ class AppState:
         # trade cap, loss streak, max concurrent and the manual kill switch.
         with contextlib.suppress(Exception):
             account_risk.account.note_equity(
-                now, sum(float(o.position.net_pnl or 0.0) for o in registry.active()
+                now, sum(o._liq_pnl() for o in registry.active()
                          if o.position.option_symbol))
         can, _reason = self.risk.can_open(time.time())
         if can and live and live_control.kill_switch_engaged():
@@ -2902,6 +2929,45 @@ class AppState:
                 lots = affordable
             elif affordable < lots:
                 lots = affordable
+
+        # LOSS BUDGET (paper): the stop-out of this trade may not exceed the
+        # per-trade rupee cap, nor (once the day lock is armed) its share of the
+        # room above the lock — a single trade can't give back the locked day.
+        if not live and lots >= 1 and decision.stop_loss is not None:
+            acct = account_risk.account
+            equity = acct.day_pnl + sum(
+                o._liq_pnl() for o in registry.active() if o.position.option_symbol)
+            budget = account_risk.entry_loss_budget(
+                acct.day_peak_equity, equity,
+                per_trade_cap=settings.auto_trade_max_loss_rupees)
+            entry_est = float(decision.current_premium or 0.0)
+            stop_est = float(decision.stop_loss)
+            stop_pts = settings.auto_trade_stop_points.get(self._instrument)
+            if stop_pts and stop_pts > 0:
+                stop_est = entry_est - float(stop_pts)
+            elif settings.auto_trade_max_stop_pct > 0:
+                stop_est = max(stop_est, entry_est * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
+            if budget is not None and entry_est > 0:
+                fit = account_risk.lots_for_budget(budget, entry_est, stop_est, lot_size)
+                if fit < 1:
+                    self._auto_last_action = (
+                        f"AUTO SKIP {decision.recommended_option}: 1 lot risks more than "
+                        f"the loss budget ₹{budget:,.0f}"
+                    )
+                    self._auto_last_action_ts = now
+                    self._auto_last_key = key
+                    exec_funnel.blocked(
+                        "RISK", "LOSS_BUDGET", instrument=self._instrument, option=opt,
+                        value=round((entry_est - stop_est) * lot_size, 0),
+                        threshold=round(budget, 0), where="state.py:_auto_trade",
+                        reason="one lot's stop-out exceeds the per-trade cap / lock room",
+                    )
+                    return
+                if fit < lots:
+                    lots = fit
+                    note = f"lots cut to {fit} by loss budget ₹{budget:,.0f}"
+                    prev = getattr(self, "_auto_entry_note", "") or ""
+                    self._auto_entry_note = f"{prev}; {note}" if prev else note
 
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from app.analysis import option_costs
 from app.config import settings
-from app.engine.account_risk import day_lock_level
+from app.engine.account_risk import day_lock_level, entry_loss_budget, lots_for_budget
 from app.market.instruments import get_spec
 from app.journal.store import iso, session_date, stable_id
 from app.models import Signal
@@ -352,6 +352,15 @@ class PaperBooks:
             if lots < 1:
                 self._skip(inst, f"{b.id}: capital")
                 continue
+            room = entry_loss_budget(b.day_peak, b.equity())
+            if room is not None:
+                fit = lots_for_budget(room, entry, stop, lot_size)
+                if fit < 1:
+                    self._skip(inst, f"{b.id}: 1 lot risks more than the lock room ₹{room:,.0f}")
+                    continue
+                if fit < lots:
+                    lots = fit
+                    risk = round(max(0.0, entry - stop) * lot_size * lots, 2)
             depth = (f"needs {lots * lot_size}, top ask shows {q.ask_size}"
                      if q.ask_size else "top ask size n/a")
             tid = stable_id("book", b.id, inst, opt, int(now))

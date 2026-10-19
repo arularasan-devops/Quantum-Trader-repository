@@ -122,7 +122,16 @@ def _record_signal(st, d, chain, was_in_pos: bool, now: float, sid: str) -> None
         outcome = "FAILED_CONDITIONS"
         reason = "; ".join((d.reasons or [])[:3]) or sig
     status = getattr(st, "_last_status", None)
-    store().record_signal({
+    # Reports: one row per distinct BUY signal. The same option with the same
+    # outcome and reason firing again only bumps that row's repeat count.
+    key = (st.instrument, d.recommended_option, outcome, reason)
+    last = getattr(st, "_jr_sig_last", None)
+    if (sig == "BUY" and outcome != "EXECUTED" and last is not None
+            and last[0] == key and now - last[2] < 3600):
+        store().touch_signal(last[1], now)
+        st._jr_sig_last = (key, last[1], now)
+        return
+    eid = store().record_signal({
         "session_id": sid, "trade_id": trade_id, "instrument": st.instrument, "ts": now,
         "signal": sig, "outcome": outcome, "reason": (reason or "")[:500],
         "strategy": STRATEGY, "setup": d.entry_trigger,
@@ -136,12 +145,14 @@ def _record_signal(st, d, chain, was_in_pos: bool, now: float, sid: str) -> None
         "data_quality": f"feed_ready={bool(st._feed_ready())}",
         "explanation": "; ".join((d.reasons or [])[:5])[:1000] or None,
     })
+    st._jr_sig_last = (key, eid, now) if sig == "BUY" else None
 
 
 def _track_levels(st, now: float, sid: str) -> None:
     tid = getattr(st, "_jr_trade_id", None)
     if not tid or not st.position.option_symbol:
         return
+    _record_path(st, tid, sid, now)
     stop = getattr(st, "_auto_stop", None)
     floor = getattr(st, "_auto_tgt_floor", None)
     prev = getattr(st, "_jr_levels", (None, None))
@@ -164,6 +175,26 @@ def _track_levels(st, now: float, sid: str) -> None:
             "target": round(floor, 4), "reason": f"{lvl} reached; floor {floor:.2f}",
             "mode": _mode(st)})
     st._jr_levels = (stop if stop is not None else prev[0], floor)
+
+
+def _record_path(st, tid: str, sid: str, now: float) -> None:
+    """Sample the open trade's bid/ask/LTP so exits can be replayed later."""
+    every = settings.trade_path_record_sec
+    if every <= 0 or now - getattr(st, "_jr_path_ts", 0.0) < every:
+        return
+    sym = st.position.option_symbol
+    try:
+        q = next((x for x in st.provider.option_chain() if x.symbol == sym), None)
+    except Exception:
+        q = None
+    if q is None:
+        return
+    st._jr_path_ts = now
+    store().record_trade_event({
+        "trade_id": tid, "session_id": sid, "instrument": st.instrument, "ts": now,
+        "kind": "PRICE", "option_symbol": sym, "price": q.premium,
+        "stop": getattr(st, "_auto_stop", None), "mode": _mode(st),
+        "detail": {"bid": q.bid, "ask": q.ask}})
 
 
 def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
