@@ -1146,7 +1146,8 @@ class AppState:
             raise RuntimeError(f"Order ledger write failed: {self._persist_error}")
         return self.recovery_status()
 
-    def sell(self, confirm: bool = False, lots: int | None = None) -> OrderResult:
+    def sell(self, confirm: bool = False, lots: int | None = None,
+             fill_px: float | None = None) -> OrderResult:
         """Close the position. ``lots`` sells only part of it (scale-out), leaving
         the remainder open to ride; ``None`` (default) closes everything."""
         if not self.position.option_symbol:
@@ -1183,6 +1184,10 @@ class AppState:
                 q = None
             if q is not None and q.bid and q.ask and 0 < q.bid <= q.ask:
                 exit_px = float(q.bid)
+            if fill_px is not None and fill_px > 0:
+                # PAPER resting limit (a target): filled at the level, or at a
+                # better bid.
+                exit_px = max(float(fill_px), exit_px or 0.0)
         return self._book_exit(lots, order_id, exit_px)
 
     def _book_exit(self, lots: int, order_id: str | None,
@@ -2236,10 +2241,14 @@ class AppState:
             prem = p.current_premium
             if prem is None:
                 return
+            ltp_now = prem
             if not live and settings.auto_trade_exit_on_bid:
                 bid = self._own_bid()
                 if bid is not None:
                     prem = bid  # judge every exit on the price a sell fills at
+            # Targets behave like a resting sell at the level: reached when the
+            # last trade OR the bid gets there. Stops and trails stay on the bid.
+            tgt_px = max(prem, ltp_now) if not live else prem
             if not live and self._auto_entry_prem is not None:
                 with contextlib.suppress(Exception):
                     acct = account_risk.account
@@ -2293,7 +2302,9 @@ class AppState:
                 else:
                     lvl = "TARGET 1"
                 self._pending_exit_reason = f"{lvl} lock"
-                self.sell(confirm=live)
+                # An exact target lock is the resting sell at that target.
+                self.sell(confirm=live, fill_px=(
+                    prev_floor if (not live and lvl.startswith("TARGET")) else None))
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {lvl} lock"
                 self._auto_last_action_ts = now
                 self._reset_auto_trade_marks()
@@ -2305,7 +2316,7 @@ class AppState:
             # the first tick that falls back to it (i.e. once the move rolls over).
             # Note this cannot exit AT the top — a trail only knows the peak has
             # passed after price comes off it, so one step is always given back.
-            if t3 is not None and prem >= t3:
+            if t3 is not None and tgt_px >= t3:
                 floor = t3
                 if settings.auto_trade_beyond_t3_ratchet:
                     # Step sized as a % of the CURRENT premium so the giveback scales
@@ -2323,7 +2334,7 @@ class AppState:
                     floor = max(floor, t3, runner)
                 if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
                     self._auto_tgt_floor = floor
-            elif t2 is not None and prem >= t2:
+            elif t2 is not None and tgt_px >= t2:
                 floor = t2
                 if settings.auto_trade_tiered_exit and t1 is not None:
                     self._auto_peak = max(self._auto_peak or prem, prem)
@@ -2331,7 +2342,7 @@ class AppState:
                                 * settings.tier_t2_giveback_pct / 100.0)
                 if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
                     self._auto_tgt_floor = floor
-            elif t1 is not None and prem >= t1:
+            elif t1 is not None and tgt_px >= t1:
                 # Stage C (T1 -> T2): once T1 is locked, trail the peak while
                 # never dropping below the T1 floor.
                 if (settings.auto_trade_tiered_exit and self._auto_tgt_floor is not None
@@ -2358,7 +2369,8 @@ class AppState:
                             ),
                         )
                         self._pending_exit_reason = "SCALE-OUT T1"
-                        res = self.sell(confirm=live, lots=book)
+                        res = self.sell(confirm=live, lots=book,
+                                        fill_px=(max(prem, t1) if not live else None))
                         if res.ok:
                             self._auto_scaled_out = True
                             self._auto_stop = max(

@@ -205,6 +205,11 @@ def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
         sid = _session(st, now)
         mode = _mode(st)
         d = st._last_decision
+        existing = getattr(st, "_jr_trade_id", None) or store().find_open_trade(
+            st.instrument, q.symbol, mode, now - 86400)
+        if existing:
+            st._jr_trade_id = existing  # same position recorded again: no duplicate row
+            return
         tid = uuid.uuid4().hex
         st._jr_trade_id = tid
         lot_size, source, lot_ts = _lot_meta(st, q.symbol)
@@ -282,7 +287,8 @@ def on_exit(st, trade_row: dict, partial: bool, lots: int) -> None:
         now = time.time()
         sid = _session(st, now)
         mode = trade_row.get("mode") or _mode(st)
-        tid = getattr(st, "_jr_trade_id", None)
+        tid = getattr(st, "_jr_trade_id", None) or store().find_open_trade(
+            st.instrument, trade_row.get("option"), mode, now - 86400)
         if tid is None:  # position opened before journal v2 (e.g. pre-upgrade)
             ctx = trade_row.get("context") or {}
             entry_ts = float(ctx.get("entry_time") or now)

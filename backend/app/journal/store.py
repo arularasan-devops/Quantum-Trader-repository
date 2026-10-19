@@ -318,6 +318,17 @@ class JournalStore:
         self._insert("jr_trades", "trade_id", data)
         return row["trade_id"]
 
+    def find_open_trade(self, instrument: str, option_symbol: str | None,
+                        mode: str, since_ts: float) -> str | None:
+        """The OPEN trade row for this contract, so a re-recorded entry (restart,
+        pending-order resolution) reuses it instead of adding a duplicate."""
+        row = self.db.query_one(
+            "SELECT trade_id FROM jr_trades WHERE instrument = ? AND option_symbol = ? "
+            "AND mode = ? AND status = 'OPEN' AND entry_ts >= ? "
+            "ORDER BY entry_ts DESC LIMIT 1",
+            (instrument, option_symbol, mode, since_ts))
+        return row["trade_id"] if row else None
+
     def record_trade_event(self, row: dict) -> str:
         _require(row, "trade_id", "instrument", "ts", "kind")
         if row["kind"] not in EVENT_KINDS:

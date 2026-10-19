@@ -1171,7 +1171,8 @@ async def auto_trade(req: AutoTradeRequest,
     if (req.allow_live or req.live_max_order_value is not None
             or req.live_max_lots is not None):
         live_control.require_live_auth(x_qt_live_token)
-    if req.enabled and live_control.kill_switch_engaged():
+    # The kill switch guards LIVE orders only; it must not block starting PAPER auto-buy.
+    if req.enabled and live_control.kill_switch_engaged() and str(settings.trade_mode).lower() == "live":
         raise HTTPException(409, "Kill switch is engaged; release it before enabling the bot.")
     if req.enabled and live_control.trade_mode_error():
         raise HTTPException(409, live_control.trade_mode_error())

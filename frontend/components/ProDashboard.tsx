@@ -646,10 +646,11 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
                 <button
                   disabled={autoBusy}
                   onClick={() => pushAuto({ enabled: !auto?.enabled })}
-                  className="px-3 py-1 rounded-md text-[11px] font-black leading-none"
-                  style={auto?.enabled ? { background: GREEN, color: "#07120c" } : { background: "rgba(255,255,255,0.10)", color: "#c4ccd6" }}
+                  title={auto?.enabled ? "Stop paper auto-buy (open trades keep their exits)" : "Start paper auto-buy"}
+                  className="px-3 py-1.5 rounded-md text-[11px] font-black leading-none"
+                  style={auto?.enabled ? { background: RED, color: "#fff" } : { background: GREEN, color: "#07120c" }}
                 >
-                  {auto?.enabled ? "ON" : "OFF"}
+                  {autoBusy ? "…" : auto?.enabled ? "■ STOP AUTO-BUY" : "▶ START AUTO-BUY"}
                 </button>
               </div>
               <div className="flex items-center justify-between gap-2 mt-2">
