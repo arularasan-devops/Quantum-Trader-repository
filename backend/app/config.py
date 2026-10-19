@@ -998,6 +998,9 @@ class Settings(BaseSettings):
     risk_free_rate: float = 0.065
     strike_step: float = 50.0
     strikes_each_side: int = 10
+    # Seconds between REST polls of an instrument's option strikes that are off
+    # the live socket or silent while its future still streams (0 = off).
+    option_rest_backfill_sec: float = 5.0
     days_to_expiry: float = 7.0
 
     # --- Brokerage (for net P&L) ---

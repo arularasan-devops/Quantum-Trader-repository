@@ -701,11 +701,16 @@ class _LiveStream:
             if toks and toks[0] not in seen:
                 seen.add(toks[0])
                 ordered.append(toks[0])
-        for toks in self._provider_tokens.values():
-            for t in toks[1:]:
-                if t not in seen:
-                    seen.add(t)
-                    ordered.append(t)
+        # Option strikes round-robin across instruments (each list is nearest
+        # first). Taking them instrument by instrument gave the first ~20 names
+        # every strike and the rest none: their option prices never ticked.
+        rest = [toks[1:] for toks in self._provider_tokens.values()]
+        depth = max((len(r) for r in rest), default=0)
+        for k in range(depth):
+            for r in rest:
+                if k < len(r) and r[k] not in seen:
+                    seen.add(r[k])
+                    ordered.append(r[k])
         self._union_wanted = len(ordered)
         return set(ordered[:_MAX_WS_TOKENS])
 
@@ -1192,6 +1197,7 @@ class AngelOneProvider(MarketDataProvider):
         self._subscribed_tokens: list[str] = []
         self._ws_exchange_code = _WS_EXCHANGE_CODE.get(self._exchange, 5)
         self._last_ws_tick = 0.0  # per-instrument: last time THIS instrument got a push
+        self._last_opt_backfill_at = 0.0
         self._streaming = False   # True while prices arrive via WebSocket push
         # Per-token tick times: an ATM option can go quiet (illiquid strike)
         # while the underlying keeps streaming, and only the option age exposes
@@ -1374,7 +1380,11 @@ class AngelOneProvider(MarketDataProvider):
         strikes = sorted({o.strike for o in self._options})
         i = min(range(len(strikes)), key=lambda k: abs(strikes[k] - spot))
         lo, hi = strikes[max(0, i - n)], strikes[min(len(strikes) - 1, i + n)]
-        return [o.token for o in self._options if lo <= o.strike <= hi]
+        # Nearest strikes first: the socket's token cap is shared fairly across
+        # instruments from this order, so the strikes a trade uses go live first.
+        window = [o for o in self._options if lo <= o.strike <= hi]
+        window.sort(key=lambda o: abs(o.strike - spot))
+        return [o.token for o in window]
 
     def _next_future(self) -> "_Instrument | None":
         """The contract after the quoted one, or None when only one exists."""
@@ -1382,12 +1392,15 @@ class AngelOneProvider(MarketDataProvider):
             return None
         return self._futures_chain[1]
 
-    def _refresh_quotes(self) -> None:
+    def _refresh_quotes(self, only: list[str] | None = None) -> None:
         tokens = [self._future.token] + self._atm_option_tokens() if self._future else []
+        if only is not None:
+            tokens = list(only)
         # The next expiry rides along on the SAME quote call (one extra token,
         # no extra request) purely so the near/next basis can be measured at one
         # instant. Nothing reads it for a signal or an order.
-        nxt = self._next_future() if settings.pair_next_expiry_capture else None
+        nxt = (self._next_future() if settings.pair_next_expiry_capture and only is None
+               else None)
         if nxt is not None and nxt.token not in tokens:
             tokens.append(nxt.token)
         if not tokens:
@@ -1439,6 +1452,9 @@ class AngelOneProvider(MarketDataProvider):
                         else None
                     ),
                 }
+                # The poll is a current read of this contract (its book is
+                # now), so its age restarts here, push or no push.
+                self._token_tick_at[token] = time.time()
         if self._future and self._future.token in self._quotes:
             self._spot = self._quotes[self._future.token]["ltp"] or self._spot
 
@@ -1528,6 +1544,17 @@ class AngelOneProvider(MarketDataProvider):
         if not streaming and now - self._last_quote_at >= max(3.0, settings.tick_interval_seconds):
             self._refresh_quotes()
             self._last_quote_at = now
+        elif streaming and settings.option_rest_backfill_sec > 0 and (
+                now - self._last_opt_backfill_at >= settings.option_rest_backfill_sec):
+            # The future can tick while this instrument's option strikes are off
+            # the socket (token cap) or silent: poll just those, or their prices
+            # freeze at start-up and every entry reads "feed not ready".
+            stale = [t for t in self._atm_option_tokens()
+                     if not self._stream.is_subscribed(t)
+                     or (self._token_age(t, now) or 1e9) > _WS_STALE_SECONDS]
+            if stale:
+                self._last_opt_backfill_at = now
+                self._refresh_quotes(only=stale[:_QUOTE_TOKEN_CHUNK])
         # Candles (for indicators) always come from the 1-minute historical API.
         interval = 60.0 if self._fut_candles else _HIST_WARMUP_RETRY_SEC
         if now - self._last_fut_candles_at >= interval:
@@ -1597,6 +1624,9 @@ class AngelOneProvider(MarketDataProvider):
                 self._future.token if self._future else None, now
             ),
             "option_age_sec": min(opt_ages) if opt_ages else None,
+            "option_tokens_wanted": len(atm),
+            "option_tokens_on_socket": sum(
+                1 for t in atm if self._stream is not None and self._stream.is_subscribed(t)),
             "stale_after_sec": _WS_STALE_SECONDS,
             "ws_connected": connected,
             "subscribed_tokens": len(self._subscribed_tokens),

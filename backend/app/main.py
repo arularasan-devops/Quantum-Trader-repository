@@ -3763,7 +3763,25 @@ async def feed_health() -> dict:
     except Exception as exc:
         return {"provider": provider_name, "angel_active": False, "error": str(exc)[:200]}
     return {"provider": provider_name, "angel_active": True, **health, "hub": _hub_counters(),
-            "warm_up": _warm_report()}
+            "warm_up": _warm_report(), "frozen_options": _frozen_options()}
+
+
+def _frozen_options(limit_sec: float = 30.0) -> list[dict]:
+    """Active instruments whose freshest ATM option price is older than limit."""
+    out = []
+    for st in registry.active():
+        try:
+            h = st.provider.feed_health()
+        except Exception:
+            continue
+        if "option_tokens_wanted" not in h:  # not the live Angel provider
+            continue
+        age = h.get("option_age_sec")
+        if age is None or age > limit_sec:
+            out.append({"instrument": st.instrument, "option_age_sec": age,
+                        "on_socket": h.get("option_tokens_on_socket"),
+                        "wanted": h.get("option_tokens_wanted")})
+    return sorted(out, key=lambda r: -(r["option_age_sec"] or 1e9))
 
 
 def _warm_report() -> dict:
