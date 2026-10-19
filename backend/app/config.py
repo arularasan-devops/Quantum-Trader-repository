@@ -1004,7 +1004,9 @@ class Settings(BaseSettings):
     strikes_each_side: int = 10
     # Seconds between REST polls of an instrument's option strikes that are off
     # the live socket or silent while its future still streams (0 = off).
-    option_rest_backfill_sec: float = 5.0
+    option_rest_backfill_sec: float = 10.0
+    # Account-wide cap on those polls (calls per second, shared by all instruments).
+    option_rest_backfill_per_sec: float = 1.0
     days_to_expiry: float = 7.0
 
     # --- Brokerage (for net P&L) ---

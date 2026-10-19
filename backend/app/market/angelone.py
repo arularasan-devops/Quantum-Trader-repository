@@ -135,6 +135,23 @@ SCRIP_MASTER_URL = (
 _QUOTE_MODE = "FULL"
 # Angel /quote FULL mode caps tokens per request (~50). Batch below that.
 _QUOTE_TOKEN_CHUNK = 45
+# Option backfill polls share ONE account-wide budget (non-blocking: a tick that
+# finds no slot skips the poll), so 50 instruments cannot flood /quote and slow
+# every other price read.
+_backfill_lock = threading.Lock()
+_backfill_next_at = 0.0
+
+
+def _backfill_slot(now: float) -> bool:
+    global _backfill_next_at
+    rate = settings.option_rest_backfill_per_sec
+    if rate <= 0:
+        return False
+    with _backfill_lock:
+        if now < _backfill_next_at:
+            return False
+        _backfill_next_at = now + 1.0 / rate
+        return True
 
 # Cap on every Angel REST call. The SDK defaults to 7s, and a 7s CONNECT stall
 # was seen holding a quote call (and therefore a tick) in a live log — an entry
@@ -1198,6 +1215,7 @@ class AngelOneProvider(MarketDataProvider):
         self._ws_exchange_code = _WS_EXCHANGE_CODE.get(self._exchange, 5)
         self._last_ws_tick = 0.0  # per-instrument: last time THIS instrument got a push
         self._last_opt_backfill_at = 0.0
+        self._backfill_busy = False
         self._streaming = False   # True while prices arrive via WebSocket push
         # Per-token tick times: an ATM option can go quiet (illiquid strike)
         # while the underlying keeps streaming, and only the option age exposes
@@ -1392,6 +1410,14 @@ class AngelOneProvider(MarketDataProvider):
             return None
         return self._futures_chain[1]
 
+    def _run_backfill(self, tokens: list[str]) -> None:
+        try:
+            self._refresh_quotes(only=tokens)
+        except Exception:
+            pass
+        finally:
+            self._backfill_busy = False
+
     def _refresh_quotes(self, only: list[str] | None = None) -> None:
         tokens = [self._future.token] + self._atm_option_tokens() if self._future else []
         if only is not None:
@@ -1552,9 +1578,14 @@ class AngelOneProvider(MarketDataProvider):
             stale = [t for t in self._atm_option_tokens()
                      if not self._stream.is_subscribed(t)
                      or (self._token_age(t, now) or 1e9) > _WS_STALE_SECONDS]
-            if stale:
+            if stale and not self._backfill_busy and _backfill_slot(now):
+                # Off the tick path: a slow or failing /quote call must never
+                # hold up this instrument's (or the hub's) price updates.
                 self._last_opt_backfill_at = now
-                self._refresh_quotes(only=stale[:_QUOTE_TOKEN_CHUNK])
+                self._backfill_busy = True
+                threading.Thread(target=self._run_backfill,
+                                 args=(stale[:_QUOTE_TOKEN_CHUNK],),
+                                 daemon=True, name=f"qt-backfill-{self._root}").start()
         # Candles (for indicators) always come from the 1-minute historical API.
         interval = 60.0 if self._fut_candles else _HIST_WARMUP_RETRY_SEC
         if now - self._last_fut_candles_at >= interval:
