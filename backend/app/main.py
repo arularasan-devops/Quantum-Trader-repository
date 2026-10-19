@@ -489,7 +489,10 @@ class Hub:
             # Watched instruments and anything holding a position are NOT skipped:
             # the dashboard must still say "CLOSED" for the name you opened, and a
             # position must stay monitored right up to its own close.
-            closed_now = [st for st in background if not _exchange_open(st.instrument)]
+            # A closed name is still ticked ONCE (until it has a snapshot) so the
+            # board shows its last/closing price from start-up instead of blank.
+            closed_now = [st for st in background
+                          if not _exchange_open(st.instrument) and st.instrument in self.latest]
             if closed_now:
                 background = [st for st in background if st not in closed_now]
             self._closed_skipped = len(closed_now)
