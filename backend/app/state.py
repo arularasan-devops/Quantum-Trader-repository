@@ -2302,9 +2302,8 @@ class AppState:
                 else:
                     lvl = "TARGET 1"
                 self._pending_exit_reason = f"{lvl} lock"
-                # An exact target lock is the resting sell at that target.
-                self.sell(confirm=live, fill_px=(
-                    prev_floor if (not live and lvl.startswith("TARGET")) else None))
+                # A floor is hit on the way DOWN: it is a stop, filled at the bid.
+                self.sell(confirm=live)
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {lvl} lock"
                 self._auto_last_action_ts = now
                 self._reset_auto_trade_marks()
@@ -2343,16 +2342,20 @@ class AppState:
                 if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
                     self._auto_tgt_floor = floor
             elif t1 is not None and tgt_px >= t1:
-                # Stage C (T1 -> T2): once T1 is locked, trail the peak while
-                # never dropping below the T1 floor.
+                # Stage C (T1 -> T2): the runner's floor starts a buffer BELOW T1
+                # (tier_t1_runner_buffer_pct of entry->T1), so a bid flicker at T1
+                # no longer closes it seconds after the scale-out; then it trails
+                # the peak and only ever moves up.
+                entry_ref = self._auto_entry_prem or p.entry_premium or 0.0
+                t1_floor = t1 - max(0.0, t1 - entry_ref) * settings.tier_t1_runner_buffer_pct / 100.0
                 if (settings.auto_trade_tiered_exit and self._auto_tgt_floor is not None
-                        and self._auto_tgt_floor >= t1 - 1e-9):
+                        and self._auto_tgt_floor >= t1_floor - 1e-9):
                     self._auto_peak = max(self._auto_peak or prem, prem)
-                    f_c = self._auto_peak - (self._auto_peak - t1) * settings.tier_t1_giveback_pct / 100.0
+                    f_c = self._auto_peak - (self._auto_peak - t1_floor) * settings.tier_t1_giveback_pct / 100.0
                     if f_c > self._auto_tgt_floor:
                         self._auto_tgt_floor = f_c
-                if self._auto_tgt_floor is None or t1 > self._auto_tgt_floor:
-                    self._auto_tgt_floor = t1
+                if self._auto_tgt_floor is None or t1_floor > self._auto_tgt_floor + 1e-9:
+                    self._auto_tgt_floor = t1_floor
                     # SCALE-OUT: bank part of the position at T1 and let the rest
                     # ride toward T2/T3. Walk-forward measured: NIFTY PF
                     # 1.098 -> 1.162, CRUDEOIL 1.143 -> 1.172.

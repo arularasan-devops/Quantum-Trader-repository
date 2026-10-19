@@ -151,6 +151,9 @@ def _record_signal(st, d, chain, was_in_pos: bool, now: float, sid: str) -> None
 def _track_levels(st, now: float, sid: str) -> None:
     tid = getattr(st, "_jr_trade_id", None)
     if not tid or not st.position.option_symbol:
+        post = getattr(st, "_jr_post", None)
+        if post and now < post[2]:
+            _record_path(st, post[0], sid, now, sym=post[1], after=True)
         return
     _record_path(st, tid, sid, now)
     stop = getattr(st, "_auto_stop", None)
@@ -177,12 +180,14 @@ def _track_levels(st, now: float, sid: str) -> None:
     st._jr_levels = (stop if stop is not None else prev[0], floor)
 
 
-def _record_path(st, tid: str, sid: str, now: float) -> None:
-    """Sample the open trade's bid/ask/LTP so exits can be replayed later."""
+def _record_path(st, tid: str, sid: str, now: float, sym: str | None = None,
+                 after: bool = False) -> None:
+    """Sample the trade's bid/ask/LTP (and for a while after it closed) so exits
+    can be replayed and what an exit left on the table can be measured."""
     every = settings.trade_path_record_sec
     if every <= 0 or now - getattr(st, "_jr_path_ts", 0.0) < every:
         return
-    sym = st.position.option_symbol
+    sym = sym or st.position.option_symbol
     try:
         q = next((x for x in st.provider.option_chain() if x.symbol == sym), None)
     except Exception:
@@ -194,7 +199,7 @@ def _record_path(st, tid: str, sid: str, now: float) -> None:
         "trade_id": tid, "session_id": sid, "instrument": st.instrument, "ts": now,
         "kind": "PRICE", "option_symbol": sym, "price": q.premium,
         "stop": getattr(st, "_auto_stop", None), "mode": _mode(st),
-        "detail": {"bid": q.bid, "ask": q.ask}})
+        "detail": {"bid": q.bid, "ask": q.ask, **({"after_exit": True} if after else {})}})
 
 
 def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
@@ -313,6 +318,8 @@ def on_exit(st, trade_row: dict, partial: bool, lots: int) -> None:
                 "brokerage", "statutory", "cost_model", "holding_minutes", "capital_used",
                 "return_on_capital_pct", "cost_status")}})
         if not partial:
+            keep = settings.trade_path_after_exit_sec
+            st._jr_post = (tid, trade_row.get("option"), now + keep) if keep > 0 else None
             st._jr_trade_id = None
             st._jr_levels = (None, None)
     except Exception as exc:

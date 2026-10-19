@@ -206,6 +206,10 @@ class Settings(BaseSettings):
     auto_trade_metal_risk_caps: list[float] = [4.0, 5.0, 6.0]
     # Tiered exits: PRE-T1 peak trail (auto_trade_pre_t1_*) -> T1 lock -> T2 ratchet -> T3 runner.
     auto_trade_tiered_exit: bool = True
+    # After T1 the runner floor starts this % of (T1 - entry) below T1.
+    tier_t1_runner_buffer_pct: float = 25.0
+    # Keep recording a closed trade's bid/ask/LTP for this long (0 = off).
+    trade_path_after_exit_sec: float = 1800.0
     tier_t1_giveback_pct: float = 60.0       # T1->T2: floor = peak - 60% of (peak - T1), never below T1
     tier_t2_giveback_pct: float = 50.0       # after T2: floor = peak - 50% of (peak - T1)
     tier_t3_runner_trail_pct: float = 8.0    # after T3: floor = peak * (1 - 8%), never below T3
