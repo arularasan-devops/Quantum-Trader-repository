@@ -781,6 +781,22 @@ async def _startup() -> None:
         _log.info("trade mode: %s (auto-trade %s)", settings.trade_mode.strip().lower(),
                   "enabled" if settings.auto_trade_enabled else "disabled")
 
+    if settings.risk_rebuild_from_journal:
+        try:
+            from app.engine import account_risk
+            from app.journal.store import store as _jr_store
+
+            now = time.time()
+            day_start = (int(now) + 19800) // 86400 * 86400 - 19800
+            row = _jr_store().db.query_one(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(net_pnl), 0) AS pnl FROM jr_trades "
+                "WHERE mode = 'paper' AND status = 'CLOSED' AND exit_ts >= ?", [day_start])
+            if row and int(row["n"] or 0) > 0:
+                account_risk.account.restore_day(now, float(row["pnl"] or 0), int(row["n"]))
+        except Exception:
+            _log.warning("could not rebuild today's risk counters from the journal",
+                         exc_info=True)
+
     loop = asyncio.get_event_loop()
     # Re-apply a user-saved manual watchlist first (survives restarts). If one is
     # active it governs the universe (auto-pick becomes a no-op below).

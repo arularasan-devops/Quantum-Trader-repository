@@ -62,27 +62,54 @@ def _today(now: float) -> str:
 
 
 
+def _lock_steps() -> list[tuple[float, float]]:
+    """``daily_lock_steps`` "peak:keep%,..." parsed and sorted; bad parts ignored."""
+    out: list[tuple[float, float]] = []
+    for part in (settings.daily_lock_steps or "").split(","):
+        a, _, b = part.partition(":")
+        try:
+            peak, keep = float(a), float(b)
+        except ValueError:
+            continue
+        if peak > 0 and keep > 0:
+            out.append((peak, min(keep, 100.0)))
+    return sorted(out)
+
+
 def day_lock_level(day_peak_equity: float) -> float | None:
-    """Day profit lock: None until equity reached ``daily_profit_target``; then
+    """Stepped lock when ``daily_lock_steps`` is set: the highest step the day
+    peak reached keeps its % of the peak (15k:50 -> peak 20k locks 10k).
+    Otherwise the single-target rule below.
+
+    Day profit lock: None until equity reached ``daily_profit_target``; then
     ``daily_lock_keep_pct`` of the day's peak (75% -> peak 40k locks 30k), or
     with keep 0 the peak minus ``daily_peak_giveback``. Never below the target."""
     tgt = settings.daily_profit_target
-    if tgt <= 0 or day_peak_equity < tgt:
+    if tgt <= 0:
+        return None
+    steps = [st for st in _lock_steps() if day_peak_equity >= st[0]]
+    if steps:
+        return day_peak_equity * steps[-1][1] / 100.0
+    if _lock_steps() or day_peak_equity < tgt:
         return None
     keep = settings.daily_lock_keep_pct
     if keep > 0:
         return max(tgt, day_peak_equity * min(keep, 100.0) / 100.0)
     return max(tgt, day_peak_equity - max(0.0, settings.daily_peak_giveback))
 
+_PEAK_LOCK = object()
+
+
 def entry_loss_budget(day_peak_equity: float, equity: float, *,
-                      per_trade_cap: float | None = None) -> float | None:
+                      per_trade_cap: float | None = None,
+                      lock: float | None | object = _PEAK_LOCK) -> float | None:
     """Most a NEW trade may lose at its stop: the per-trade rupee cap and, once
     the day lock is armed, ``daily_lock_room_share_pct`` of the room above it.
     None means unlimited."""
     caps: list[float] = []
     if per_trade_cap is not None and per_trade_cap > 0:
         caps.append(per_trade_cap)
-    lvl = day_lock_level(day_peak_equity)
+    lvl = day_lock_level(day_peak_equity) if lock is _PEAK_LOCK else lock
     share = settings.daily_lock_room_share_pct
     if lvl is not None and share > 0:
         caps.append(max(0.0, equity - lvl) * min(share, 100.0) / 100.0)
@@ -116,6 +143,12 @@ class AccountRisk:
         self.day_peak_equity: float = 0.0
         self.giveback_tripped: bool = False
         self.target_hit_at: float = 0.0
+        # After a lock breach: entries pause until ``lock_pause_until``, then
+        # resume under ``lock_floor`` (equity minus daily_lock_resume_room,
+        # trailing new highs) so post-lock trades stay small.
+        self.lock_pause_until: float = 0.0
+        self.lock_resumes: int = 0
+        self.lock_floor: float | None = None
         self._loaded = False
 
     # --- persistence ------------------------------------------------------
@@ -138,6 +171,10 @@ class AccountRisk:
         self.day_peak_equity = float(raw.get("day_peak_equity") or 0.0)
         self.giveback_tripped = bool(raw.get("giveback_tripped") or False)
         self.target_hit_at = float(raw.get("target_hit_at") or 0.0)
+        self.lock_pause_until = float(raw.get("lock_pause_until") or 0.0)
+        self.lock_resumes = int(raw.get("lock_resumes") or 0)
+        lf = raw.get("lock_floor")
+        self.lock_floor = float(lf) if lf is not None else None
         self.last_exit = {str(k): float(v) for k, v in (raw.get("last_exit") or {}).items()}
         self.last_stop = {str(k): float(v) for k, v in (raw.get("last_stop") or {}).items()}
 
@@ -151,6 +188,9 @@ class AccountRisk:
             "day_peak_equity": self.day_peak_equity,
             "giveback_tripped": self.giveback_tripped,
             "target_hit_at": self.target_hit_at,
+            "lock_pause_until": self.lock_pause_until,
+            "lock_resumes": self.lock_resumes,
+            "lock_floor": self.lock_floor,
             "last_exit": self.last_exit,
             "last_stop": self.last_stop,
         }
@@ -186,12 +226,32 @@ class AccountRisk:
         self.day_peak_equity = 0.0
         self.giveback_tripped = False
         self.target_hit_at = 0.0
+        self.lock_pause_until = 0.0
+        self.lock_resumes = 0
+        self.lock_floor = None
         self._save()
 
     def lock_level(self) -> float | None:
         """Equity the day may not fall below once the target was reached (see
-        ``day_lock_level``). None until the target has been reached."""
+        ``day_lock_level``), or the post-pause floor. None until armed."""
+        if self.lock_floor is not None:
+            return self.lock_floor
         return day_lock_level(self.day_peak_equity)
+
+    def restore_day(self, now: float, day_pnl: float, trades: int) -> bool:
+        """Refill today's counters from the journal when the saved file came
+        back empty for today (lost/replaced risk_guard.json). Never overwrites
+        counters that already hold today's trades."""
+        self._roll(now)
+        if trades <= 0 or self.trades_today > 0 or abs(self.day_pnl) > 1e-6:
+            return False
+        self.day_pnl = float(day_pnl)
+        self.trades_today = int(trades)
+        self.day_peak_equity = max(self.day_peak_equity, self.day_pnl)
+        self._save()
+        _log.warning("RISK_RESTORE: today's counters rebuilt from the journal — "
+                     "%d trades, booked ₹%.0f", trades, day_pnl)
+        return True
 
     def lock_breached(self, equity: float) -> bool:
         lvl = self.lock_level()
@@ -211,12 +271,30 @@ class AccountRisk:
         if equity > self.day_peak_equity:
             self.day_peak_equity = equity
             changed = True
-        if not self.giveback_tripped and self.lock_breached(equity):
+        if (self.lock_floor is not None and not self.giveback_tripped
+                and equity - settings.daily_lock_resume_room > self.lock_floor + 1e-6):
+            self.lock_floor = equity - settings.daily_lock_resume_room
+            changed = True
+        if (self.giveback_tripped and self.lock_pause_until > 0
+                and now >= self.lock_pause_until):
+            self.giveback_tripped = False
+            self.lock_pause_until = 0.0
+            self.lock_resumes += 1
+            self.lock_floor = equity - max(0.0, settings.daily_lock_resume_room)
+            changed = True
+            _log.warning("PROFIT_LOCK: pause over — auto-buy resumes with a floor "
+                         "₹%.0f (equity ₹%.0f)", self.lock_floor, equity)
+        elif not self.giveback_tripped and self.lock_breached(equity):
             self.giveback_tripped = True
             changed = True
+            pause = settings.daily_lock_pause_sec
+            if pause > 0 and self.lock_resumes < max(0, settings.daily_lock_max_resumes):
+                self.lock_pause_until = now + pause
+            else:
+                self.lock_pause_until = 0.0
             _log.warning(
                 "PROFIT_LOCK: equity ₹%.0f fell ₹%.0f below the day peak ₹%.0f "
-                "(realized ₹%.0f, open ₹%.0f) — auto-buy stopped for the day",
+                "(realized ₹%.0f, open ₹%.0f) — new buys paused (or stopped if no resume is left)",
                 equity, self.day_peak_equity - equity, self.day_peak_equity,
                 self.day_pnl, unrealized)
         if (settings.daily_profit_target > 0 and not self.target_hit_at
@@ -263,6 +341,11 @@ class AccountRisk:
             return (
                 f"account daily loss cap hit (₹{self.day_pnl:,.0f} of "
                 f"₹{settings.max_daily_loss:,.0f}) — flat for the day"
+            )
+        if self.giveback_tripped and self.lock_pause_until > 0:
+            return (
+                f"profit lock: the day fell below the lock — pausing new buys for "
+                f"{max(0, int(self.lock_pause_until - now))}s, then small trades only"
             )
         if self.giveback_tripped:
             return (

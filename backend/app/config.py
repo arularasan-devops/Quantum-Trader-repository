@@ -675,6 +675,22 @@ class Settings(BaseSettings):
     # most this % of the room between equity and the lock, so one trade cannot
     # take the day through the lock.
     daily_lock_room_share_pct: float = 50.0
+    # Stepped lock "peak:keep%" pairs: once the day peak reaches a step the lock
+    # keeps that % of the peak (20k peak -> 10k locked). Empty = the single
+    # daily_profit_target / daily_lock_keep_pct rule. daily_profit_target 0 = off.
+    daily_lock_steps: str = "15000:50,30000:75,60000:85"
+    # Equity under the lock: pause new buys this long (0 = stop for the day),
+    # then resume with a floor this many ₹ below equity that trails new highs,
+    # so post-lock trades are sized from that small room. Resumes per day.
+    daily_lock_pause_sec: float = 1800.0
+    daily_lock_resume_room: float = 6000.0
+    daily_lock_max_resumes: int = 1
+    # Skip a PAPER auto entry whose ask is above the signal premium by more than
+    # this % of the signal's stop distance (0 = off). The stop is fixed, so a
+    # chased fill is a bigger loss than was planned.
+    auto_trade_max_chase_pct: float = 30.0
+    # Startup: rebuild today's risk counters from the journal if the saved file is empty.
+    risk_rebuild_from_journal: bool = True
     # PAPER: most a single auto trade may lose at its stop (lots are cut to fit;
     # 0 disables). Paper books keep their own FULL/RISK sizing.
     auto_trade_max_loss_rupees: float = 10000.0

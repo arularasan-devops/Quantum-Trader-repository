@@ -25,6 +25,7 @@ settings.data_provider = "simulated"
 settings.paper_capital = 500000.0
 settings.daily_profit_target = 10000.0
 settings.daily_lock_keep_pct = 75.0
+settings.daily_lock_steps = ""  # these checks cover the single-target lock
 settings.paper_books_risk_pct = 1.0
 tmp = tempfile.mkdtemp()
 url = os.environ.get("BOOKS_SMOKE_DB_URL") or f"sqlite:///{tmp}/books.db"

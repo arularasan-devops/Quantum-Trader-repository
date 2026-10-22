@@ -2229,6 +2229,7 @@ class AppState:
 
     def _pullback_spread_and_risk_ok(self, decision: Decision, opt: str, now: float) -> bool:
         """SPREAD OK? and RISK ACCEPTABLE? of the PAPER pullback engine."""
+        self._auto_entry_ask = 0.0
         try:
             q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
         except Exception:
@@ -2256,6 +2257,23 @@ class AppState:
                 reason="stop is missing or not below the entry price",
             )
             return False
+        self._auto_entry_ask = ask
+        sig = float(decision.current_premium or 0.0)
+        chase_cap = settings.auto_trade_max_chase_pct
+        if chase_cap > 0 and ask > 0 and 0 < stop < sig < ask:
+            chase = (ask - sig) / (sig - stop) * 100.0
+            if chase > chase_cap:
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: ask {ask:.2f} is {chase:.0f}% of the stop above "
+                    f"the signal {sig:.2f}")
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "RISK", "ENTRY_CHASE", instrument=self._instrument, option=opt,
+                    value=round(chase, 1), threshold=chase_cap,
+                    where="state.py:_pullback_spread_and_risk_ok",
+                    reason="ask too far above the signal price for its stop",
+                )
+                return False
         risk_pct = (entry - stop) / entry * 100.0
         metals = {m.upper() for m in settings.auto_trade_metal_roots}
         if self._instrument.upper() in metals and settings.auto_trade_metal_risk_caps:
@@ -3061,8 +3079,11 @@ class AppState:
                 o._liq_pnl() for o in registry.active() if o.position.option_symbol)
             budget = account_risk.entry_loss_budget(
                 acct.day_peak_equity, equity,
-                per_trade_cap=settings.auto_trade_max_loss_rupees)
-            entry_est = float(decision.current_premium or 0.0)
+                per_trade_cap=settings.auto_trade_max_loss_rupees,
+                lock=acct.lock_level())
+            # Size on the price a buy fills at (the ask), not the signal premium.
+            entry_est = max(float(decision.current_premium or 0.0),
+                            float(getattr(self, "_auto_entry_ask", 0.0) or 0.0) if eng else 0.0)
             stop_est = float(decision.stop_loss)
             stop_pts = settings.auto_trade_stop_points.get(self._instrument)
             if stop_pts and stop_pts > 0:

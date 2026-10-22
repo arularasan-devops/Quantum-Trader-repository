@@ -20,6 +20,7 @@ def check(name, ok, info=""):
 
 check("default lock minimum is ₹30,000", settings.daily_profit_target == 30000.0,
       settings.daily_profit_target)
+settings.daily_lock_steps = ""  # single-target rule checks; stepped lock in _smoke_v3510.py
 check("no lock below ₹30k", ar.day_lock_level(29_000) is None)
 check("₹40k high locks ₹30k", ar.day_lock_level(40_000) == 30_000.0, ar.day_lock_level(40_000))
 check("₹60k high locks ₹45k", ar.day_lock_level(60_000) == 45_000.0, ar.day_lock_level(60_000))

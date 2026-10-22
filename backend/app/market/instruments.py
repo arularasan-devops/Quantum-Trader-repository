@@ -50,7 +50,6 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "AXISBANK": InstrumentSpec("AXISBANK", "Axis Bank", "NFO", "NSE:AXISBANK", 1150.0, 0.24, 10, 625, 30),
     "KOTAKBANK": InstrumentSpec("KOTAKBANK", "Kotak Bank", "NFO", "NSE:KOTAKBANK", 1800.0, 0.22, 20, 400, 30),
     "LT": InstrumentSpec("LT", "L&T", "NFO", "NSE:LT", 3600.0, 0.22, 20, 175, 30),
-    "TATAMOTORS": InstrumentSpec("TATAMOTORS", "Tata Motors", "NFO", "NSE:TATAMOTORS", 700.0, 0.30, 10, 550, 30),
     "TATASTEEL": InstrumentSpec("TATASTEEL", "Tata Steel", "NFO", "NSE:TATASTEEL", 150.0, 0.30, 1, 5500, 30),
     "ITC": InstrumentSpec("ITC", "ITC", "NFO", "NSE:ITC", 450.0, 0.20, 5, 1600, 30),
     "BHARTIARTL": InstrumentSpec("BHARTIARTL", "Bharti Airtel", "NFO", "NSE:BHARTIARTL", 1650.0, 0.24, 20, 475, 30),
@@ -69,7 +68,6 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "FINNIFTY": InstrumentSpec("FINNIFTY", "Fin Nifty", "NFO", "NSE:CNXFINANCE", 23500.0, 0.14, 50, 65, 7),
     "BANKEX": InstrumentSpec("BANKEX", "Bankex", "BFO", "BSE:BANKEX", 58000.0, 0.14, 100, 30, 7),
     "ZINC": InstrumentSpec("ZINC", "Zinc", "MCX", "MCX:ZINC", 270.0, 0.20, 5, 5000, 30),
-    "ALUMINIUM": InstrumentSpec("ALUMINIUM", "Aluminium", "MCX", "MCX:ALUMINIUM", 240.0, 0.20, 5, 5000, 30),
     "BAJFINANCE": InstrumentSpec("BAJFINANCE", "Bajaj Finance", "NFO", "NSE:BAJFINANCE", 7200.0, 0.26, 100, 125, 30),
     "BAJAJFINSV": InstrumentSpec("BAJAJFINSV", "Bajaj Finserv", "NFO", "NSE:BAJAJFINSV", 1700.0, 0.26, 20, 500, 30),
     "INDUSINDBK": InstrumentSpec("INDUSINDBK", "IndusInd Bank", "NFO", "NSE:INDUSINDBK", 1000.0, 0.30, 10, 700, 30),
@@ -102,7 +100,6 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "VEDL": InstrumentSpec("VEDL", "Vedanta", "NFO", "NSE:VEDL", 450.0, 0.32, 5, 2300, 30),
     "TATACONSUM": InstrumentSpec("TATACONSUM", "Tata Consumer", "NFO", "NSE:TATACONSUM", 1100.0, 0.24, 10, 550, 30),
     "TRENT": InstrumentSpec("TRENT", "Trent", "NFO", "NSE:TRENT", 5500.0, 0.32, 50, 100, 30),
-    "IRCTC": InstrumentSpec("IRCTC", "IRCTC", "NFO", "NSE:IRCTC", 780.0, 0.30, 10, 875, 30),
     "LICI": InstrumentSpec("LICI", "LIC of India", "NFO", "NSE:LICI", 900.0, 0.24, 10, 800, 30),
     # Mid-cap: real F&O name, but its option premiums are thinner than the index
     # contracts — expect the premium floor and the opportunity score to skip it

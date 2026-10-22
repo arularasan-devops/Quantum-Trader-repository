@@ -163,6 +163,7 @@ _lc.kill_switch_engaged = _orig_ks
 check("kill switch no longer blocks PAPER auto-buy (live only)", took, why)
 from app.engine import account_risk as _ar  # noqa: E402
 settings.daily_profit_target = 10_000.0  # lock checks below use the old ₹10k minimum
+settings.daily_lock_steps = ""
 _acct = _ar.AccountRisk()
 _acct._loaded = True
 _acct._save = lambda: None
