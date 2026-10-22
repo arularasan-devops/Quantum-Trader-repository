@@ -622,6 +622,9 @@ class Settings(BaseSettings):
     # target-floor lock takes over once a target is actually reached. Off → prior
     # behaviour (hard stop only until T1).
     auto_trade_pre_t1_trail: bool = True
+    # PAPER/live auto: when the pre-T1 trail fires on 2+ lots, sell half and hold
+    # the rest with a break-even stop until T1. False = sell everything (old).
+    auto_trade_pre_t1_half_out: bool = True
     auto_trade_pre_t1_trail_arm_pct: float = 40.0     # arm once this % of the way to T1
     auto_trade_pre_t1_trail_giveback_pct: float = 30.0  # exit on giving back this % of the run from the peak
     # Also arm the pre-T1 trail as soon as the premium is at least this % ABOVE

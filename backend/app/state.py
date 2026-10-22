@@ -280,6 +280,7 @@ class AppState:
         # highest target FLOOR reached this trade (ratchets up): 0=none,1=T1,2=T2
         self._auto_tgt_floor: float | None = None
         self._auto_scaled_out: bool = False       # part already booked at T1
+        self._auto_pre_t1_halved: bool = False    # half booked at the pre-T1 trail
         # running high premium this trade (for the pre-T1 peak-giveback trail)
         self._auto_peak: float | None = None
         self._auto_entry_prem: float | None = None  # actual entry fill this trade
@@ -998,7 +999,7 @@ class AppState:
     _PAPER_SAVE_FIELDS = (
         "_entry_time", "_entry_factors", "_entry_context", "_entry_book",
         "_auto_last_key", "_auto_target1", "_auto_target2", "_auto_target3",
-        "_auto_stop", "_auto_tgt_floor", "_auto_scaled_out", "_auto_peak",
+        "_auto_stop", "_auto_tgt_floor", "_auto_scaled_out", "_auto_pre_t1_halved", "_auto_peak",
         "_auto_entry_prem", "_auto_entry_active", "_auto_entry_strike",
         "_auto_entry_conf", "_auto_entry_lots", "_z2h_is_sleeve", "_jr_trade_id",
     )
@@ -2579,7 +2580,26 @@ class AppState:
                             run * (settings.auto_trade_pre_t1_trail_giveback_pct / 100.0),
                         )
                         trail = peak - giveback
-                        if prem <= trail and prem > entry:
+                        halved = getattr(self, "_auto_pre_t1_halved", False)
+                        if (prem <= trail and prem > entry and not halved
+                                and settings.auto_trade_pre_t1_half_out
+                                and p.quantity_lots >= 2):
+                            # Bank half; the rest holds with a break-even stop
+                            # until T1 (price-path replay: early trails left
+                            # T1 runs on the table).
+                            book = p.quantity_lots // 2
+                            self._pending_exit_reason = "PRE-T1 HALF OUT"
+                            res = self.sell(confirm=live, lots=book)
+                            if res.ok:
+                                self._auto_pre_t1_halved = True
+                                self._auto_stop = max(self._auto_stop or 0.0, entry)
+                                self._auto_last_action = (
+                                    f"AUTO HALF OUT {book} lot(s) {p.option_symbol} @ "
+                                    f"{prem:.1f} · peak trail — rest holds to T1, stop at "
+                                    f"break-even")
+                                self._auto_last_action_ts = now
+                            return
+                        if prem <= trail and prem > entry and not halved:
                             self._pending_exit_reason = "PRE-T1 PEAK TRAIL"
                             self.sell(confirm=live)
                             self._auto_last_action = (
@@ -2591,9 +2611,11 @@ class AppState:
                             return
             # before any target is reached the hard stop still protects the trade
             if self._auto_tgt_floor is None and self._auto_stop and prem <= self._auto_stop:
-                self._pending_exit_reason = "STOP LOSS"
+                why = ("BREAK-EVEN STOP" if getattr(self, "_auto_pre_t1_halved", False)
+                       else "STOP LOSS")
+                self._pending_exit_reason = why
                 self.sell(confirm=live)
-                self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · STOP LOSS"
+                self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why}"
                 self._auto_last_action_ts = now
                 self._reset_auto_trade_marks()
             return
@@ -3196,6 +3218,7 @@ class AppState:
         self._auto_stop = None
         self._auto_tgt_floor = None
         self._auto_scaled_out = False
+        self._auto_pre_t1_halved = False
         self._auto_peak = None
         self._auto_entry_prem = None
         self._auto_entry_active = False
