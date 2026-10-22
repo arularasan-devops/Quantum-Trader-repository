@@ -622,6 +622,14 @@ export interface JournalTrade {
   lot_size?: number | null;
   risk_rupees?: number | null;
   cost_rupees?: number | null;
+  total_costs?: number | null;
+  brokerage?: number | null;
+  stt?: number | null;
+  exchange_txn?: number | null;
+  sebi?: number | null;
+  stamp?: number | null;
+  gst?: number | null;
+  exchange?: string | null;
   return_on_capital_pct?: number | null;
   holding_minutes: number | null;
   mode: string | null;
@@ -655,8 +663,10 @@ export interface JournalOpenPosition {
   stop: number | null;
 }
 
-export async function getTradeJournal(limit = 500, book: JournalBook = "all") {
-  const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}`);
+export async function getTradeJournal(limit = 500, book: JournalBook = "all",
+                                      since: number | null = null, until: number | null = null) {
+  const range = `${since !== null ? `&since=${since}` : ""}${until !== null ? `&until=${until}` : ""}`;
+  const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}${range}`);
   return res.json() as Promise<{
     count: number;
     wins: number;

@@ -249,7 +249,7 @@ class PaperBooks:
 
     def _close(self, b: Book, p: Pos, price: float, reason: str, now: float) -> None:
         gross = (price - p.entry) * p.qty
-        costs = option_costs.charges(p.entry, price, p.qty).total
+        costs = option_costs.charges(p.entry, price, p.qty, p.instrument).total
         net = gross - costs
         self.db.execute(
             "UPDATE jr_book_trades SET status = 'CLOSED', exit_ts = ?, exit_ts_iso = ?, "

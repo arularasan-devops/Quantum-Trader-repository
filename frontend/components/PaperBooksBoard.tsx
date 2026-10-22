@@ -24,6 +24,7 @@ export default function PaperBooksBoard() {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [total, setTotal] = useState(0);
   const [err, setErr] = useState<string | null>(null);
+  const [range, setRange] = useState<{ since: number | null; until: number | null }>({ since: null, until: null });
 
   useEffect(() => {
     let alive = true;
@@ -31,6 +32,8 @@ export default function PaperBooksBoard() {
       try {
         const q = new URLSearchParams({ page_size: "200" });
         if (book) q.set("book", book);
+        if (range.since !== null) q.set("since", String(range.since));
+        if (range.until !== null) q.set("until", String(range.until));
         const [s, t] = await Promise.all([
           fetch(`${API_BASE}/api/paper-books`).then((r) => r.json()),
           fetch(`${API_BASE}/api/paper-books/trades?${q}`).then((r) => r.json()),
@@ -47,7 +50,7 @@ export default function PaperBooksBoard() {
     load();
     const id = setInterval(load, 5000);
     return () => { alive = false; clearInterval(id); };
-  }, [book]);
+  }, [book, range.since, range.until]);
 
   return (
     <div className="w-full space-y-3 p-3">
@@ -110,7 +113,8 @@ export default function PaperBooksBoard() {
           </select>
           <span className="text-xs text-white/50">{total} trades</span>
           <span className="ml-auto">
-            <DateRangeDownload href={`${API_BASE}/api/paper-books/trades.csv${book ? `?book=${encodeURIComponent(book)}` : ""}`} />
+            <DateRangeDownload href={`${API_BASE}/api/paper-books/trades.csv${book ? `?book=${encodeURIComponent(book)}` : ""}`}
+              onRange={(since, until) => setRange({ since, until })} />
           </span>
         </div>
         <div className="mt-2 max-h-[60vh] overflow-auto">

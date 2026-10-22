@@ -39,6 +39,7 @@ ASSUMED = "ASSUMED_FAMILY_MEDIAN"
 # exactly as they were rather than rewritten under new assumptions.
 COST_MODEL = "PER_ORDER_V2"
 COST_MODEL_OLD = "COST_MODEL_OLD"
+COST_MODEL_ANGEL = "ANGEL_ITEMIZED_V3"
 
 # Both legs of a round trip are one order each.
 ORDERS_PER_ROUND_TRIP = 2
@@ -62,6 +63,12 @@ class Charges:
     entry_statutory: float
     exit_statutory: float
     model: str = COST_MODEL
+    stt: float = 0.0
+    exchange_txn: float = 0.0
+    sebi: float = 0.0
+    stamp: float = 0.0
+    gst: float = 0.0
+    exchange: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -73,11 +80,24 @@ class Charges:
             "entry_statutory": self.entry_statutory,
             "exit_statutory": self.exit_statutory,
             "cost_model": self.model,
+            "stt": self.stt,
+            "exchange_txn": self.exchange_txn,
+            "sebi": self.sebi,
+            "stamp": self.stamp,
+            "gst": self.gst,
+            "exchange": self.exchange,
         }
 
 
+def _exchange(instrument: str | None) -> str:
+    from app.market.instruments import REGISTRY
+
+    spec = REGISTRY.get((instrument or "").upper())
+    return spec.exchange.upper() if spec is not None else ""
+
+
 def charges(entry_premium: float | None, exit_premium: float | None,
-            qty: int) -> Charges:
+            qty: int, instrument: str | None = None) -> Charges:
     """Rupee charges for buying ``qty`` at ``entry_premium`` and selling at
     ``exit_premium``, with the entry and exit orders computed separately.
 
@@ -97,6 +117,9 @@ def charges(entry_premium: float | None, exit_premium: float | None,
         max(0.0, float(exit_premium))
         if isinstance(exit_premium, (int, float)) else entry
     )
+    exch = _exchange(instrument) if instrument else ""
+    if settings.option_charges_itemized and exch in ("NFO", "BFO", "MCX"):
+        return _angel_charges(entry * quantity, exit_px * quantity, per_order, brokerage, exch)
     txn = float(settings.option_txn_pct) / 100.0
     stt = float(settings.option_stt_sell_pct) / 100.0
     entry_stat = entry * quantity * txn
@@ -109,6 +132,41 @@ def charges(entry_premium: float | None, exit_premium: float | None,
         per_order=round(per_order, 2),
         entry_statutory=round(entry_stat, 2),
         exit_statutory=round(exit_stat, 2),
+    )
+
+
+def _angel_charges(buy_val: float, sell_val: float, per_order: float,
+                   brokerage: float, exch: str) -> Charges:
+    """Angel One option charges, itemised per contract-note line."""
+    txn_pct = {"NFO": settings.option_nse_txn_pct, "BFO": settings.option_bse_txn_pct,
+               "MCX": settings.option_mcx_txn_pct}[exch] / 100.0
+    tax_pct = (settings.option_mcx_ctt_sell_pct if exch == "MCX"
+               else settings.option_stt_sell_pct) / 100.0
+    sebi_pct = settings.option_sebi_pct / 100.0
+    gst_pct = settings.option_gst_pct / 100.0
+    stt = sell_val * tax_pct
+    txn_b, txn_s = buy_val * txn_pct, sell_val * txn_pct
+    sebi_b, sebi_s = buy_val * sebi_pct, sell_val * sebi_pct
+    stamp = buy_val * settings.option_stamp_buy_pct / 100.0
+    gst_b = (per_order + txn_b + sebi_b) * gst_pct
+    gst_s = (per_order + txn_s + sebi_s) * gst_pct
+    entry_stat = txn_b + sebi_b + stamp + gst_b
+    exit_stat = stt + txn_s + sebi_s + gst_s
+    return Charges(
+        brokerage=round(brokerage, 2),
+        statutory=round(entry_stat + exit_stat, 2),
+        total=round(brokerage + entry_stat + exit_stat, 2),
+        orders=ORDERS_PER_ROUND_TRIP,
+        per_order=round(per_order, 2),
+        entry_statutory=round(entry_stat, 2),
+        exit_statutory=round(exit_stat, 2),
+        model=COST_MODEL_ANGEL,
+        stt=round(stt, 2),
+        exchange_txn=round(txn_b + txn_s, 2),
+        sebi=round(sebi_b + sebi_s, 2),
+        stamp=round(stamp, 2),
+        gst=round(gst_b + gst_s, 2),
+        exchange=exch,
     )
 
 

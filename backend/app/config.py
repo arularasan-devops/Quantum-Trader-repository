@@ -586,6 +586,18 @@ class Settings(BaseSettings):
     # whether the move actually pays. STT is charged on the sell side only.
     option_stt_sell_pct: float = 0.10
     option_txn_pct: float = 0.05
+    # Angel One itemised option charges (used when the instrument is known).
+    # Exchange txn % of premium turnover, both sides; STT (NSE/BSE) or CTT (MCX)
+    # on the sell side; SEBI fee both sides; stamp duty on the buy side; GST on
+    # brokerage + exchange + SEBI. Check against a contract note.
+    option_charges_itemized: bool = True
+    option_nse_txn_pct: float = 0.03503
+    option_bse_txn_pct: float = 0.0325
+    option_mcx_txn_pct: float = 0.0418
+    option_mcx_ctt_sell_pct: float = 0.05
+    option_sebi_pct: float = 0.0001
+    option_stamp_buy_pct: float = 0.003
+    option_gst_pct: float = 18.0
     # One-click LIVE auto-buy: when True (and the bot is live-armed) the sizing
     # budget is taken from the broker's LIVE available cash instead of the fixed
     # ``capital`` figure, so position size follows your real balance with no

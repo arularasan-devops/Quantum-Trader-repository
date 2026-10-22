@@ -1997,10 +1997,12 @@ async def paper_books_trades_csv(book: str | None = None, status: str | None = N
 @app.get("/api/paper-books/trades")
 async def paper_books_trades(book: str | None = None, status: str | None = None,
                              page: int = Query(1, ge=1),
-                             page_size: int = Query(50, ge=1, le=500)) -> dict:
+                             page_size: int = Query(50, ge=1, le=500),
+                             since: float | None = None,
+                             until: float | None = None) -> dict:
     from app.engine import paper_books
 
-    return paper_books.books().trades(book, status, page, page_size)
+    return paper_books.books().trades(book, status, page, page_size, since, until)
 
 
 @app.get("/api/journal/v2/sessions")
@@ -3575,7 +3577,8 @@ def _filter_book(rows: list[dict], book: str) -> list[dict]:
 
 
 @app.get("/api/trade-journal")
-async def trade_journal(limit: int = 500, book: str = "all") -> dict:
+async def trade_journal(limit: int = 500, book: str = "all",
+                        since: float | None = None, until: float | None = None) -> dict:
     """Complete trade journal — the FULL persisted record of every closed trade
     (paper AND live) with entry/exit, ₹ P&L, whether the bot opened it, the exit
     reason, entry confidence and a plain-English analyst note. Read-only. Survives
@@ -3594,6 +3597,8 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
     flow_only = book.lower() == "flow"
     all_rows = _filter_book(
         storage.store.journal(
+            since=int(since) if since is not None else None,
+            until=int(until) if until is not None else None,
             limit=max(1, min(5000, limit)),
             exclude_flow=not flow_only, only_flow=flow_only,
         ),
@@ -3634,7 +3639,8 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
 
     gross_win = sum(float(r["net_pnl"] or 0.0) for r in rows if float(r["net_pnl"] or 0.0) > 0)
     gross_loss = -sum(float(r["net_pnl"] or 0.0) for r in rows if float(r["net_pnl"] or 0.0) < 0)
-    charges = round(sum(float(r.get("cost_rupees") or 0.0) for r in rows), 1)
+    charges = round(sum(float(r.get("cost_rupees") or r.get("total_costs") or 0.0)
+                        for r in rows), 1)
     # Open positions are MTM only and never mixed into the realized totals.
     open_pos: list[dict] = []
     if book.lower() in ("all", "options"):
@@ -3734,6 +3740,7 @@ async def trade_journal_csv(limit: int = 5000, book: str = "all",
             # tell a measured spread from an absent one. Rows written before the
             # correction carry cost_model COST_MODEL_OLD, unaltered.
             "book", "cost_model", "brokerage", "brokerage_per_order", "statutory",
+            "total_costs", "exchange", "stt", "exchange_txn", "sebi", "stamp", "gst",
             "cost_status", "entry_bid", "entry_ask", "exit_bid", "exit_ask",
             "spread_cost_rupees"]
     if since is not None or until is not None:

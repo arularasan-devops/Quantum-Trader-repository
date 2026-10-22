@@ -38,11 +38,12 @@ export default function JournalBoard() {
   const [book, setBook] = useState<JournalBook>("all");
   const [extra, setExtra] = useState({ charges: 0, gross: 0, pf: null as number | null, unrealized: 0 });
   const [openPos, setOpenPos] = useState<JournalOpenPosition[]>([]);
+  const [range, setRange] = useState<{ since: number | null; until: number | null }>({ since: null, until: null });
 
   useEffect(() => {
     let alive = true;
     const load = () =>
-      getTradeJournal(500, book)
+      getTradeJournal(500, book, range.since, range.until)
         .then((r) => {
           if (!alive) return;
           setRows(r.trades || []);
@@ -60,7 +61,7 @@ export default function JournalBoard() {
       alive = false;
       clearInterval(id);
     };
-  }, [book]);
+  }, [book, range.since, range.until]);
 
   const winPct = summary.count ? Math.round((summary.wins / summary.count) * 100) : 0;
 
@@ -93,6 +94,7 @@ export default function JournalBoard() {
         <DateRangeDownload
           href={tradeJournalCsvUrl(5000, book)}
           label={`⬇ Download CSV${book === "all" ? "" : ` (${book})`}`}
+          onRange={(since, until) => setRange({ since, until })}
         />
       </div>
 
@@ -176,6 +178,7 @@ export default function JournalBoard() {
                   <th className="text-right px-3 py-2">Entry→Exit</th>
                   <th className="text-right px-3 py-2">Lots</th>
                   <th className="text-right px-3 py-2">P&amp;L ₹</th>
+                  <th className="text-right px-3 py-2">Charges ₹</th>
                   {/* Premium paid on an option, margin blocked on a future — and the
                       net measured against it, so trades of different size compare. */}
                   <th className="text-right px-3 py-2">Capital used</th>
@@ -196,6 +199,22 @@ export default function JournalBoard() {
                     <td className="px-3 py-2 text-right tabular-nums font-semibold"
                       style={{ color: (r.net_pnl ?? 0) >= 0 ? GREEN : RED }}>
                       {(r.net_pnl ?? 0) >= 0 ? "+" : ""}{(r.net_pnl ?? 0).toLocaleString()}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums text-white/60"
+                      title={r.total_costs == null ? "" : [
+                        `Brokerage ₹${r.brokerage ?? 0}`,
+                        r.stt != null ? `${r.exchange === "MCX" ? "CTT" : "STT"} ₹${r.stt}` : "",
+                        r.exchange_txn != null ? `Exchange ₹${r.exchange_txn}` : "",
+                        r.sebi != null ? `SEBI ₹${r.sebi}` : "",
+                        r.stamp != null ? `Stamp ₹${r.stamp}` : "",
+                        r.gst != null ? `GST ₹${r.gst}` : "",
+                      ].filter(Boolean).join(" · ")}>
+                      {r.total_costs == null ? "—" : Math.round(r.total_costs).toLocaleString("en-IN")}
+                      {r.gst != null && (
+                        <div className="text-[9px] text-white/40 whitespace-nowrap">
+                          Brk {Math.round(r.brokerage ?? 0)} · {r.exchange === "MCX" ? "CTT" : "STT"} {Math.round(r.stt ?? 0)} · GST {Math.round(r.gst)}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums text-white/60">
                       {r.capital_used == null

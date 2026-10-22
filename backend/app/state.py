@@ -1350,7 +1350,7 @@ class AppState:
         # be checked against a contract note instead of being taken on trust.
         exit_prem = self.position.current_premium
         charges_now = option_costs.charges(
-            entry_prem, exit_prem, spec_now.lot_size * lots
+            entry_prem, exit_prem, spec_now.lot_size * lots, self._instrument
         )
         trade_row.update(charges_now.as_dict())
         # Top-of-book at both ends, or COST_STATUS UNKNOWN. Never a modelled
@@ -3948,7 +3948,7 @@ class AppState:
         lot_size = get_spec(self._instrument).lot_size
         qty = lot_size * p.quantity_lots
         gross = (premium - (p.entry_premium or premium)) * qty
-        ch = option_costs.charges(p.entry_premium, premium, qty)
+        ch = option_costs.charges(p.entry_premium, premium, qty, self._instrument)
         p.brokerage = ch.brokerage
         p.statutory_charges = ch.statutory
         p.total_costs = ch.total

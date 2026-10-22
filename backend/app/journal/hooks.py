@@ -268,7 +268,7 @@ def _record_sizing(st, tid, sid, symbol, entry, stop, lots, lot_size, source, lo
         p = other.position
         deployed += (p.entry_premium or 0.0) * get_spec(other.instrument).lot_size * p.quantity_lots
     available = equity - deployed
-    est_cost = option_costs.charges(entry, entry, lot_size).total
+    est_cost = option_costs.charges(entry, entry, lot_size, st.instrument).total
     inp = sz.SizingInputs(
         instrument=st.instrument, contract=symbol, vehicle="OPTION_BUY", entry_price=entry,
         stop_price=stop, lot_size=lot_size, lot_size_source=source, lot_size_ts=lot_ts,
