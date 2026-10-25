@@ -105,6 +105,9 @@ REGISTRY: dict[str, InstrumentSpec] = {
     # contracts — expect the premium floor and the opportunity score to skip it
     # often. That is the gate working, not the instrument missing.
     "KALYANKJIL": InstrumentSpec("KALYANKJIL", "Kalyan Jewellers", "NFO", "NSE:KALYANKJIL", 500.0, 0.40, 10, 1175, 30),
+    # Seeds only — live Angel One reads the real lot size from the scrip master.
+    "ABB": InstrumentSpec("ABB", "ABB India", "NFO", "NSE:ABB", 5400.0, 0.30, 50, 125, 30),
+    "SHRIRAMFIN": InstrumentSpec("SHRIRAMFIN", "Shriram Finance", "NFO", "NSE:SHRIRAMFIN", 620.0, 0.32, 10, 825, 30),
 }
 
 DEFAULT_INSTRUMENT = "CRUDEOIL"
@@ -138,6 +141,8 @@ PINNED: tuple[str, ...] = (
     "BANKNIFTY",
     "SENSEX",
     "KALYANKJIL",
+    "ABB",
+    "SHRIRAMFIN",
 )
 
 

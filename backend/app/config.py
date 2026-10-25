@@ -700,6 +700,13 @@ class Settings(BaseSettings):
     daily_lock_pause_sec: float = 1800.0
     daily_lock_resume_room: float = 6000.0
     daily_lock_max_resumes: int = 1
+    # After the NSE/BSE close only MCX trades: from this IST time the lock starts
+    # fresh (steps count only profit made after it, pause/resume cleared) while
+    # the lock already reached before it stays a floor ("" = off).
+    daily_lock_session_reset_ist: str = "15:30"
+    # Apply the per-trade loss cap, ask-based sizing and the chase guard to LIVE
+    # auto entries too (they only ever shrink or skip a live order).
+    auto_trade_live_loss_budget: bool = True
     # Skip a PAPER auto entry whose ask is above the signal premium by more than
     # this % of the signal's stop distance (0 = off). The stop is fixed, so a
     # chased fill is a bigger loss than was planned.

@@ -100,6 +100,41 @@ def day_lock_level(day_peak_equity: float) -> float | None:
 _PEAK_LOCK = object()
 
 
+def combined_lock(peak: float, base: float = 0.0, floor: float | None = None,
+                  carry: float | None = None) -> float | None:
+    """Lock level from the peak measured above ``base`` (the session-reset
+    equity), or the post-pause ``floor``; never below a ``carry`` floor kept
+    from before the reset."""
+    if floor is not None:
+        lvl: float | None = floor
+    else:
+        rel = day_lock_level(peak - base)
+        lvl = None if rel is None else base + rel
+    if carry is not None:
+        lvl = carry if lvl is None else max(lvl, carry)
+    return lvl
+
+
+def session_reset_due(now: float, done_day: str, day: str) -> bool:
+    """True once per IST day at/after ``daily_lock_session_reset_ist``."""
+    raw = (settings.daily_lock_session_reset_ist or "").strip()
+    if not raw or done_day == day or settings.hours_ignored():
+        return False
+    try:
+        h, m = (int(x) for x in raw.split(":"))
+    except ValueError:
+        return False
+    return ist_minutes(now) >= h * 60 + m
+
+
+def reset_carry(lock: float | None, equity: float) -> float | None:
+    """Floor kept across the session reset: the lock already reached, but at
+    least the post-pause resume room below current equity."""
+    if lock is None:
+        return None
+    return min(lock, equity - max(0.0, settings.daily_lock_resume_room))
+
+
 def entry_loss_budget(day_peak_equity: float, equity: float, *,
                       per_trade_cap: float | None = None,
                       lock: float | None | object = _PEAK_LOCK) -> float | None:
@@ -149,6 +184,11 @@ class AccountRisk:
         self.lock_pause_until: float = 0.0
         self.lock_resumes: int = 0
         self.lock_floor: float | None = None
+        # Session reset (MCX evening): lock steps count from ``lock_base``;
+        # ``lock_carry`` keeps the lock reached before the reset.
+        self.lock_base: float = 0.0
+        self.lock_carry: float | None = None
+        self.lock_reset_day: str = ""
         self._loaded = False
 
     # --- persistence ------------------------------------------------------
@@ -175,6 +215,10 @@ class AccountRisk:
         self.lock_resumes = int(raw.get("lock_resumes") or 0)
         lf = raw.get("lock_floor")
         self.lock_floor = float(lf) if lf is not None else None
+        self.lock_base = float(raw.get("lock_base") or 0.0)
+        lc = raw.get("lock_carry")
+        self.lock_carry = float(lc) if lc is not None else None
+        self.lock_reset_day = str(raw.get("lock_reset_day") or "")
         self.last_exit = {str(k): float(v) for k, v in (raw.get("last_exit") or {}).items()}
         self.last_stop = {str(k): float(v) for k, v in (raw.get("last_stop") or {}).items()}
 
@@ -191,6 +235,9 @@ class AccountRisk:
             "lock_pause_until": self.lock_pause_until,
             "lock_resumes": self.lock_resumes,
             "lock_floor": self.lock_floor,
+            "lock_base": self.lock_base,
+            "lock_carry": self.lock_carry,
+            "lock_reset_day": self.lock_reset_day,
             "last_exit": self.last_exit,
             "last_stop": self.last_stop,
         }
@@ -229,14 +276,16 @@ class AccountRisk:
         self.lock_pause_until = 0.0
         self.lock_resumes = 0
         self.lock_floor = None
+        self.lock_base = 0.0
+        self.lock_carry = None
+        self.lock_reset_day = ""
         self._save()
 
     def lock_level(self) -> float | None:
         """Equity the day may not fall below once the target was reached (see
         ``day_lock_level``), or the post-pause floor. None until armed."""
-        if self.lock_floor is not None:
-            return self.lock_floor
-        return day_lock_level(self.day_peak_equity)
+        return combined_lock(self.day_peak_equity, self.lock_base,
+                             self.lock_floor, self.lock_carry)
 
     def restore_day(self, now: float, day_pnl: float, trades: int) -> bool:
         """Refill today's counters from the journal when the saved file came
@@ -268,6 +317,19 @@ class AccountRisk:
         self._roll(now)
         equity = self.day_pnl + unrealized
         changed = False
+        if session_reset_due(now, self.lock_reset_day, self.day):
+            self.lock_carry = reset_carry(self.lock_level(), equity)
+            self.lock_base = equity
+            self.day_peak_equity = equity
+            self.giveback_tripped = False
+            self.lock_pause_until = 0.0
+            self.lock_resumes = 0
+            self.lock_floor = None
+            self.lock_reset_day = self.day
+            changed = True
+            _log.warning("PROFIT_LOCK: session reset — fresh lock from equity ₹%.0f, "
+                         "earlier lock kept as a floor %s", equity,
+                         "none" if self.lock_carry is None else f"₹{self.lock_carry:,.0f}")
         if equity > self.day_peak_equity:
             self.day_peak_equity = equity
             changed = True
@@ -342,6 +404,9 @@ class AccountRisk:
                 f"account daily loss cap hit (₹{self.day_pnl:,.0f} of "
                 f"₹{settings.max_daily_loss:,.0f}) — flat for the day"
             )
+        if self.giveback_tripped and 0 < self.lock_pause_until <= now:
+            return ("profit lock: the pause is over — the next BUY resumes "
+                    "with small trades only")
         if self.giveback_tripped and self.lock_pause_until > 0:
             return (
                 f"profit lock: the day fell below the lock — pausing new buys for "

@@ -2223,6 +2223,14 @@ class AppState:
         lines.append("Paper/advisory alert — place the order manually per your risk plan.")
         notify.push("\n".join(lines))
 
+    def _live_entry_ask(self, opt: str | None) -> float:
+        """Current ask of ``opt`` from the feed (0 when unknown). Read-only."""
+        try:
+            q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+        except Exception:
+            q = None
+        return float(getattr(q, "ask", 0) or 0)
+
     def _auto_live_armed(self) -> bool:
         """True only when the bot is fully armed to place REAL orders: live feed +
         auto-trader on + the explicit second live switch. Any one missing → paper."""
@@ -3095,7 +3103,28 @@ class AppState:
         # LOSS BUDGET (paper): the stop-out of this trade may not exceed the
         # per-trade rupee cap, nor (once the day lock is armed) its share of the
         # room above the lock — a single trade can't give back the locked day.
-        if not live and lots >= 1 and decision.stop_loss is not None:
+        live_ask = 0.0
+        if live and settings.auto_trade_live_loss_budget and lots >= 1:
+            live_ask = self._live_entry_ask(opt)
+            sig = float(decision.current_premium or 0.0)
+            stop = float(decision.stop_loss) if decision.stop_loss is not None else 0.0
+            chase_cap = settings.auto_trade_max_chase_pct
+            if chase_cap > 0 and live_ask > 0 and 0 < stop < sig < live_ask:
+                chase = (live_ask - sig) / (sig - stop) * 100.0
+                if chase > chase_cap:
+                    self._auto_last_action = (
+                        f"AUTO SKIP {opt}: ask {live_ask:.2f} is {chase:.0f}% of the stop "
+                        f"above the signal {sig:.2f}")
+                    self._auto_last_action_ts = now
+                    self._auto_last_key = key
+                    exec_funnel.blocked(
+                        "RISK", "ENTRY_CHASE", instrument=self._instrument, option=opt,
+                        value=round(chase, 1), threshold=chase_cap,
+                        where="state.py:_auto_trade", reason="live ask too far above the signal",
+                    )
+                    return
+        if ((not live or settings.auto_trade_live_loss_budget)
+                and lots >= 1 and decision.stop_loss is not None):
             acct = account_risk.account
             equity = acct.day_pnl + sum(
                 o._liq_pnl() for o in registry.active() if o.position.option_symbol)
@@ -3105,7 +3134,8 @@ class AppState:
                 lock=acct.lock_level())
             # Size on the price a buy fills at (the ask), not the signal premium.
             entry_est = max(float(decision.current_premium or 0.0),
-                            float(getattr(self, "_auto_entry_ask", 0.0) or 0.0) if eng else 0.0)
+                            float(getattr(self, "_auto_entry_ask", 0.0) or 0.0) if eng else 0.0,
+                            live_ask)
             stop_est = float(decision.stop_loss)
             stop_pts = settings.auto_trade_stop_points.get(self._instrument)
             if stop_pts and stop_pts > 0:

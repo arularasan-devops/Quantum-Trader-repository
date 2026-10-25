@@ -652,6 +652,7 @@ export interface TriggerStats {
 
 /** Which book to score: everything, the option engine, or the futures paper tool. */
 export type JournalBook = "all" | "options" | "futures";
+export type JournalMode = "all" | "paper" | "live";
 
 export interface JournalOpenPosition {
   instrument: string;
@@ -664,9 +665,10 @@ export interface JournalOpenPosition {
 }
 
 export async function getTradeJournal(limit = 500, book: JournalBook = "all",
-                                      since: number | null = null, until: number | null = null) {
+                                      since: number | null = null, until: number | null = null,
+                                      mode: JournalMode = "all") {
   const range = `${since !== null ? `&since=${since}` : ""}${until !== null ? `&until=${until}` : ""}`;
-  const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}${range}`);
+  const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}&mode=${mode}${range}`);
   return res.json() as Promise<{
     count: number;
     wins: number;
@@ -683,8 +685,8 @@ export async function getTradeJournal(limit = 500, book: JournalBook = "all",
   }>;
 }
 
-export function tradeJournalCsvUrl(limit = 5000, book: JournalBook = "all") {
-  return `${API_BASE}/api/trade-journal.csv?limit=${limit}&book=${book}`;
+export function tradeJournalCsvUrl(limit = 5000, book: JournalBook = "all", mode: JournalMode = "all") {
+  return `${API_BASE}/api/trade-journal.csv?limit=${limit}&book=${book}&mode=${mode}`;
 }
 
 export interface FlowSettings {

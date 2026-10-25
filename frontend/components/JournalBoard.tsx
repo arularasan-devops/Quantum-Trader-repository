@@ -7,8 +7,15 @@ import {
   tradeJournalCsvUrl,
   type JournalBook,
   type JournalOpenPosition,
+  type JournalMode,
   type JournalTrade,
 } from "@/lib/api";
+
+const MODES: { key: JournalMode; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "paper", label: "Paper" },
+  { key: "live", label: "Live" },
+];
 
 const BOOKS: { key: JournalBook; label: string }[] = [
   { key: "all", label: "All" },
@@ -36,6 +43,7 @@ export default function JournalBoard() {
   // The two books are different instruments with different risk models, so a
   // combined win rate is close to meaningless — score them apart.
   const [book, setBook] = useState<JournalBook>("all");
+  const [mode, setMode] = useState<JournalMode>("all");
   const [extra, setExtra] = useState({ charges: 0, gross: 0, pf: null as number | null, unrealized: 0 });
   const [openPos, setOpenPos] = useState<JournalOpenPosition[]>([]);
   const [range, setRange] = useState<{ since: number | null; until: number | null }>({ since: null, until: null });
@@ -43,7 +51,7 @@ export default function JournalBoard() {
   useEffect(() => {
     let alive = true;
     const load = () =>
-      getTradeJournal(500, book, range.since, range.until)
+      getTradeJournal(500, book, range.since, range.until, mode)
         .then((r) => {
           if (!alive) return;
           setRows(r.trades || []);
@@ -61,7 +69,7 @@ export default function JournalBoard() {
       alive = false;
       clearInterval(id);
     };
-  }, [book, range.since, range.until]);
+  }, [book, mode, range.since, range.until]);
 
   const winPct = summary.count ? Math.round((summary.wins / summary.count) * 100) : 0;
 
@@ -74,6 +82,20 @@ export default function JournalBoard() {
             style={{ color: MUTED, border: `1px solid ${MUTED}55` }}>
             Auto-bought trades · PostgreSQL (persistent volume + backups/ on C:)
           </span>
+        </div>
+        <div className="flex items-center gap-1 rounded-lg border border-white/15 p-0.5">
+          {MODES.map((m) => (
+            <button
+              key={m.key}
+              onClick={() => setMode(m.key)}
+              className={`text-xs font-semibold px-3 py-1 rounded-md ${
+                mode === m.key ? "bg-white/15 text-white" : "text-white/50 hover:bg-white/5"
+              }`}
+              style={m.key === "live" && mode === m.key ? { color: RED } : undefined}
+            >
+              {m.label}
+            </button>
+          ))}
         </div>
         <div className="flex items-center gap-1 rounded-lg border border-white/15 p-0.5">
           {BOOKS.map((b) => (
@@ -92,8 +114,8 @@ export default function JournalBoard() {
           ))}
         </div>
         <DateRangeDownload
-          href={tradeJournalCsvUrl(5000, book)}
-          label={`⬇ Download CSV${book === "all" ? "" : ` (${book})`}`}
+          href={tradeJournalCsvUrl(5000, book, mode)}
+          label={`⬇ Download CSV${book === "all" ? "" : ` (${book})`}${mode === "all" ? "" : ` (${mode})`}`}
           onRange={(since, until) => setRange({ since, until })}
         />
       </div>

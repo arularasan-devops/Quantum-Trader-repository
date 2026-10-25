@@ -3576,9 +3576,18 @@ def _filter_book(rows: list[dict], book: str) -> list[dict]:
     return rows
 
 
+def _filter_mode(rows: list[dict], mode: str) -> list[dict]:
+    """Paper / live tabs of the journal; "all" keeps both."""
+    m = (mode or "all").lower()
+    if m not in ("paper", "live"):
+        return rows
+    return [r for r in rows if (r.get("mode") or "paper").lower() == m]
+
+
 @app.get("/api/trade-journal")
 async def trade_journal(limit: int = 500, book: str = "all",
-                        since: float | None = None, until: float | None = None) -> dict:
+                        since: float | None = None, until: float | None = None,
+                        mode: str = "all") -> dict:
     """Complete trade journal — the FULL persisted record of every closed trade
     (paper AND live) with entry/exit, ₹ P&L, whether the bot opened it, the exit
     reason, entry confidence and a plain-English analyst note. Read-only. Survives
@@ -3595,7 +3604,7 @@ async def trade_journal(limit: int = 500, book: str = "all",
     # "flow" is the Flow book on its own; every other view holds it out. Pooled,
     # its 4,647 one-minute legs decide each aggregate by weight of numbers.
     flow_only = book.lower() == "flow"
-    all_rows = _filter_book(
+    all_rows = _filter_mode(_filter_book(
         storage.store.journal(
             since=int(since) if since is not None else None,
             until=int(until) if until is not None else None,
@@ -3603,7 +3612,7 @@ async def trade_journal(limit: int = 500, book: str = "all",
             exclude_flow=not flow_only, only_flow=flow_only,
         ),
         book,
-    )
+    ), mode)
     # Seeded demonstration rows are held out of every figure below. Averaged in,
     # they reported ₹1,94,034 at an 83.5% win rate off 82 copies of one leg.
     provenance = prov.provenance(all_rows)
@@ -3697,7 +3706,8 @@ def _in_range(t: float | None, since: float | None, until: float | None) -> bool
 
 @app.get("/api/trade-journal.csv")
 async def trade_journal_csv(limit: int = 5000, book: str = "all",
-                            since: float | None = None, until: float | None = None):
+                            since: float | None = None, until: float | None = None,
+                            mode: str = "all"):
     """Download the complete trade journal as CSV (spreadsheet-friendly).
     Read-only; same data as /api/journal."""
     import csv
@@ -3715,14 +3725,14 @@ async def trade_journal_csv(limit: int = 5000, book: str = "all",
     from app.analysis import trade_provenance as prov
 
     flow_only = book.lower() == "flow"
-    rows, _seeded = prov.split(
+    rows, _seeded = prov.split(_filter_mode(
         _filter_book(
             storage.store.journal(
                 limit=max(1, min(20000, limit)),
                 exclude_flow=not flow_only, only_flow=flow_only,
             ),
             book,
-        )
+        ), mode)
     )
     # entry_trigger lets you compare PULLBACK vs REVERSAL vs IGNITION entries
     # against each other on real fills; FUT marks the futures paper book.

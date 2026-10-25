@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 
 from app.analysis import option_costs
 from app.config import settings
-from app.engine.account_risk import day_lock_level, entry_loss_budget, lots_for_budget
+from app.engine.account_risk import (
+    combined_lock, day_lock_level, entry_loss_budget, ist_minutes, lots_for_budget,
+    reset_carry,
+    session_reset_due,
+)
 from app.market.instruments import get_spec
 from app.journal.store import iso, session_date, stable_id
 from app.models import Signal
@@ -48,7 +52,32 @@ _DDL = [
         PRIMARY KEY (book, day))""",
 ]
 
+_DAY_COLS = [("pause_until", "DOUBLE PRECISION"), ("resumes", "INTEGER"),
+             ("lock_floor", "DOUBLE PRECISION"), ("lock_base", "DOUBLE PRECISION"),
+             ("lock_carry", "DOUBLE PRECISION"), ("reset_done", "INTEGER")]
+
 _POS_COLS = ("stop", "peak", "floor", "mark")
+
+
+def _hhmm(raw: str) -> int | None:
+    try:
+        h, m = (int(x) for x in str(raw).split(":"))
+    except ValueError:
+        return None
+    return h * 60 + m
+
+
+def squareoff_min(instrument: str) -> int | None:
+    """IST minute after which a book takes no new entry and flattens: the main
+    engine's square-off time on MCX, five minutes before the NSE/BSE close."""
+    exch = (get_spec(instrument).exchange or "").upper()
+    close = _hhmm(settings.session_window_ist(exch)[1])
+    cut = None if close is None else close - 5
+    if exch == "MCX":
+        sq = _hhmm(settings.auto_squareoff_ist)
+        if sq is not None:
+            cut = sq if cut is None else min(cut, sq)
+    return cut
 
 
 @dataclass
@@ -88,6 +117,15 @@ class Book:
     day_realized: float = 0.0
     day_peak: float = 0.0
     locked: bool = False
+    pause_until: float = 0.0
+    resumes: int = 0
+    floor: float | None = None
+    base: float = 0.0
+    carry: float | None = None
+    reset_done: bool = False
+
+    def lock_level(self) -> float | None:
+        return combined_lock(self.day_peak, self.base, self.floor, self.carry)
 
     def deployed(self) -> float:
         return sum(p.entry * p.qty for p in self.positions.values())
@@ -200,6 +238,14 @@ class PaperBooks:
         self.db = db or Database()
         for ddl in _DDL:
             self.db.execute(ddl)
+        for col, typ in _DAY_COLS:
+            try:
+                if self.db.is_postgres:
+                    self.db.execute(f"ALTER TABLE jr_book_days ADD COLUMN IF NOT EXISTS {col} {typ}")
+                else:
+                    self.db.execute(f"ALTER TABLE jr_book_days ADD COLUMN {col} {typ}")
+            except Exception:  # sqlite: column already exists
+                pass
         self.books = parse_books(specs if specs is not None else settings.paper_books)
         self._lock = threading.Lock()
         self.last_skip: dict[str, str] = {}
@@ -227,10 +273,17 @@ class PaperBooks:
                 continue
             b.day = day
             row = self.db.query_one(
-                "SELECT peak_equity, locked FROM jr_book_days WHERE book = ? AND day = ?",
+                "SELECT * FROM jr_book_days WHERE book = ? AND day = ?",
                 (b.id, day))
-            b.day_peak = float(row["peak_equity"] or 0.0) if row else 0.0
-            b.locked = bool(row["locked"]) if row else False
+            row = dict(row) if row else {}
+            b.day_peak = float(row.get("peak_equity") or 0.0)
+            b.locked = bool(row.get("locked"))
+            b.pause_until = float(row.get("pause_until") or 0.0)
+            b.resumes = int(row.get("resumes") or 0)
+            b.floor = float(row["lock_floor"]) if row.get("lock_floor") is not None else None
+            b.base = float(row.get("lock_base") or 0.0)
+            b.carry = float(row["lock_carry"]) if row.get("lock_carry") is not None else None
+            b.reset_done = bool(row.get("reset_done"))
             b.day_realized = 0.0
             for r in self.db.query(
                     "SELECT net_pnl, exit_ts FROM jr_book_trades WHERE book = ? AND status = 'CLOSED'",
@@ -240,12 +293,17 @@ class PaperBooks:
 
     def _save_day(self, b: Book, now: float) -> None:
         self.db.execute(
-            "INSERT INTO jr_book_days (book, day, peak_equity, locked, lock_ts, lock_level) "
-            "VALUES (?,?,?,?,?,?) ON CONFLICT (book, day) DO UPDATE SET "
+            "INSERT INTO jr_book_days (book, day, peak_equity, locked, lock_ts, lock_level, "
+            "pause_until, resumes, lock_floor, lock_base, lock_carry, reset_done) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (book, day) DO UPDATE SET "
             "peak_equity = excluded.peak_equity, locked = excluded.locked, "
-            "lock_ts = excluded.lock_ts, lock_level = excluded.lock_level",
+            "lock_ts = excluded.lock_ts, lock_level = excluded.lock_level, "
+            "pause_until = excluded.pause_until, resumes = excluded.resumes, "
+            "lock_floor = excluded.lock_floor, lock_base = excluded.lock_base, "
+            "lock_carry = excluded.lock_carry, reset_done = excluded.reset_done",
             (b.id, b.day, b.day_peak, int(b.locked), now if b.locked else None,
-             day_lock_level(b.day_peak)))
+             b.lock_level(), b.pause_until, b.resumes, b.floor, b.base, b.carry,
+             int(b.reset_done)))
 
     def _close(self, b: Book, p: Pos, price: float, reason: str, now: float) -> None:
         gross = (price - p.entry) * p.qty
@@ -280,7 +338,7 @@ class PaperBooks:
                 if mark <= 0:
                     continue
                 before = tuple(getattr(p, c) for c in _POS_COLS)
-                reason = manage(p, mark, b.capital)
+                reason = self._session_exit(p, now) or manage(p, mark, b.capital)
                 if reason:
                     self._close(b, p, mark, reason, now)
                 elif tuple(getattr(p, c) for c in _POS_COLS) != before:
@@ -291,16 +349,52 @@ class PaperBooks:
                 self._profit_lock(b, now)
             self._entries(st, decision, quotes, now)
 
+    @staticmethod
+    def _past_cutoff(inst: str, now: float) -> bool:
+        if settings.hours_ignored():
+            return False
+        cut = squareoff_min(inst)
+        return cut is not None and ist_minutes(now) >= cut
+
+    def _session_exit(self, p: Pos, now: float) -> str | None:
+        """Books are intraday like the main engine: flat at the square-off
+        time, and a position left open from an earlier session closes at once."""
+        if settings.hours_ignored():
+            return None
+        if session_date(p.entry_ts) != session_date(now):
+            return "SQUARE-OFF (carried)"
+        return "SQUARE-OFF" if self._past_cutoff(p.instrument, now) else None
+
     def _profit_lock(self, b: Book, now: float) -> None:
         eq = b.equity()
         changed = False
+        room = max(0.0, settings.daily_lock_resume_room)
+        if not b.reset_done and session_reset_due(now, "", b.day):
+            b.carry = reset_carry(b.lock_level(), eq)
+            b.base, b.day_peak = eq, eq
+            b.locked, b.pause_until, b.resumes, b.floor = False, 0.0, 0, None
+            b.reset_done = True
+            changed = True
         if eq > b.day_peak:
             b.day_peak = eq
             changed = True
-        lvl = day_lock_level(b.day_peak)
-        if not b.locked and lvl is not None and eq < lvl - 1e-6:
+        if b.floor is not None and not b.locked and eq - room > b.floor + 1e-6:
+            b.floor = eq - room
+            changed = True
+        lvl = b.lock_level()
+        if b.locked and b.pause_until > 0 and now >= b.pause_until:
+            b.locked, b.pause_until = False, 0.0
+            b.resumes += 1
+            b.floor = eq - room
+            changed = True
+            _log.warning("BOOK %s PROFIT_LOCK: pause over — resumes under floor ₹%.0f",
+                         b.id, b.floor)
+        elif not b.locked and lvl is not None and eq < lvl - 1e-6:
             b.locked = True
             changed = True
+            pause = settings.daily_lock_pause_sec
+            b.pause_until = (now + pause if pause > 0
+                             and b.resumes < max(0, settings.daily_lock_max_resumes) else 0.0)
             _log.warning("BOOK %s PROFIT_LOCK: equity ₹%.0f under lock ₹%.0f (peak ₹%.0f)",
                          b.id, eq, lvl, b.day_peak)
             if settings.profit_lock_flatten:
@@ -330,6 +424,8 @@ class PaperBooks:
             return self._skip(inst, f"confidence {d.confidence:.0f}")
         if not st._feed_ready():
             return self._skip(inst, "feed not ready")
+        if self._past_cutoff(inst, now):
+            return self._skip(inst, "past square-off time")
         q = quotes.get(opt)
         if q is None:
             return self._skip(inst, "no quote")
@@ -352,7 +448,7 @@ class PaperBooks:
             if lots < 1:
                 self._skip(inst, f"{b.id}: capital")
                 continue
-            room = entry_loss_budget(b.day_peak, b.equity())
+            room = entry_loss_budget(b.day_peak, b.equity(), lock=b.lock_level())
             if room is not None:
                 fit = lots_for_budget(room, entry, stop, lot_size)
                 if fit < 1:
@@ -412,7 +508,8 @@ class PaperBooks:
                     "today_realized": round(b.day_realized, 2),
                     "today_equity": round(b.equity(), 2),
                     "day_peak": round(b.day_peak, 2),
-                    "lock_level": day_lock_level(b.day_peak),
+                    "lock_level": b.lock_level(),
+                    "pause_sec_left": max(0, int(b.pause_until - time.time())) if b.locked else 0,
                     "locked": b.locked,
                     "deployed": round(b.deployed(), 2),
                     "open": [{"instrument": p.instrument, "option": p.option, "lots": p.lots,
