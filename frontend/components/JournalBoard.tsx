@@ -11,16 +11,10 @@ import {
   type JournalTrade,
 } from "@/lib/api";
 
-const MODES: { key: JournalMode; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "paper", label: "Paper" },
-  { key: "live", label: "Live" },
-];
-
-const BOOKS: { key: JournalBook; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "options", label: "Options" },
-  { key: "futures", label: "Futures" },
+const TABS: { key: string; label: string; mode: JournalMode; book: JournalBook }[] = [
+  { key: "all", label: "All", mode: "all", book: "options" },
+  { key: "paper", label: "Paper", mode: "paper", book: "options" },
+  { key: "live", label: "Live", mode: "live", book: "options" },
 ];
 
 const GREEN = "#22c55e";
@@ -42,8 +36,8 @@ export default function JournalBoard() {
   const [summary, setSummary] = useState({ count: 0, wins: 0, losses: 0, net_pnl: 0 });
   // The two books are different instruments with different risk models, so a
   // combined win rate is close to meaningless — score them apart.
-  const [book, setBook] = useState<JournalBook>("all");
-  const [mode, setMode] = useState<JournalMode>("all");
+  const [tab, setTab] = useState("all");
+  const { mode, book } = TABS.find((t) => t.key === tab) ?? TABS[0];
   const [extra, setExtra] = useState({ charges: 0, gross: 0, pf: null as number | null, unrealized: 0 });
   const [openPos, setOpenPos] = useState<JournalOpenPosition[]>([]);
   const [range, setRange] = useState<{ since: number | null; until: number | null }>({ since: null, until: null });
@@ -84,38 +78,22 @@ export default function JournalBoard() {
           </span>
         </div>
         <div className="flex items-center gap-1 rounded-lg border border-white/15 p-0.5">
-          {MODES.map((m) => (
+          {TABS.map((t) => (
             <button
-              key={m.key}
-              onClick={() => setMode(m.key)}
+              key={t.key}
+              onClick={() => setTab(t.key)}
               className={`text-xs font-semibold px-3 py-1 rounded-md ${
-                mode === m.key ? "bg-white/15 text-white" : "text-white/50 hover:bg-white/5"
+                tab === t.key ? "bg-white/15 text-white" : "text-white/50 hover:bg-white/5"
               }`}
-              style={m.key === "live" && mode === m.key ? { color: RED } : undefined}
+              style={t.key === "live" && tab === t.key ? { color: RED } : undefined}
             >
-              {m.label}
-            </button>
-          ))}
-        </div>
-        <div className="flex items-center gap-1 rounded-lg border border-white/15 p-0.5">
-          {BOOKS.map((b) => (
-            <button
-              key={b.key}
-              onClick={() => setBook(b.key)}
-              className={`text-xs font-semibold px-3 py-1 rounded-md ${
-                book === b.key ? "bg-white/15 text-white" : "text-white/50 hover:bg-white/5"
-              }`}
-            >
-              {b.label}
-              {b.key === "futures" && (
-                <span className="ml-1 text-[9px] text-amber-300/80">PAPER</span>
-              )}
+              {t.label}
             </button>
           ))}
         </div>
         <DateRangeDownload
           href={tradeJournalCsvUrl(5000, book, mode)}
-          label={`⬇ Download CSV${book === "all" ? "" : ` (${book})`}${mode === "all" ? "" : ` (${mode})`}`}
+          label={`⬇ Download CSV${mode === "all" ? "" : ` (${mode})`}`}
           onRange={(since, until) => setRange({ since, until })}
         />
       </div>

@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { AccountRiskStatus, AutoBuyStatus, AutoTradeConfig, EntryGateSettings, getEngineSettings, getEntryGates, getRiskGuard, setAutoBuy, setAutoTrade, setEntryGates, setPointExits } from "@/lib/api";
+import { AccountRiskStatus, AutoBuyStatus, AutoTradeConfig, EntryGateSettings, getEngineSettings, getEntryGates, getKillSwitch, getRiskGuard, hasLiveToken, releaseKillSwitch, setAutoBuy, setLiveToken, setAutoTrade, setEntryGates, setPointExits } from "@/lib/api";
 import { InstrumentOption } from "@/lib/types";
 
 /**
@@ -15,6 +15,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
   const [saving, setSaving] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoBuy, setAutoBuyState] = useState<AutoBuyStatus | null>(null);
+  const [autoBuyErr, setAutoBuyErr] = useState<string | null>(null);
   const [gates, setGates] = useState<EntryGateSettings | null>(null);
   const [guard, setGuard] = useState<AccountRiskStatus | null>(null);
 
@@ -108,19 +109,43 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
   };
 
   const toggleAutoBuy = async (turnOn: boolean) => {
+    setAutoBuyErr(null);
     if (turnOn) {
       const ok = window.confirm(
-        "Turn ON LIVE Auto-Buy?\n\nThe bot will place REAL orders on your Angel account, sizing each trade from your available balance (bigger size on higher-confidence signals). Real money, real losses. One order can never exceed your available cash.\n\nRequires QT_TRADE_MODE=live + a connected Angel session."
+        "Turn ON LIVE Auto-Buy?\n\nThe bot will place REAL orders on your Angel account with the same strategy as paper. Lots are sized from QT_CAPITAL at the ask, then cut to the per-trade loss cap and the live order cap.\n\nRequires QT_TRADE_MODE=live and a connected Angel session."
       );
       if (!ok) return;
+      if (!hasLiveToken()) {
+        const t = window.prompt("Live-arm token (QT_LIVE_ARM_TOKEN from your .env). Kept in memory only:");
+        if (!t || !t.trim()) return;
+        setLiveToken(t);
+      }
     }
     setSaving(true);
     try {
+      if (turnOn) {
+        const ks = await getKillSwitch();
+        if (ks.engaged) {
+          if (!window.confirm(`Kill switch is engaged (${ks.reason || "no reason"}). Release it and arm live?`)) return;
+          const t = window.prompt("Confirm the live-arm token to release the kill switch:");
+          if (!t || !t.trim()) return;
+          setLiveToken(t);
+          await releaseKillSwitch(t.trim(), "released from Live Auto-Buy");
+        }
+      }
       const st = await setAutoBuy(turnOn);
       setAutoBuyState(st);
-      const s = await getEngineSettings();
-      setCfg(s.auto_trade);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("(401)")) setLiveToken(null);
+      setAutoBuyErr(msg);
     } finally {
+      try {
+        const s = await getEngineSettings();
+        setCfg(s.auto_trade);
+      } catch {
+        /* keep the last settings */
+      }
       setSaving(false);
     }
   };
@@ -129,7 +154,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
 
   const liveArmed = cfg.mode === "live";
   const liveFeed = cfg.trade_mode?.toLowerCase() === "live";
-  const oneClickOn = cfg.enabled && cfg.allow_live && !!cfg.use_live_balance;
+  const oneClickOn = cfg.enabled && cfg.allow_live;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4 mb-4">
@@ -145,8 +170,8 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
           <div className="min-w-0">
             <div className="text-sm font-bold text-white">Live Auto-Buy</div>
             <div className="text-[11px] text-white/45 leading-4 mt-0.5">
-              One switch. The signal picks the trade &amp; confidence; the bot sizes it from your
-              balance and buys automatically. You decide nothing else.
+              One switch arms LIVE with the same strategy as paper. Lots come from your capital at
+              the ask, cut to the per-trade loss cap and the live order cap.
             </div>
           </div>
           <button
@@ -169,7 +194,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
                 Balance <span className="font-bold text-white">₹{autoBuy.available_cash.toLocaleString("en-IN")}</span>
               </span>
             )}
-            <span className="text-white/45">Sizing: confidence-scaled · buys first signal ≥ {cfg.min_confidence}%</span>
+            <span className="text-white/45">Sizing: capital at the ask · loss-capped · buys signals ≥ {cfg.min_confidence}%</span>
             {oneClickOn && !liveArmed && (
               <span className="text-amber-300 font-semibold">Not live yet — set QT_TRADE_MODE=live (paper for now)</span>
             )}
@@ -179,6 +204,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
           </div>
         )}
         {autoBuy?.note && <div className="mt-1 text-[10px] text-white/35">{autoBuy.note}</div>}
+        {autoBuyErr && <div className="mt-1 text-[11px] text-rose-300 font-semibold">{autoBuyErr}</div>}
       </div>
 
       <button

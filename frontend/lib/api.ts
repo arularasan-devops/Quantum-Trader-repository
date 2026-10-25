@@ -14,6 +14,10 @@ export function setLiveToken(token: string | null) {
   liveToken = token && token.trim() ? token.trim() : null;
 }
 
+export function hasLiveToken(): boolean {
+  return !!liveToken;
+}
+
 if (typeof window !== "undefined") {
   // Remove the token an earlier build kept in persistent browser storage.
   try {
@@ -277,6 +281,7 @@ export async function setAutoBuy(on: boolean) {
     headers: liveHeaders(),
     body: JSON.stringify({ on }),
   });
+  if (!res.ok) throw new Error(`Auto-buy ${on ? "on" : "off"} failed (${res.status}): ${await errorDetail(res)}`);
   return res.json() as Promise<AutoBuyStatus>;
 }
 

@@ -1308,42 +1308,19 @@ async def auto_buy(req: AutoBuyRequest,
         balance = None
 
     if req.on:
+        # Arms LIVE only. The strategy, exits and sizing stay exactly as in PAPER
+        # (pullback engine, lots from QT_CAPITAL at the ask, per-trade loss cap);
+        # the broker balance can only shrink the per-order ceiling.
         settings.auto_trade_enabled = True
         settings.auto_trade_allow_live = True
-        settings.auto_trade_use_live_balance = True
-        settings.auto_trade_safe_sizing = True
-        settings.auto_trade_momentum_entry = False
-        # --- V4 management (validated on 5y of 1-min data): keep the WIDE ATR stop
-        # and RIDE winners on a ratcheting lock instead of booking T1. The 5-year
-        # dry run showed tight stops / break-even / quick-scalp all cut the win rate
-        # so hard they turned the edge NEGATIVE (PF < 0.6); the wide-stop + ride
-        # variant was the only clear net winner (NIFTY PF 1.12 vs 1.05). Loss size
-        # is controlled by LOT COUNT + the order-value cap, NOT by a tight stop.
-        settings.auto_trade_ride_trail = True
-        # LOCK-ANY-PROFIT exit (user-requested): do NOT wait for T1. As soon as the
-        # premium is a little above entry and then stalls / ticks down from its peak,
-        # exit and bank whatever profit is showing (e.g. entry 12 → stuck at 15 → exit;
-        # or reaches 17 and rolls over → exit). Arm early (small profit) and use a
-        # tight give-back so it exits near the stall instead of holding for the target.
-        settings.auto_trade_pre_t1_trail = True
-        settings.auto_trade_pre_t1_trail_arm_profit_pct = 4.0
-        settings.auto_trade_pre_t1_trail_giveback_pct = 20.0
-        settings.auto_trade_pre_t1_trail_min_giveback = 1.0
-        settings.auto_trade_pre_t1_trail_min_giveback_pct = 0.5
-        # Once green, never let it fall back below entry — protect the profit.
-        settings.auto_trade_breakeven_after_arm = True
-        settings.auto_trade_quick_scalp_lots = 0
-        # Use the engine's regime ATR stop as-is (wide). 0 = no extra tightening.
-        settings.auto_trade_max_stop_pct = 0.0
-        # Balance can only SHRINK the per-order ceiling; it never raises it above
-        # the configured live cap or the strategy capital, and live lots stay at
-        # the configured cap (no silent expansion).
+        settings.auto_trade_use_live_balance = False
         ceiling = min(settings.auto_trade_live_max_order_value, settings.capital)
         if balance and balance > 0:
             ceiling = min(ceiling, round(balance, 2))
         settings.auto_trade_live_max_order_value = ceiling
     else:
-        settings.auto_trade_enabled = False
+        # Disarm live only: no new live entries; an open live position keeps its
+        # exits, and the PAPER bot is left as it was.
         settings.auto_trade_allow_live = False
 
     live_active = settings.trade_mode.lower() == "live" and balance is not None
@@ -1357,13 +1334,13 @@ async def auto_buy(req: AutoBuyRequest,
         "live_max_order_value": settings.auto_trade_live_max_order_value,
         "min_confidence": settings.auto_trade_min_confidence,
         "note": (
-            "Live auto-buy armed — sizing from your balance by signal confidence."
+            "Live auto-buy armed: same strategy as paper, lots from capital at the ask."
             if (req.on and live_active)
             else (
                 "Enabled, but NOT live: set QT_TRADE_MODE=live and ensure your Angel "
                 "session is connected, or it will paper-trade only."
                 if req.on
-                else "Auto-buy off."
+                else "Live disarmed: no new live buys (open positions keep their exits)."
             )
         ),
     }
