@@ -1428,6 +1428,7 @@ async def get_settings() -> dict:
                 if (settings.trade_mode.lower() == "live" and settings.auto_trade_enabled and settings.auto_trade_allow_live)
                 else "paper"
             ),
+            "kill_switch": live_control.kill_switch_engaged(),
         },
         # Premium-SELLING engine — PAPER ONLY; no live order path exists for it.
         "credit_spread": {

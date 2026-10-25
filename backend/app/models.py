@@ -1152,6 +1152,7 @@ class AutoTradeState(BaseModel):
 
     enabled: bool = False
     mode: str = "paper"                 # always 'paper' for now (never live here)
+    kill_switch: bool = False           # live entries blocked while engaged
     min_confidence: float = 90.0        # auto-buy gate
     max_lots: int = 1
     in_position: bool = False

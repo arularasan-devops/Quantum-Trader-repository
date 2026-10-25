@@ -154,7 +154,9 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
 
   const liveArmed = cfg.mode === "live";
   const liveFeed = cfg.trade_mode?.toLowerCase() === "live";
-  const oneClickOn = cfg.enabled && cfg.allow_live;
+  const killOn = !!cfg.kill_switch;
+  const killBlocked = cfg.enabled && cfg.allow_live && killOn;
+  const oneClickOn = cfg.enabled && cfg.allow_live && !killOn;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4 mb-4">
@@ -175,18 +177,23 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
             </div>
           </div>
           <button
-            onClick={() => toggleAutoBuy(!oneClickOn)}
+            onClick={() => toggleAutoBuy(killBlocked ? true : !oneClickOn)}
             disabled={saving}
             className="ml-auto shrink-0 px-5 py-2.5 rounded-xl text-sm font-extrabold border"
             style={{
-              borderColor: oneClickOn ? "#19e57f" : "rgba(255,255,255,0.2)",
-              color: oneClickOn ? "#04110a" : "#e6e9f0",
+              borderColor: oneClickOn ? "#19e57f" : killBlocked ? "#f59e0b" : "rgba(255,255,255,0.2)",
+              color: oneClickOn ? "#04110a" : killBlocked ? "#fbbf24" : "#e6e9f0",
               background: oneClickOn ? "#19e57f" : "rgba(255,255,255,0.04)",
             }}
           >
-            {oneClickOn ? "AUTO-BUY ON" : "AUTO-BUY OFF"}
+            {oneClickOn ? "AUTO-BUY ON" : killBlocked ? "KILL SWITCH ON · RELEASE" : "AUTO-BUY OFF"}
           </button>
         </div>
+        {killBlocked && (
+          <div className="mt-2 text-[11px] text-amber-300 font-semibold">
+            Kill switch engaged: no live orders until you release it (click the button, then paste your token).
+          </div>
+        )}
         {(oneClickOn || autoBuy) && (
           <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
             {autoBuy?.available_cash != null && (

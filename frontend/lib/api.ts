@@ -233,6 +233,7 @@ export interface AutoTradeConfig {
   balanced_max_lots?: number;
   trade_mode: string;
   mode: string;
+  kill_switch?: boolean;
 }
 
 // Set per-instrument fixed point stops / profit targets for Auto-Buy. Send

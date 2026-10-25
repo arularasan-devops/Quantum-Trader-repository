@@ -380,7 +380,9 @@ export default function QuantumSignal({
           </>
         ) : (
           <div className="text-sm text-white/40">
-            {at?.mode === "live"
+            {at?.mode === "live" && at?.kill_switch
+              ? "Flat — no open position. Kill switch ENGAGED: no live orders until you release it."
+              : at?.mode === "live"
               ? "Flat — no open position. Bot is LIVE-armed and will place a REAL order on the next qualified signal."
               : at?.enabled
                 ? "Flat — no open position. Bot is ON (paper); it will simulate a buy on the next qualified signal."

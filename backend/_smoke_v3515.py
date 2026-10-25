@@ -38,10 +38,12 @@ settings.auto_trade_enabled = True
 
 ok(c.post("/api/auto-buy", json={"on": True}).status_code == 401, "on without token -> 401")
 c.post("/api/kill-switch", json={"engaged": True, "reason": "smoke"})
+ok(c.get("/api/settings").json()["auto_trade"]["kill_switch"] is True, "settings report kill switch engaged")
 r = c.post("/api/auto-buy", json={"on": True}, headers=H)
 ok(r.status_code == 409, "on while kill switch engaged -> 409")
 r = c.post("/api/kill-switch", json={"engaged": False}, headers=H)
 ok(r.status_code == 200 and not live_control.kill_switch_engaged(), "kill switch released with token")
+ok(c.get("/api/settings").json()["auto_trade"]["kill_switch"] is False, "settings report kill switch released")
 r = c.post("/api/auto-buy", json={"on": True}, headers=H)
 ok(r.status_code == 200 and r.json()["on"], "authorised on -> on=true")
 ok(settings.auto_trade_enabled and settings.auto_trade_allow_live, "bot enabled and live armed")

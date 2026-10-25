@@ -3363,6 +3363,7 @@ class AppState:
         return AutoTradeState(
             enabled=settings.auto_trade_enabled,
             mode="live" if self._auto_live_armed() else "paper",
+            kill_switch=live_control.kill_switch_engaged(),
             min_confidence=settings.auto_trade_min_confidence,
             max_lots=(settings.auto_trade_live_max_lots if self._auto_live_armed() else max(1, settings.auto_trade_max_lots)),
             in_position=in_pos,

@@ -703,6 +703,7 @@ export interface AutoTradeHistoryRow {
 export interface AutoTradeState {
   enabled: boolean;
   mode: string;
+  kill_switch?: boolean;
   min_confidence: number;
   max_lots: number;
   in_position: boolean;
