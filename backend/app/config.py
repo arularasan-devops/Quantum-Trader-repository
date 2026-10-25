@@ -750,6 +750,17 @@ class Settings(BaseSettings):
     auto_trade_live_max_order_value: float = 25000.0
     # Hard cap on lots for a LIVE auto entry, independent of the paper max_lots.
     auto_trade_live_max_lots: int = 1
+    # LIVE parity with the PAPER strategy (v3.5.14): same pullback engine and
+    # bid/ask checks, lots from QT_CAPITAL at the ask (then the loss budget and the
+    # live order-value cap trim them; the fixed live lot cap is not used), exits
+    # judged on the bid, profit-lock flatten.
+    auto_trade_live_pullback_engine: bool = True
+    auto_trade_live_capital_sizing: bool = True
+    auto_trade_live_exit_on_bid: bool = True
+    # LIVE intraday square-off (IST): flatten and stop new live entries after
+    # this time. Set a few minutes before the broker's own intraday cut-off.
+    auto_trade_live_squareoff_equity_ist: str = "15:20"
+    auto_trade_live_squareoff_mcx_ist: str = "23:00"
 
     # --- Zero-to-Hero expiry sleeve (SPECULATIVE, HIGH RISK, SEPARATE budget) ---
     # A deliberately tiny, isolated punt on EXPIRY DAY only: buy a cheap far-OTM

@@ -2223,6 +2223,19 @@ class AppState:
         lines.append("Paper/advisory alert — place the order manually per your risk plan.")
         notify.push("\n".join(lines))
 
+    def _live_squareoff_due(self, now: float) -> bool:
+        """LIVE only: past the intraday square-off time of this exchange."""
+        if settings.hours_ignored():
+            return False
+        exch = (get_spec(self._instrument).exchange or "").upper()
+        raw = (settings.auto_trade_live_squareoff_mcx_ist if exch == "MCX"
+               else settings.auto_trade_live_squareoff_equity_ist)
+        try:
+            h, m = (int(x) for x in str(raw).split(":"))
+        except ValueError:
+            return False
+        return account_risk.ist_minutes(now) >= h * 60 + m
+
     def _live_entry_ask(self, opt: str | None) -> float:
         """Current ask of ``opt`` from the feed (0 when unknown). Read-only."""
         try:
@@ -2321,12 +2334,14 @@ class AppState:
                      each live entry is additionally bounded by a hard lots cap and
                      a per-order notional cap. If the live feed is up but the bot is
                      not armed for live, it stays completely hands-off."""
-        if not settings.auto_trade_enabled:
-            return
-        # Live feed but not armed for live orders → do nothing (never a surprise order).
-        if self.is_live and not settings.auto_trade_allow_live:
-            return
-        live = self._auto_live_armed()
+        # An open LIVE auto position keeps its exits running when the bot is
+        # switched off or the kill switch disarms it; only new entries stop.
+        manage_only = False
+        if not settings.auto_trade_enabled or (self.is_live and not settings.auto_trade_allow_live):
+            if not (self.is_live and in_pos and self._auto_entry_active):
+                return
+            manage_only = True
+        live = self._auto_live_armed() or manage_only
 
         # --- manage an open auto-position ---
         # Two exit styles:
@@ -2344,14 +2359,23 @@ class AppState:
             if prem is None:
                 return
             ltp_now = prem
-            if not live and settings.auto_trade_exit_on_bid:
+            if live and self._live_squareoff_due(now):
+                self._pending_exit_reason = "SQUARE-OFF"
+                self.sell(confirm=True)
+                self._auto_last_action = f"AUTO EXIT {p.option_symbol} · LIVE SQUARE-OFF"
+                self._auto_last_action_ts = now
+                self._reset_auto_trade_marks()
+                return
+            if (settings.auto_trade_exit_on_bid
+                    and (not live or settings.auto_trade_live_exit_on_bid)):
                 bid = self._own_bid()
                 if bid is not None:
                     prem = bid  # judge every exit on the price a sell fills at
             # Targets behave like a resting sell at the level: reached when the
             # last trade OR the bid gets there. Stops and trails stay on the bid.
             tgt_px = max(prem, ltp_now) if not live else prem
-            if not live and self._auto_entry_prem is not None:
+            if ((not live or settings.auto_trade_live_loss_budget)
+                    and self._auto_entry_prem is not None):
                 with contextlib.suppress(Exception):
                     acct = account_risk.account
                     equity = acct.day_pnl + sum(
@@ -2359,7 +2383,7 @@ class AppState:
                     )
                     if acct.must_flatten(equity):
                         self._pending_exit_reason = "PROFIT LOCK"
-                        self.sell(confirm=False)
+                        self.sell(confirm=live)
                         self._auto_last_action = (
                             f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · PROFIT LOCK "
                             f"(day ₹{equity:,.0f} fell to the lock ₹{acct.lock_level() or 0:,.0f})"
@@ -2627,6 +2651,8 @@ class AppState:
                 self._auto_last_action_ts = now
                 self._reset_auto_trade_marks()
             return
+        if manage_only:
+            return
 
         # --- consider a fresh auto-entry ---
         actionable = (
@@ -2652,7 +2678,14 @@ class AppState:
         opt = decision.recommended_option or ""
         exec_funnel.reached("SIGNAL")
         # PAPER pullback engine: TRENDING -> PULLBACK -> quote -> spread -> risk -> BUY.
-        eng = settings.auto_trade_pullback_engine and not live
+        eng = settings.auto_trade_pullback_engine and (
+            not live or settings.auto_trade_live_pullback_engine)
+        if live and self._live_squareoff_due(now):
+            exec_funnel.blocked(
+                "RISK", "LIVE_SQUAREOFF_TIME", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade", reason="past the live intraday square-off time",
+            )
+            return
         self._auto_entry_note = ""
         if settings.auto_trade_strategy_gate:
             trig = (decision.entry_trigger or "").upper()
@@ -3025,7 +3058,8 @@ class AppState:
 
         # LIVE safeguards: a hard lots cap + a per-order notional ceiling so a single
         # real order can never exceed the configured blast radius.
-        if live:
+        live_cap_sized = bool(live and eng and settings.auto_trade_live_capital_sizing)
+        if live and not live_cap_sized:
             lots = max(1, min(lots, settings.auto_trade_live_max_lots))
             order_value = (decision.current_premium or 0.0) * lot_size * lots
             if order_value > settings.auto_trade_live_max_order_value:
@@ -3094,8 +3128,8 @@ class AppState:
                     reason="not enough free capital for a single lot",
                 )
                 return
-            if eng and settings.auto_trade_capital_sizing:
-                # PAPER: as many lots as the free capital pays for at the ask.
+            if eng and (settings.auto_trade_capital_sizing if not live else live_cap_sized):
+                # As many lots as the free capital pays for (LIVE: QT_CAPITAL).
                 lots = affordable
             elif affordable < lots:
                 lots = affordable
@@ -3104,7 +3138,7 @@ class AppState:
         # per-trade rupee cap, nor (once the day lock is armed) its share of the
         # room above the lock — a single trade can't give back the locked day.
         live_ask = 0.0
-        if live and settings.auto_trade_live_loss_budget and lots >= 1:
+        if live and settings.auto_trade_live_loss_budget and lots >= 1 and not eng:
             live_ask = self._live_entry_ask(opt)
             sig = float(decision.current_premium or 0.0)
             stop = float(decision.stop_loss) if decision.stop_loss is not None else 0.0
@@ -3163,6 +3197,26 @@ class AppState:
                     note = f"lots cut to {fit} by loss budget ₹{budget:,.0f}"
                     prev = getattr(self, "_auto_entry_note", "") or ""
                     self._auto_entry_note = f"{prev}; {note}" if prev else note
+
+        if live_cap_sized and lots >= 1:
+            px = max(float(decision.current_premium or 0.0),
+                     float(getattr(self, "_auto_entry_ask", 0.0) or 0.0))
+            per_lot = px * lot_size
+            fit = int(settings.auto_trade_live_max_order_value // per_lot) if per_lot > 0 else 0
+            if fit < 1:
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: one lot ₹{per_lot:,.0f} > live order cap "
+                    f"₹{settings.auto_trade_live_max_order_value:,.0f}")
+                self._auto_last_action_ts = now
+                self._auto_last_key = key
+                exec_funnel.blocked(
+                    "EXECUTION", "LIVE_ORDER_VALUE_CAP", instrument=self._instrument,
+                    option=opt, value=round(per_lot, 0),
+                    threshold=settings.auto_trade_live_max_order_value,
+                    where="state.py:_auto_trade", reason="one lot above the live order cap",
+                )
+                return
+            lots = min(lots, fit)
 
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")
