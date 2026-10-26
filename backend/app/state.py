@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import contextlib
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -4189,15 +4190,27 @@ class StateRegistry:
 
     def __init__(self) -> None:
         self._states: dict[str, AppState] = {}
+        self._guard = threading.Lock()
+        self._build_locks: dict[str, threading.Lock] = {}
 
     def get(self, instrument: str | None) -> AppState:
         name = resolve_key(instrument or DEFAULT_INSTRUMENT)
         if name not in REGISTRY:
             name = DEFAULT_INSTRUMENT
         st = self._states.get(name)
-        if st is None:
-            st = AppState(name)
-            self._states[name] = st
+        if st is not None:
+            return st
+        # Construction is slow (broker login, candles) and reads the live order
+        # ledger. Concurrent callers must share ONE instance per instrument: a
+        # second copy would restore an in-flight order as "unresolved" and could
+        # trade independently of the first.
+        with self._guard:
+            lock = self._build_locks.setdefault(name, threading.Lock())
+        with lock:
+            st = self._states.get(name)
+            if st is None:
+                st = AppState(name)
+                self._states[name] = st
         return st
 
     def active(self) -> list[AppState]:
