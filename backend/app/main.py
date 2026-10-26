@@ -306,6 +306,11 @@ class Hub:
         # abandoning the wait keeps every other instrument ticking, it does not
         # make the wedged instrument's minute appear.
         self._ticks_abandoned: int = 0
+        self.tick_errors: int = 0
+        self.loop_restarts: int = 0
+        self.cycle_errors: int = 0
+        self._tick_err_logged: dict[str, float] = {}
+        self._p45_fut = None
         self._tick_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._TICK_WORKERS, thread_name_prefix="tick")
         self._wedged: set[concurrent.futures.Future] = set()
@@ -369,6 +374,14 @@ class Hub:
             # thread eventually returns describes a market that has moved on,
             # and a late quote presented as current is worse than a gap the
             # coverage report can see.
+            return
+        except Exception:
+            # A raising tick costs this instrument its tick, never the loop:
+            # uncaught, it ended Hub.run and froze every LTP with no error shown.
+            self.tick_errors += 1
+            if time.monotonic() - self._tick_err_logged.get(inst, 0.0) > 60.0:
+                self._tick_err_logged[inst] = time.monotonic()
+                _log.exception("tick failed for %s", inst)
             return
         finally:
             with contextlib.suppress(Exception):
@@ -453,151 +466,181 @@ class Hub:
             return
         from app.research.phase45 import service as p45
 
-        try:
-            await loop.run_in_executor(None, p45.resolve_due)
-        except Exception:  # pragma: no cover - research must not break the loop
-            _log.exception("phase45 paper resolution failed")
+        # Not awaited: a pass held on the shadow store's write lock must not
+        # hold the tick loop (and every on-screen LTP) with it. One at a time.
+        if self._p45_fut is not None and not self._p45_fut.done():
+            return
+
+        def _done(f) -> None:
+            if not f.cancelled() and f.exception() is not None:
+                _log.error("phase45 paper resolution failed: %r", f.exception())
+
+        self._p45_fut = loop.run_in_executor(None, p45.resolve_due)
+        self._p45_fut.add_done_callback(_done)
 
     async def run(self) -> None:
         loop = asyncio.get_event_loop()
+        self._next_movers = 0.0  # monotonic time of the next auto day-movers check
         rr = 0  # round-robin cursor over background (screener-only) instruments
         cycle = 0
-        next_movers = 0.0  # monotonic time of the next auto day-movers check
         while True:
             cycle += 1
             cycle_began = time.monotonic()
-            # Re-run the daily auto-pick when the IST day rolls over on a
-            # long-running server, then warm any newly-picked instruments.
-            if settings.auto_pick_enabled and cycle % 120 == 1:
-                changed = await loop.run_in_executor(None, _refresh_universe, False)
-                if changed is not None:
-                    app.state.warm = asyncio.create_task(_warm_all())
-            # Auto day-movers: pick the day's handful of instruments and hold
-            # them. Kept on its own timer rather than a cycle count so the
-            # interval means seconds regardless of how long a cycle takes, and
-            # run in the executor because it scores every candidate.
-            if settings.day_movers_auto_enabled and time.monotonic() >= next_movers:
-                next_movers = time.monotonic() + max(30.0, settings.day_movers_refresh_sec)
-                picked = await loop.run_in_executor(None, _day_movers_cycle)
-                if picked["action"] in ("picked", "swapped"):
-                    _log.info("day-movers %s: %s", picked["action"], picked["reason"])
-                    app.state.warm = asyncio.create_task(_warm_all())
-            # Always keep the default instrument warm; all other instruments are
-            # warmed by the background _warm_all task, after which they appear in
-            # registry.active() and get ticked here (populating the screener).
-            registry.get(DEFAULT_INSTRUMENT)
-            active = list(registry.active())
-            self._capture_pair_legs(active)
-            await self._resolve_shadow_paper(loop)
-
-            # PRIORITY = instruments a client is actually watching right now. These
-            # tick EVERY cycle so the on-screen LTP stays fast, no matter how many
-            # instruments exist. BACKGROUND = the rest (only feeding the screener);
-            # we tick just a few per cycle in round-robin so they never starve the
-            # watched instrument. This is what keeps live prices fast after adding
-            # many instruments.
-            watched = set(self.clients.values())
-            watched.add(DEFAULT_INSTRUMENT)
-            # Any instrument holding an open (paper/auto) position MUST tick every
-            # cycle too — otherwise its auto-exit at Target 1 / stop would only be
-            # checked on the slow round-robin, letting price run past the level.
-            for st in active:
-                if st.position.option_symbol:
-                    watched.add(st.instrument)
-                # An open FUTURES paper position needs the same treatment: its
-                # stop and locked floor are only checked on a tick, so leaving it
-                # on the slow round-robin lets price run through both.
-                if futures_paper.store.get(st.instrument) is not None:
-                    watched.add(st.instrument)
-            priority = [st for st in active if st.instrument in watched]
-            background = [st for st in active if st.instrument not in watched]
-            # Skip the background scan for instruments whose EXCHANGE is shut.
-            # A closed name cannot produce an entry and its price cannot move, so
-            # scanning it only spends the cycle budget and Angel's rate limit that
-            # the still-trading names need: after 15:30 IST that is ~40 frozen
-            # NSE/BSE names competing with Crude and Nat Gas. Nothing is dropped
-            # or disabled — they return by themselves at the next open, because
-            # this is evaluated every cycle rather than latched at startup.
-            # Watched instruments and anything holding a position are NOT skipped:
-            # the dashboard must still say "CLOSED" for the name you opened, and a
-            # position must stay monitored right up to its own close.
-            # A closed name is still ticked ONCE (until it has a snapshot) so the
-            # board shows its last/closing price from start-up instead of blank.
-            closed_now = [st for st in background
-                          if not _exchange_open(st.instrument) and st.instrument in self.latest]
-            if closed_now:
-                background = [st for st in background if st not in closed_now]
-            self._closed_skipped = len(closed_now)
-
-            scan_queue: list = []
-            # When the auto-trader is armed every active instrument must be
-            # scanned often enough that a BUY elsewhere is not missed. Earlier
-            # this ticked ALL of them every cycle, which does not scale: at 50
-            # instruments the watched one waited behind 49 full engine computes
-            # and its LTP visibly lagged. Instead the most OVERDUE scans go
-            # first, under a time budget, so scan coverage degrades gracefully
-            # with universe size while the on-screen price never does.
-            # Futures counts as armed here too. Keying this on the OPTION
-            # auto-trader alone is why the futures tool only ever traded Crude:
-            # with just futures enabled, every instrument except the one on
-            # screen refreshed on the slow round-robin (~25-30s), and the futures
-            # engine only sees a setup on a tick, so it saw Crude's and nothing
-            # else's. Crude is the default instrument, hence 21 of 27 trades.
-            if (settings.auto_trade_enabled or settings.futures_paper_enabled) and background:
-                mono = time.monotonic()
-                overdue = sorted(
-                    (st for st in background if mono - self._ticked_at.get(st.instrument, 0.0) >= self._SCAN_MAX_AGE),
-                    key=lambda st: self._ticked_at.get(st.instrument, 0.0),
-                )
-                scan_queue.extend(overdue)
-                background = [st for st in background if st not in overdue]
-            # Background (screener-only) instruments refresh only every Nth loop
-            # and only a few at a time, so they never queue up ahead of the next
-            # fast refresh of the instrument you're actually watching.
-            if background and cycle % self._BG_EVERY_N == 0:
-                take = min(self._BG_PER_CYCLE, len(background))
-                for i in range(take):
-                    scan_queue.append(background[(rr + i) % len(background)])
-                rr = (rr + take) % len(background)
-
-            # 1) Watched instruments: always, unbounded, first — the on-screen
-            #    LTP must never wait behind the scan.
-            for st in priority:
-                await self._tick_one(st, loop)
-
-            # 2) Scanned instruments: budgeted, but NEVER zero.
-            #
-            #    The budget clock starts HERE, after the watched ticks. It used
-            #    to start at the top of the cycle, which made the scan collapse
-            #    completely: the watched ticks alone cost more than the 0.24s
-            #    window, so by the time the loop reached a scanned instrument the
-            #    deadline was already past and it broke immediately — every
-            #    cycle, forever. Measured on a 46-name universe: median scan age
-            #    789s against a 2s target, i.e. only the 4 watched names were
-            #    ever refreshed, which also starved the futures engine (it only
-            #    evaluates a setup on a tick).
-            #
-            #    _SCAN_MIN_PER_CYCLE is the floor that makes that failure mode
-            #    impossible: however slow the watched ticks are, the scan still
-            #    advances, so full-sweep time is bounded by universe size rather
-            #    than by whether any budget happened to be left over.
-            scanned = 0
-            deadline = time.monotonic() + self._WATCHED_INTERVAL * self._SCAN_BUDGET
-            for st in scan_queue:
-                if scanned >= self._SCAN_MIN_PER_CYCLE and time.monotonic() > deadline:
-                    break
-                await self._tick_one(st, loop)
-                scanned += 1
-            self._scan_rate = self._scan_rate * 0.8 + scanned * 0.2
-            # Fast cadence for the watched instrument. Never slower than the
-            # configured tick interval; capped fast so the LTP tracks the broker.
-            # Sleep only what is left of the cadence: a fixed sleep on top of the
-            # cycle's own work pushed the on-screen LTP to ~0.8s instead of 0.4s.
+            try:
+                rr = await self._cycle(loop, cycle, rr)
+            except Exception:
+                # The loop must outlive any one bad cycle: if it ends, every LTP
+                # and every auto-exit check stops while the API still answers.
+                self.cycle_errors += 1
+                _log.exception("hub cycle %d failed; continuing", cycle)
             cadence = min(settings.tick_interval_seconds, self._WATCHED_INTERVAL)
             await asyncio.sleep(max(0.05, cadence - (time.monotonic() - cycle_began)))
 
+    async def _cycle(self, loop, cycle: int, rr: int) -> int:
+        """One pass of :meth:`run`; returns the round-robin cursor."""
+        # Re-run the daily auto-pick when the IST day rolls over on a
+        # long-running server, then warm any newly-picked instruments.
+        if settings.auto_pick_enabled and cycle % 120 == 1:
+            changed = await loop.run_in_executor(None, _refresh_universe, False)
+            if changed is not None:
+                app.state.warm = asyncio.create_task(_warm_all())
+        # Auto day-movers: pick the day's handful of instruments and hold
+        # them. Kept on its own timer rather than a cycle count so the
+        # interval means seconds regardless of how long a cycle takes, and
+        # run in the executor because it scores every candidate.
+        if settings.day_movers_auto_enabled and time.monotonic() >= self._next_movers:
+            self._next_movers = time.monotonic() + max(30.0, settings.day_movers_refresh_sec)
+            picked = await loop.run_in_executor(None, _day_movers_cycle)
+            if picked["action"] in ("picked", "swapped"):
+                _log.info("day-movers %s: %s", picked["action"], picked["reason"])
+                app.state.warm = asyncio.create_task(_warm_all())
+        # Always keep the default instrument warm; all other instruments are
+        # warmed by the background _warm_all task, after which they appear in
+        # registry.active() and get ticked here (populating the screener).
+        registry.get(DEFAULT_INSTRUMENT)
+        active = list(registry.active())
+        self._capture_pair_legs(active)
+        await self._resolve_shadow_paper(loop)
+
+        # PRIORITY = instruments a client is actually watching right now. These
+        # tick EVERY cycle so the on-screen LTP stays fast, no matter how many
+        # instruments exist. BACKGROUND = the rest (only feeding the screener);
+        # we tick just a few per cycle in round-robin so they never starve the
+        # watched instrument. This is what keeps live prices fast after adding
+        # many instruments.
+        watched = set(self.clients.values())
+        watched.add(DEFAULT_INSTRUMENT)
+        # Any instrument holding an open (paper/auto) position MUST tick every
+        # cycle too — otherwise its auto-exit at Target 1 / stop would only be
+        # checked on the slow round-robin, letting price run past the level.
+        for st in active:
+            if st.position.option_symbol:
+                watched.add(st.instrument)
+            # An open FUTURES paper position needs the same treatment: its
+            # stop and locked floor are only checked on a tick, so leaving it
+            # on the slow round-robin lets price run through both.
+            if futures_paper.store.get(st.instrument) is not None:
+                watched.add(st.instrument)
+        priority = [st for st in active if st.instrument in watched]
+        background = [st for st in active if st.instrument not in watched]
+        # Skip the background scan for instruments whose EXCHANGE is shut.
+        # A closed name cannot produce an entry and its price cannot move, so
+        # scanning it only spends the cycle budget and Angel's rate limit that
+        # the still-trading names need: after 15:30 IST that is ~40 frozen
+        # NSE/BSE names competing with Crude and Nat Gas. Nothing is dropped
+        # or disabled — they return by themselves at the next open, because
+        # this is evaluated every cycle rather than latched at startup.
+        # Watched instruments and anything holding a position are NOT skipped:
+        # the dashboard must still say "CLOSED" for the name you opened, and a
+        # position must stay monitored right up to its own close.
+        # A closed name is still ticked ONCE (until it has a snapshot) so the
+        # board shows its last/closing price from start-up instead of blank.
+        closed_now = [st for st in background
+                      if not _exchange_open(st.instrument) and st.instrument in self.latest]
+        if closed_now:
+            background = [st for st in background if st not in closed_now]
+        self._closed_skipped = len(closed_now)
+
+        scan_queue: list = []
+        # When the auto-trader is armed every active instrument must be
+        # scanned often enough that a BUY elsewhere is not missed. Earlier
+        # this ticked ALL of them every cycle, which does not scale: at 50
+        # instruments the watched one waited behind 49 full engine computes
+        # and its LTP visibly lagged. Instead the most OVERDUE scans go
+        # first, under a time budget, so scan coverage degrades gracefully
+        # with universe size while the on-screen price never does.
+        # Futures counts as armed here too. Keying this on the OPTION
+        # auto-trader alone is why the futures tool only ever traded Crude:
+        # with just futures enabled, every instrument except the one on
+        # screen refreshed on the slow round-robin (~25-30s), and the futures
+        # engine only sees a setup on a tick, so it saw Crude's and nothing
+        # else's. Crude is the default instrument, hence 21 of 27 trades.
+        if (settings.auto_trade_enabled or settings.futures_paper_enabled) and background:
+            mono = time.monotonic()
+            overdue = sorted(
+                (st for st in background if mono - self._ticked_at.get(st.instrument, 0.0) >= self._SCAN_MAX_AGE),
+                key=lambda st: self._ticked_at.get(st.instrument, 0.0),
+            )
+            scan_queue.extend(overdue)
+            background = [st for st in background if st not in overdue]
+        # Background (screener-only) instruments refresh only every Nth loop
+        # and only a few at a time, so they never queue up ahead of the next
+        # fast refresh of the instrument you're actually watching.
+        if background and cycle % self._BG_EVERY_N == 0:
+            take = min(self._BG_PER_CYCLE, len(background))
+            for i in range(take):
+                scan_queue.append(background[(rr + i) % len(background)])
+            rr = (rr + take) % len(background)
+
+        # 1) Watched instruments: always, unbounded, first — the on-screen
+        #    LTP must never wait behind the scan.
+        for st in priority:
+            await self._tick_one(st, loop)
+
+        # 2) Scanned instruments: budgeted, but NEVER zero.
+        #
+        #    The budget clock starts HERE, after the watched ticks. It used
+        #    to start at the top of the cycle, which made the scan collapse
+        #    completely: the watched ticks alone cost more than the 0.24s
+        #    window, so by the time the loop reached a scanned instrument the
+        #    deadline was already past and it broke immediately — every
+        #    cycle, forever. Measured on a 46-name universe: median scan age
+        #    789s against a 2s target, i.e. only the 4 watched names were
+        #    ever refreshed, which also starved the futures engine (it only
+        #    evaluates a setup on a tick).
+        #
+        #    _SCAN_MIN_PER_CYCLE is the floor that makes that failure mode
+        #    impossible: however slow the watched ticks are, the scan still
+        #    advances, so full-sweep time is bounded by universe size rather
+        #    than by whether any budget happened to be left over.
+        scanned = 0
+        deadline = time.monotonic() + self._WATCHED_INTERVAL * self._SCAN_BUDGET
+        for st in scan_queue:
+            if scanned >= self._SCAN_MIN_PER_CYCLE and time.monotonic() > deadline:
+                break
+            await self._tick_one(st, loop)
+            scanned += 1
+        self._scan_rate = self._scan_rate * 0.8 + scanned * 0.2
+        return rr
+
 
 hub = Hub()
+
+
+def _start_hub() -> None:
+    """Run the tick loop, and start it again if it ever ends other than by
+    shutdown: a dead loop freezes every LTP and auto-exit while the API answers."""
+    task = asyncio.create_task(hub.run())
+    app.state.task = task
+
+    def _ended(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        hub.loop_restarts += 1
+        _log.error("hub loop ended (%r); restarting", t.exception())
+        _start_hub()
+
+    task.add_done_callback(_ended)
 
 # ---- Live screener: scan EVERY registered instrument and expose its current
 # fresh-entry call (signal/confidence/entry-zone/premium/stop/targets) so the
@@ -835,7 +878,7 @@ async def _startup() -> None:
     # session does not pay for reading a journal that is now tens of megabytes.
     # Read-only, and a failure only costs that first request its old speed.
     loop.run_in_executor(None, _warm_ledgers)
-    app.state.task = asyncio.create_task(hub.run())
+    _start_hub()
     app.state.warm = asyncio.create_task(_warm_all())
     app.state.intel = asyncio.create_task(_refresh_intelligence())
     app.state.ai = asyncio.create_task(_ai_loop())
@@ -3911,6 +3954,10 @@ def _hub_counters() -> dict:
         "ws_clients": len(hub.clients),
         "ws_send_drops": hub.ws_send_drops,
         "ticks_abandoned": hub._ticks_abandoned,
+        "tick_errors": hub.tick_errors,
+        "cycle_errors": hub.cycle_errors,
+        "loop_restarts": hub.loop_restarts,
+        "loop_running": not app.state.task.done() if getattr(app.state, "task", None) else False,
     }
 
 
