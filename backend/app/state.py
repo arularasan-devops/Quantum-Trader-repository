@@ -742,7 +742,19 @@ class AppState:
                                        "before anything was sent.")
         # If place_order raises, the SUBMITTING record stays: the outcome is
         # unknown, so new entries remain blocked until it is reconciled.
-        res = self.provider.place_order(symbol, side, lots)
+        from app.ai.safety import RealMoneyBlocked
+        try:
+            res = self.provider.place_order(symbol, side, lots)
+        except RealMoneyBlocked as exc:
+            # The build's real-money lock raises before any broker call, so the
+            # outcome is known (nothing sent): clear the record, refuse cleanly.
+            setattr(self, attr, None)
+            self._persist_state()
+            self._event("SUBMIT_REFUSED_LOCKED", pend)
+            self._add_alert("LIVE_ORDERS_LOCKED", f"{side} {symbol} not sent: {exc}", "critical")
+            return OrderResult(ok=False, mode="live", side=side, option_symbol=symbol, lots=lots,
+                               message="Live order not sent: real-money execution is "
+                                       "disabled in this build.")
         if not res.ok:
             setattr(self, attr, None)
             self._persist_state()

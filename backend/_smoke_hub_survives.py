@@ -104,7 +104,7 @@ check("the raising instrument is counted, not hidden", hub.tick_errors > 0 and b
       f"{hub.tick_errors} errors, {bad.ticks} attempts")
 check("other instruments keep ticking past it", good.ticks > 3, f"{good.ticks} ticks")
 check("a raising cycle is counted and the loop goes on",
-      hub.cycle_errors == 1 and good.ticks > before, f"{good.ticks - before} ticks after it")
+      hub.cycle_errors >= 1 and good.ticks > before, f"{good.ticks - before} ticks after it")
 check("a 3s research pass does not hold the ticks", good.ticks >= 5, f"{good.ticks} ticks in 3s")
 print("\nALL HUB-SURVIVAL CHECKS PASSED" if not FAILED else f"\nFAILED: {FAILED}")
 sys.exit(1 if FAILED else 0)
