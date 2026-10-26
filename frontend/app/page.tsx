@@ -60,6 +60,10 @@ type PendingOrder = {
   warnings?: string[];
 };
 
+// Server registry key: older builds saved the scrip name ("BAJAJ-AUTO", "M&M"),
+// which matched no dropdown option, so the select fell back to Crude Oil.
+const instrumentKey = (s: string) => s.toUpperCase().replace(/[^A-Z0-9]/g, "");
+
 export default function Page() {
   // Per-tab instrument selection. Kept in this tab's own React state (not on the
   // server), so duplicating the tab and switching to a different instrument
@@ -87,8 +91,7 @@ export default function Page() {
     const fromUrl = new URLSearchParams(window.location.search).get("instrument");
     // Older builds saved the scrip name ("BAJAJ-AUTO", "M&M"); the server keys
     // those as BAJAJAUTO / MM.
-    const saved = (fromUrl || window.localStorage.getItem("qt_instrument") || "")
-      .toUpperCase().replace("BAJAJ-AUTO", "BAJAJAUTO").replace("M&M", "MM");
+    const saved = instrumentKey(fromUrl || window.localStorage.getItem("qt_instrument") || "");
     if (saved && saved !== instrument) {
       setInstrument(saved);
       selectInstrument(saved).catch(() => {});
@@ -250,7 +253,8 @@ export default function Page() {
     req.then((d) => showResult(d.result));
   };
 
-  const onSelectInstrument = (sym: string) => {
+  const onSelectInstrument = (picked: string) => {
+    const sym = instrumentKey(picked);
     // Switch only THIS tab. Warm the instrument on the server, then point this
     // tab's stream at it — other tabs are untouched.
     setInstrument(sym);
@@ -346,7 +350,7 @@ export default function Page() {
             QUANTUM<span style={{ color: t.accent }}>TRADER</span>
           </div>
           <select
-            value={instrument}
+            value={instrumentKey(instrument)}
             onChange={(e) => onSelectInstrument(e.target.value)}
             title="Choose what to analyse (this tab only — other tabs are independent)"
             className="bg-white/5 border border-white/15 rounded-lg text-xs font-semibold px-2 py-1 outline-none disabled:opacity-40"

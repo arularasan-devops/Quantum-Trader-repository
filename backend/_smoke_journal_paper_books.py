@@ -28,6 +28,9 @@ for tid, book, net in (("jpb-1", "5L-FULL", 1234.5), ("jpb-2", "10L-RISK", -99.0
 
 c = TestClient(main.app)
 settings.trade_mode = "live"
+check("off by default", settings.journal_paper_books == "" and not any(
+    (r.get("note") or "").startswith("Paper Book") for r in c.get("/api/trade-journal").json()["trades"]))
+settings.journal_paper_books = "5L-FULL"
 j = c.get("/api/trade-journal?mode=paper").json()
 mine = [r for r in j["trades"] if r.get("note") == "Paper Book 5L-FULL"]
 check("live stack: 5L-FULL trade in Journal Paper tab", len(mine) == 1 and mine[0]["mode"] == "paper"
