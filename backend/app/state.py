@@ -2080,8 +2080,11 @@ class AppState:
         if c.signal not in (Signal.BUY, Signal.HOLD, Signal.EXIT):
             # No plan is held on a stand-aside call, so its strike is display
             # only: follow this tick's pick, else one committed before the chain
-            # loaded stays blank ("—") until the signal changes.
+            # loaded stays blank ("—") until the signal changes. The contract and
+            # its premium follow too, so the card never pairs one strike's label
+            # with another strike's price.
             c.strike, c.option_type = raw.strike, raw.option_type
+            c.recommended_option, c.current_premium = raw.recommended_option, raw.current_premium
         return self._decorate(now)
 
     def _decorate(self, now: float) -> Decision:
