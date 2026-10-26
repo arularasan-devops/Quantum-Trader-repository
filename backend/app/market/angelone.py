@@ -22,6 +22,7 @@ Notes / limitations (be honest):
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import math
 import os
@@ -421,12 +422,90 @@ def _historical_candles(shard: "_Shard", params: dict, *, blocking: bool) -> tup
     return [], "historical API rate-limited (AB1021) — sharing budget with other instruments, will retry shortly"
 
 
+# A saved copy of the scrip master under data_dir lets a restart skip the
+# ~37 MB download (Angel's file server can trickle at ~100-200 KB/s), and is the
+# fallback when today's download is too slow. Contracts are listed per IST day,
+# so a copy saved today is reused as-is; an older copy is used only if the
+# download fails or exceeds _SCRIP_DOWNLOAD_DEADLINE_SEC.
+_SCRIP_DOWNLOAD_DEADLINE_SEC = 240.0
+_SCRIP_MIN_ROWS = 1000
+
+
+def _scrip_cache_path() -> str:
+    return os.path.join(settings.data_dir, "scrip_master.json")
+
+
+def _ist_date(ts: float) -> dt.date:
+    return dt.datetime.fromtimestamp(ts, dt.timezone(dt.timedelta(hours=5, minutes=30))).date()
+
+
+def _read_scrip_cache() -> tuple[list | None, float]:
+    path = _scrip_cache_path()
+    try:
+        mtime = os.path.getmtime(path)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None, 0.0
+    if not isinstance(data, list) or len(data) < _SCRIP_MIN_ROWS:
+        return None, 0.0
+    return data, mtime
+
+
+def _write_scrip_cache(raw: bytes) -> None:
+    path = _scrip_cache_path()
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log.warning("scrip master: could not save local copy (%s)", exc)
+
+
+def _download_scrip_master(deadline_sec: float | None) -> list:
+    start = time.time()
+    buf = bytearray()
+    with httpx.stream("GET", SCRIP_MASTER_URL, timeout=60.0) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_bytes():
+            buf.extend(chunk)
+            if deadline_sec is not None and time.time() - start > deadline_sec:
+                raise TimeoutError(
+                    f"scrip master download exceeded {deadline_sec:.0f}s "
+                    f"({len(buf) / 1e6:.1f} MB received)")
+    data = json.loads(bytes(buf))
+    if not isinstance(data, list) or len(data) < _SCRIP_MIN_ROWS:
+        raise ValueError("scrip master download returned an unexpected payload")
+    _write_scrip_cache(bytes(buf))
+    _log.info("scrip master: downloaded %d rows in %.0fs", len(data), time.time() - start)
+    return data
+
+
+def _load_scrip_master() -> list:
+    cached, mtime = _read_scrip_cache()
+    if cached is not None and _ist_date(mtime) == _ist_date(time.time()):
+        _log.info("scrip master: using today's saved copy (%d rows)", len(cached))
+        return cached
+    try:
+        # With no saved copy there is nothing to fall back to: wait it out.
+        return _download_scrip_master(_SCRIP_DOWNLOAD_DEADLINE_SEC if cached else None)
+    except Exception as exc:
+        if cached is None:
+            raise
+        _log.warning("scrip master: download failed (%s); using saved copy from %s "
+                     "(%d rows) — contracts listed since then are missing until the "
+                     "next successful download", exc, _ist_date(mtime), len(cached))
+        return cached
+
+
 def _get_scrip_master() -> list:
     global _scrip_master_cache
     if _scrip_master_cache is None:
         with _scrip_lock:
             if _scrip_master_cache is None:
-                _scrip_master_cache = httpx.get(SCRIP_MASTER_URL, timeout=60.0).json()
+                _scrip_master_cache = _load_scrip_master()
     return _scrip_master_cache
 
 
