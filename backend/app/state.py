@@ -2065,6 +2065,11 @@ class AppState:
         c.htf_trend = raw.htf_trend
         c.htf_strength = raw.htf_strength
         c.entry_trigger = raw.entry_trigger
+        if c.signal not in (Signal.BUY, Signal.HOLD, Signal.EXIT):
+            # No plan is held on a stand-aside call, so its strike is display
+            # only: follow this tick's pick, else one committed before the chain
+            # loaded stays blank ("—") until the signal changes.
+            c.strike, c.option_type = raw.strike, raw.option_type
         return self._decorate(now)
 
     def _decorate(self, now: float) -> Decision:
