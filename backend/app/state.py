@@ -1873,9 +1873,7 @@ class AppState:
         # hours are ignored. Angel One only constructs successfully after a real
         # login (build_provider has no silent fallback), so provider == angelone
         # means a live feed is connected.
-        feed_label = {"angelone": "LIVE Angel One feed",
-                      "relay": "LIVE feed relayed from the live backend"}.get(
-            settings.data_provider.lower(), "SIMULATED feed")
+        feed_label = "LIVE Angel One feed" if settings.data_provider.lower() == "angelone" else "SIMULATED feed"
         if settings.hours_ignored():
             session_note = "Live session" if is_open else session_note
             is_open = True
