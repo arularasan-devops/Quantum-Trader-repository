@@ -268,7 +268,7 @@ _HIST_BLOCKING_PASSES = 3
 # the key is still warming, instruments that already hold a recent cache skip
 # their routine refresh and leave the slot to it. Bounded so no cache is held
 # back longer than this.
-_HIST_YIELD_MAX_AGE = 180.0
+_HIST_YIELD_MAX_AGE = 600.0
 # A warming instrument retries this often instead of once a minute.
 _HIST_WARMUP_RETRY_SEC = 5.0
 
@@ -1836,6 +1836,10 @@ class AngelOneProvider(MarketDataProvider):
         cached = self._opt_candles.get(symbol)
         if cached:
             return cached[-limit:]
+        if self._shard.hist.warming_count():
+            # An instrument still has no futures history: its first candles
+            # outrank an option chart, or it can starve on the shared budget.
+            return []
         frm, to = _ist_window(48)
         # Non-blocking: option charts are secondary to the futures decision, so
         # they must never stall the tick. They share the same historical budget

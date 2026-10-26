@@ -159,12 +159,21 @@ def _apply_cap(names: list[str]) -> list[str]:
 UNIVERSE: list[str] = _apply_cap(list(REGISTRY.keys()))
 
 
+def resolve_key(name: str | None) -> str:
+    """Registry key for a key or an exchange symbol ("BAJAJ-AUTO" -> "BAJAJAUTO",
+    "M&M" -> "MM"); unknown names come back upper-cased and unresolved."""
+    n = (name or "").strip().upper()
+    if n in REGISTRY:
+        return n
+    return next((k for k, v in REGISTRY.items() if v.symbol.upper() == n), n)
+
+
 def set_universe(symbols: list[str]) -> list[str]:
     """Set the active instrument universe (the auto-pick uses this daily). Only
     names present in the full master are kept, order preserved; if nothing valid
     is given the full master is restored. Returns the resulting universe."""
     global UNIVERSE, DEFAULT_INSTRUMENT
-    kept = [s.upper() for s in symbols if s.upper() in REGISTRY]
+    kept = [resolve_key(s) for s in symbols if resolve_key(s) in REGISTRY]
     UNIVERSE = _apply_cap(kept or list(REGISTRY.keys()))
     if DEFAULT_INSTRUMENT not in UNIVERSE:
         DEFAULT_INSTRUMENT = UNIVERSE[0]
@@ -184,4 +193,4 @@ if _only:
 
 
 def get_spec(symbol: str) -> InstrumentSpec:
-    return REGISTRY.get((symbol or "").upper(), REGISTRY[DEFAULT_INSTRUMENT])
+    return REGISTRY.get(resolve_key(symbol), REGISTRY[DEFAULT_INSTRUMENT])

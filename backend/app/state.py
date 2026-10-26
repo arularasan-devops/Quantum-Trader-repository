@@ -65,7 +65,8 @@ from app.execution import (
     signal_delay,
     zero_to_hero,
 )
-from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, universe_specs
+from app.market import instruments as _instruments
+from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, resolve_key, universe_specs
 from app.market import tiers
 from app.market.provider import MarketDataProvider, build_provider
 from app.execution import live_control
@@ -205,7 +206,7 @@ class AppState:
         # instrument (see StateRegistry) so two browser tabs watching different
         # instruments (e.g. Crude in one, Nifty in another) stay independent
         # instead of overwriting a single shared "active instrument".
-        chosen = (instrument or settings.angel_symbol_root or DEFAULT_INSTRUMENT).upper()
+        chosen = resolve_key(instrument or settings.angel_symbol_root or DEFAULT_INSTRUMENT)
         self._instrument = chosen if chosen in REGISTRY else DEFAULT_INSTRUMENT
         self._providers: dict[str, MarketDataProvider] = {}
         self.provider = self._provider_for(self._instrument)
@@ -417,7 +418,7 @@ class AppState:
         return self._instrument
 
     def set_instrument(self, instrument: str) -> str:
-        name = (instrument or "").upper()
+        name = resolve_key(instrument)
         if name not in REGISTRY:
             raise ValueError(f"Unknown instrument {instrument}")
         if self.position.option_symbol:
@@ -1872,7 +1873,9 @@ class AppState:
         # hours are ignored. Angel One only constructs successfully after a real
         # login (build_provider has no silent fallback), so provider == angelone
         # means a live feed is connected.
-        feed_label = "LIVE Angel One feed" if settings.data_provider.lower() == "angelone" else "SIMULATED feed"
+        feed_label = {"angelone": "LIVE Angel One feed",
+                      "relay": "LIVE feed relayed from the live backend"}.get(
+            settings.data_provider.lower(), "SIMULATED feed")
         if settings.hours_ignored():
             session_note = "Live session" if is_open else session_note
             is_open = True
@@ -1896,7 +1899,10 @@ class AppState:
         learning = learn.summarize(self.journal)
         # Show the ACTIVE universe (post auto-pick / QT_INSTRUMENTS) in the
         # dropdown, not the full master, so the dashboard focuses on today's set.
-        instruments = [InstrumentOption(symbol=s.symbol, display=s.display) for s in universe_specs()]
+        # Registry KEY, not the scrip name: "BAJAJ-AUTO" is keyed BAJAJAUTO, and
+        # sending the scrip name back used to open the default (Crude) instead.
+        instruments = [InstrumentOption(symbol=k, display=REGISTRY[k].display)
+                       for k in _instruments.UNIVERSE if k in REGISTRY]
 
         # ---- Phase 3.1 Intelligence Layer (ADVISORY, read-only) ------------
         # Computed alongside the frozen engine from data it already produced;
@@ -4167,7 +4173,7 @@ class StateRegistry:
         self._states: dict[str, AppState] = {}
 
     def get(self, instrument: str | None) -> AppState:
-        name = (instrument or DEFAULT_INSTRUMENT).upper()
+        name = resolve_key(instrument or DEFAULT_INSTRUMENT)
         if name not in REGISTRY:
             name = DEFAULT_INSTRUMENT
         st = self._states.get(name)

@@ -85,7 +85,10 @@ export default function Page() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const fromUrl = new URLSearchParams(window.location.search).get("instrument");
-    const saved = (fromUrl || window.localStorage.getItem("qt_instrument") || "").toUpperCase();
+    // Older builds saved the scrip name ("BAJAJ-AUTO", "M&M"); the server keys
+    // those as BAJAJAUTO / MM.
+    const saved = (fromUrl || window.localStorage.getItem("qt_instrument") || "")
+      .toUpperCase().replace("BAJAJ-AUTO", "BAJAJAUTO").replace("M&M", "MM");
     if (saved && saved !== instrument) {
       setInstrument(saved);
       selectInstrument(saved).catch(() => {});

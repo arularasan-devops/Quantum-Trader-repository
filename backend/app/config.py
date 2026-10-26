@@ -736,6 +736,9 @@ class Settings(BaseSettings):
         "1000000:RISK", "1500000:FULL", "1500000:RISK",
     ]
     paper_books_risk_pct: float = 1.0
+    # Paper Books shown in the Journal's Paper tab while the stack trades LIVE,
+    # so paper and live sit in one Journal off one feed ("" = none).
+    journal_paper_books: str = "5L-FULL"
     # Auto-buy lots from free capital (no fixed lot cap) in PAPER.
     auto_trade_capital_sizing: bool = True
     # --- LIVE auto-execution arm (DANGER: real money) ---

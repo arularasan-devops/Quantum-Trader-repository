@@ -3558,6 +3558,58 @@ def _filter_book(rows: list[dict], book: str) -> list[dict]:
     return rows
 
 
+def _paper_book_rows(since: float | None = None, until: float | None = None) -> list[dict]:
+    """Closed Paper Book trades as Journal rows (mode=paper).
+
+    Only while this stack trades LIVE: the Paper Books then run on the same
+    feed, ledger-only, and are the paper side of the one Journal. A paper-mode
+    stack already journals its own paper trades, so nothing is added there.
+    """
+    if (settings.trade_mode or "").lower() != "live" or not settings.paper_books_enabled:
+        return []
+    from app.analysis import option_costs
+    from app.engine import paper_books
+
+    out: list[dict] = []
+    for bid in [b.strip() for b in (settings.journal_paper_books or "").split(",") if b.strip()]:
+        try:
+            rows = paper_books.books().trades(book=bid, status="CLOSED", page_size=0,
+                                              since=since, until=until)["rows"]
+        except Exception:
+            _log.debug("paper book rows unavailable for %s", bid, exc_info=True)
+            continue
+        for r in rows:
+            sym = str(r.get("option_symbol") or "")
+            net = float(r.get("net_pnl") or 0.0)
+            ent, ext = r.get("entry_ts"), r.get("exit_ts") or r.get("entry_ts")
+            out.append({
+                "instrument": r.get("instrument"), "ts": int(ext or 0), "option": sym,
+                "option_type": "CE" if sym.endswith("CE") else "PE" if sym.endswith("PE") else None,
+                "entry": r.get("entry_price"), "exit": r.get("exit_price"),
+                "lots": r.get("lots"), "net_pnl": round(net, 2), "win": net > 0,
+                "holding_minutes": round((float(ext) - float(ent)) / 60.0, 1) if ent and ext else None,
+                "mode": "paper", "auto": True, "exit_reason": r.get("exit_reason"),
+                "confidence": r.get("confidence"), "note": f"Paper Book {bid}",
+                "entry_trigger": (str(r.get("setup") or "").upper() or None),
+                "capital_used": r.get("capital_used"), "risk_rupees": r.get("risk_rupees"),
+                "cost_rupees": r.get("costs"), "total_costs": r.get("costs"),
+                "lot_size": r.get("lot_size"), "book": f"PAPER {bid}",
+                "cost_model": getattr(option_costs, "COST_MODEL", None),
+            })
+    return out
+
+
+def _with_paper_books(rows: list[dict], flow_only: bool, since=None, until=None,
+                      limit: int | None = None) -> list[dict]:
+    if flow_only:
+        return rows
+    extra = _paper_book_rows(since, until)
+    if not extra:
+        return rows
+    merged = sorted(rows + extra, key=lambda r: _row_epoch(r.get("ts")) or 0.0, reverse=True)
+    return merged[:limit] if limit else merged
+
+
 def _filter_mode(rows: list[dict], mode: str) -> list[dict]:
     """Paper / live tabs of the journal; "all" keeps both."""
     m = (mode or "all").lower()
@@ -3586,13 +3638,13 @@ async def trade_journal(limit: int = 500, book: str = "all",
     # "flow" is the Flow book on its own; every other view holds it out. Pooled,
     # its 4,647 one-minute legs decide each aggregate by weight of numbers.
     flow_only = book.lower() == "flow"
-    all_rows = _filter_mode(_filter_book(
+    all_rows = _filter_mode(_filter_book(_with_paper_books(
         storage.store.journal(
             since=int(since) if since is not None else None,
             until=int(until) if until is not None else None,
             limit=max(1, min(5000, limit)),
             exclude_flow=not flow_only, only_flow=flow_only,
-        ),
+        ), flow_only, since, until, max(1, min(5000, limit))),
         book,
     ), mode)
     # Seeded demonstration rows are held out of every figure below. Averaged in,
@@ -3709,10 +3761,10 @@ async def trade_journal_csv(limit: int = 5000, book: str = "all",
     flow_only = book.lower() == "flow"
     rows, _seeded = prov.split(_filter_mode(
         _filter_book(
-            storage.store.journal(
+            _with_paper_books(storage.store.journal(
                 limit=max(1, min(20000, limit)),
                 exclude_flow=not flow_only, only_flow=flow_only,
-            ),
+            ), flow_only, since, until, max(1, min(20000, limit))),
             book,
         ), mode)
     )
