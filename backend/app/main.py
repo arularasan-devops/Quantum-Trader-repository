@@ -465,6 +465,7 @@ class Hub:
         next_movers = 0.0  # monotonic time of the next auto day-movers check
         while True:
             cycle += 1
+            cycle_began = time.monotonic()
             # Re-run the daily auto-pick when the IST day rolls over on a
             # long-running server, then warm any newly-picked instruments.
             if settings.auto_pick_enabled and cycle % 120 == 1:
@@ -590,7 +591,10 @@ class Hub:
             self._scan_rate = self._scan_rate * 0.8 + scanned * 0.2
             # Fast cadence for the watched instrument. Never slower than the
             # configured tick interval; capped fast so the LTP tracks the broker.
-            await asyncio.sleep(min(settings.tick_interval_seconds, self._WATCHED_INTERVAL))
+            # Sleep only what is left of the cadence: a fixed sleep on top of the
+            # cycle's own work pushed the on-screen LTP to ~0.8s instead of 0.4s.
+            cadence = min(settings.tick_interval_seconds, self._WATCHED_INTERVAL)
+            await asyncio.sleep(max(0.05, cadence - (time.monotonic() - cycle_began)))
 
 
 hub = Hub()
