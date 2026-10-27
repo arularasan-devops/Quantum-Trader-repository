@@ -653,6 +653,9 @@ class Settings(BaseSettings):
     # stop up to at least break-even (entry). A trade that went green can then
     # never turn into a full stop-loss — worst case is roughly flat.
     auto_trade_breakeven_after_arm: bool = True
+    # Exit a pre-T1 auto trade whose trail never armed (stop still below
+    # entry) once held this many minutes, at the bid. 0 = off.
+    auto_trade_no_progress_exit_min: float = 0.0
     # Cap the initial hard-stop distance below entry premium, as a % of entry
     # (0 = off, use the signal engine's stop as-is). When >0, a stop further than
     # this is tightened to this distance so a single auto trade can't bleed a big

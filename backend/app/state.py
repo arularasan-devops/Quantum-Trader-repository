@@ -2728,6 +2728,19 @@ class AppState:
                             self._auto_last_action_ts = now
                             self._reset_auto_trade_marks()
                             return
+            np_min = settings.auto_trade_no_progress_exit_min
+            if (np_min > 0 and self._auto_tgt_floor is None and self._entry_time
+                    and entry_prem and (self._auto_stop or 0.0) < entry_prem
+                    and not getattr(self, "_auto_pre_t1_halved", False)
+                    and now - self._entry_time >= np_min * 60):
+                self._pending_exit_reason = "NO-PROGRESS EXIT"
+                self.sell(confirm=live)
+                self._auto_last_action = (
+                    f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · no progress in "
+                    f"{np_min:g} min (trail never armed)")
+                self._auto_last_action_ts = now
+                self._reset_auto_trade_marks()
+                return
             # before any target is reached the hard stop still protects the trade
             if self._auto_tgt_floor is None and self._auto_stop and prem <= self._auto_stop:
                 why = ("BREAK-EVEN STOP" if getattr(self, "_auto_pre_t1_halved", False)
