@@ -137,18 +137,31 @@ def reset_carry(lock: float | None, equity: float) -> float | None:
 
 def entry_loss_budget(day_peak_equity: float, equity: float, *,
                       per_trade_cap: float | None = None,
-                      lock: float | None | object = _PEAK_LOCK) -> float | None:
-    """Most a NEW trade may lose at its stop: the per-trade rupee cap and, once
-    the day lock is armed, ``daily_lock_room_share_pct`` of the room above it.
+                      lock: float | None | object = _PEAK_LOCK,
+                      daily_room: float | None = None) -> float | None:
+    """Most a NEW trade may lose at its stop: the per-trade rupee cap, the room
+    left under the daily loss cap (``daily_room``) and, once the day lock is
+    armed, ``daily_lock_room_share_pct`` of the room above it.
     None means unlimited."""
     caps: list[float] = []
     if per_trade_cap is not None and per_trade_cap > 0:
         caps.append(per_trade_cap)
+    if daily_room is not None:
+        caps.append(max(0.0, daily_room))
     lvl = day_lock_level(day_peak_equity) if lock is _PEAK_LOCK else lock
     share = settings.daily_lock_room_share_pct
     if lvl is not None and share > 0:
         caps.append(max(0.0, equity - lvl) * min(share, 100.0) / 100.0)
     return min(caps) if caps else None
+
+
+def daily_loss_room(equity: float) -> float | None:
+    """Rupees a new trade may still lose before the day reaches
+    ``max_daily_loss`` (equity = realised + open P&L). None when the cap is off."""
+    cap = abs(settings.max_daily_loss)
+    if cap <= 0:
+        return None
+    return max(0.0, cap + equity)
 
 
 def lots_for_budget(budget: float, entry: float, stop: float, lot_size: int) -> int:
@@ -419,6 +432,14 @@ class AccountRisk:
             )
         if settings.max_trades_per_day > 0 and self.trades_today >= settings.max_trades_per_day:
             return f"account trade cap reached ({self.trades_today} today)"
+        # The streak is re-read against the CURRENT limit, so lowering
+        # max_consecutive_losses mid-day stands down an existing streak too.
+        limit = max(1, settings.max_consecutive_losses)
+        if (self.consecutive_losses >= limit and settings.risk_stand_down_sec > 0
+                and self.last_exit):
+            self.stand_down_until = max(
+                self.stand_down_until,
+                max(self.last_exit.values()) + settings.risk_stand_down_sec)
         if self.stand_down_until > now:
             return (
                 f"{self.consecutive_losses} losses in a row — standing down for "

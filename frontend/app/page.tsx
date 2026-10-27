@@ -294,9 +294,14 @@ export default function Page() {
             </div>
             <div className="text-lg font-bold">
               {pending.side} {pending.symbol}
-              {snap.decision.current_premium != null && (
-                <span className="text-white/70 text-base font-semibold">{`  @ ₹${snap.decision.current_premium}`}</span>
-              )}
+              {(() => {
+                // A SELL closes the HELD contract: show its mark, not the
+                // engine's current pick (a different strike).
+                const px = pending.side === "SELL" ? snap.position.current_premium : snap.decision.current_premium;
+                return px != null && (
+                  <span className="text-white/70 text-base font-semibold">{`  @ ₹${px}`}</span>
+                );
+              })()}
             </div>
             {pending.warnings && pending.warnings.length > 0 && (
               <div className="rounded-lg border border-[#ff4d4d]/40 bg-[#ff4d4d]/10 p-3 space-y-2">

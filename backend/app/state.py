@@ -315,6 +315,8 @@ class AppState:
         self._order_recovery: dict | None = None
         self._persist_error: str | None = None
         self._last_order_poll = 0.0
+        self._last_broker_pos_check = 0.0
+        self._broker_flat_seen = 0
         self._restore_live_ledger()
         self._paper_pos_saved_at = 0.0
         self._paper_pos_saved = False
@@ -929,6 +931,7 @@ class AppState:
         if not busy:
             if order_ledger.mirror_backlog_bytes() > 0:
                 order_ledger.mirror_pending()
+            self._check_broker_position(now)
             return
         try:
             if self._persist_error:
@@ -953,6 +956,54 @@ class AppState:
         except Exception as exc:
             self._add_alert("ORDER_RECONCILE_ERROR", f"Order reconciliation error: {exc}",
                             "critical")
+
+    def _check_broker_position(self, now: float) -> None:
+        """Read-only: an open LIVE app position that Angel shows flat (netqty 0
+        on two checks in a row) was closed outside the app. Flag recovery so
+        the bot neither re-sells it (that would open a short) nor buys again
+        until the operator confirms. An unknown answer is never read as flat."""
+        sym = self.position.option_symbol
+        fetch = getattr(self.provider, "broker_position", None)
+        if (not self.is_live or not sym or fetch is None
+                or self._pending_order or self._pending_exit):
+            self._broker_flat_seen = 0
+            return
+        if now - self._last_broker_pos_check < settings.live_position_check_sec:
+            return
+        self._last_broker_pos_check = now
+        try:
+            row = fetch(sym)
+        except Exception:
+            row = None
+        if not row or row.get("net_qty") != 0:
+            self._broker_flat_seen = 0
+            return
+        self._broker_flat_seen += 1
+        if self._broker_flat_seen < 2:
+            return
+        p = self.position
+        if self._ledger_position is None:
+            self._ledger_position = {"symbol": sym, "lots": p.quantity_lots,
+                                     "entry": p.entry_premium, "order_ids": [],
+                                     "ts": int(self._entry_time or now), "verified": False}
+        reason = (f"Angel shows {sym} flat while the app holds {p.quantity_lots} lot(s) "
+                  "— closed outside the app")
+        if self._order_recovery is None:
+            self._order_recovery = {"reason": reason, "since": now, "manual_only": True}
+        self._order_recovery["broker_flat"] = {"symbol": sym, "sell_avg": row.get("sell_avg"),
+                                               "buy_avg": row.get("buy_avg")}
+        self._enter_recovery(reason)
+
+    def _broker_closed(self) -> bool:
+        rec = self._order_recovery
+        return bool(rec and rec.get("broker_flat")
+                    and rec["broker_flat"].get("symbol") == self.position.option_symbol)
+
+    def _recovery_cleared(self, note: str) -> None:
+        self._order_recovery = None
+        self._event("RECOVERY_CLEARED", note=note)
+        self.alerts = [a for a in self.alerts if a.kind != "ORDER_RECOVERY"]
+        self._add_alert("ORDER_RECOVERY_CLEARED", f"Order recovery cleared: {note}", "info")
 
     # ---------- crash-safe persistence + restart recovery ----------
     def _persist_state(self) -> bool:
@@ -1147,9 +1198,7 @@ class AppState:
         if (rec and self._ledger_position is None and not self._pending_order
                 and not self._pending_exit and not rec.get("fills_seen")
                 and not rec.get("manual_only") and not rec.get("conflicts")):
-            self._order_recovery = None
-            self._event("RECOVERY_CLEARED", note="restored orders ended unfilled; "
-                        "no saved position")
+            self._recovery_cleared("restored orders ended unfilled; no saved position")
             self._persist_state()
 
     def recovery_status(self) -> dict:
@@ -1192,6 +1241,14 @@ class AppState:
                 raise ValueError("Resolve the pending exit order first.")
             self._event("OPERATOR_CONFIRMED_FLAT", note=note,
                         saved_position=self._ledger_position)
+            if self._broker_closed():
+                # Closed in Angel: book it at Angel's sell average (nothing is
+                # sent) so the journal and the day's loss cap see this trade.
+                px = self._order_recovery["broker_flat"].get("sell_avg")
+                self._pending_exit_reason = "MANUAL EXIT (ANGEL)"
+                self._book_exit(self.position.quantity_lots, None,
+                                float(px) if px else None)
+                self._reset_auto_trade_marks()
             self._ledger_position = None
             self._order_recovery.pop("conflicts", None)
         elif action == "adopt_position":
@@ -1226,8 +1283,7 @@ class AppState:
                 and not self._order_recovery.get("conflicts")
                 and not any(pd and not pd.get("order_id")
                             for pd in (self._pending_order, self._pending_exit))):
-            self._order_recovery = None
-            self._event("RECOVERY_CLEARED", note=note)
+            self._recovery_cleared(note)
         if not self._persist_state():
             raise RuntimeError(f"Order ledger write failed: {self._persist_error}")
         return self.recovery_status()
@@ -1256,6 +1312,10 @@ class AppState:
             if not confirm:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Confirmation required for a live order.")
+            if self._broker_closed():
+                return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                   lots=lots, message="Angel shows this position already "
+                                   "closed — no SELL sent. Confirm flat via /api/order-recovery.")
             res = self._submit_live("_pending_exit", sym, "SELL", lots)
             if not res.ok:
                 return res
@@ -2367,6 +2427,8 @@ class AppState:
                 return
             manage_only = True
         live = self._auto_live_armed() or manage_only
+        if in_pos and self._broker_closed():
+            return  # closed in Angel: no exits on a position that no longer exists
 
         # --- manage an open auto-position ---
         # Two exit styles:
@@ -2775,7 +2837,7 @@ class AppState:
         open_block = account_risk.account.opening_window_block(
             now, account_risk.session_open_min(get_spec(self._instrument).exchange)
         )
-        if open_block and not eng:
+        if open_block and (not eng or live):
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {open_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(
@@ -3190,7 +3252,8 @@ class AppState:
             budget = account_risk.entry_loss_budget(
                 acct.day_peak_equity, equity,
                 per_trade_cap=settings.auto_trade_max_loss_rupees,
-                lock=acct.lock_level())
+                lock=acct.lock_level(),
+                daily_room=account_risk.daily_loss_room(equity) if live else None)
             # Size on the price a buy fills at (the ask), not the signal premium.
             entry_est = max(float(decision.current_premium or 0.0),
                             float(getattr(self, "_auto_entry_ask", 0.0) or 0.0) if eng else 0.0,
@@ -3214,7 +3277,7 @@ class AppState:
                         "RISK", "LOSS_BUDGET", instrument=self._instrument, option=opt,
                         value=round((entry_est - stop_est) * lot_size, 0),
                         threshold=round(budget, 0), where="state.py:_auto_trade",
-                        reason="one lot's stop-out exceeds the per-trade cap / lock room",
+                        reason="one lot's stop-out exceeds the per-trade cap / daily room / lock room",
                     )
                     return
                 if fit < lots:

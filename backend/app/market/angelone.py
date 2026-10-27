@@ -2124,6 +2124,30 @@ class AngelOneProvider(MarketDataProvider):
             status=status, message=str(row.get("text") or row.get("status") or ""),
         )
 
+    def broker_position(self, option_symbol: str) -> dict | None:
+        """Read-only: today's Angel position row for ``option_symbol`` from the
+        account that places orders. None = unknown (error, no data, no row)."""
+        smart = self._smart
+        if settings.orders_on_primary_only:
+            try:
+                shards = _get_shards()
+                if shards:
+                    smart = shards[0].smart
+            except Exception:
+                smart = self._smart
+        try:
+            rows = (smart.position() or {}).get("data") or []
+        except Exception:  # pragma: no cover - live API
+            return None
+        row = next((r for r in rows if str(r.get("tradingsymbol")) == option_symbol), None)
+        if row is None:
+            return None
+        net = _as_int(row.get("netqty"))
+        if net is None:
+            return None
+        return {"net_qty": net, "buy_avg": _to_float(row.get("buyavgprice")),
+                "sell_avg": _to_float(row.get("sellavgprice"))}
+
     # --------------------------------------------------------------- helpers
     def _time_to_expiry(self) -> float:
         if not self._options:
