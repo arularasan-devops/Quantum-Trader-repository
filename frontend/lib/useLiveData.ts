@@ -1,11 +1,31 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { Snapshot } from "./types";
+import { Candle, Snapshot } from "./types";
 import { API_BASE, WS_BASE } from "./api";
 
 // `instrument` addresses a specific per-instrument stream on the server, so two
 // tabs on different instruments stay independent. Changing it tears down the
 // old socket and connects to the new instrument's stream.
+// A "candles_tail" frame carries only the forming bars: fold them into the
+// history already on screen (replace the same bar, append a newer one).
+function mergeTail(prev: Candle[] | undefined, tail: Candle[] | undefined): Candle[] {
+  if (!tail?.length) return prev ?? [];
+  if (!prev?.length) return tail;
+  const out = prev.slice();
+  for (const c of tail) {
+    const last = out[out.length - 1];
+    if (c.time > last.time) {
+      out.push(c);
+      if (out.length > prev.length) out.shift();
+      continue;
+    }
+    for (let j = out.length - 1; j >= 0 && out[j].time >= c.time; j--) {
+      if (out[j].time === c.time) { out[j] = c; break; }
+    }
+  }
+  return out;
+}
+
 export function useLiveData(instrument?: string) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [connected, setConnected] = useState(false);
@@ -51,12 +71,17 @@ export function useLiveData(instrument?: string) {
         lastMsgAt = Date.now();
         try {
           const d = JSON.parse(e.data);
-          setSnap((prev) =>
-            prev && typeof prev.time === "number" && typeof d.time === "number"
-              && d.instrument === prev.instrument && d.time < prev.time
-              ? prev
-              : d,
-          );
+          setSnap((prev) => {
+            if (prev && typeof prev.time === "number" && typeof d.time === "number"
+              && d.instrument === prev.instrument && d.time < prev.time) return prev;
+            if (d.candles_tail) {
+              const same = prev && d.instrument === prev.instrument;
+              d.futures_candles = mergeTail(same ? prev.futures_candles : undefined, d.futures_candles);
+              d.selected_option_candles = mergeTail(
+                same ? prev.selected_option_candles : undefined, d.selected_option_candles);
+            }
+            return d;
+          });
         } catch {}
       };
       ws.onclose = () => {

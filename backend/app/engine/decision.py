@@ -1360,11 +1360,29 @@ def decide(
     return decision, breakdown
 
 
+# The pick only comes from strikes within this band of spot. A far chain row
+# (expiry-day ₹0.1 wings, deep-ITM prints whose solved IV gives a misleading
+# delta) must not win on OI alone. Every MCX/index pick seen live sits within
+# ~2% of spot, so normal picks are unchanged.
+_PICK_MAX_DIST_PCT = 3.0
+_PICK_MIN_PREMIUM = 0.5
+
+
+def _near_spot(candidates: list[OptionQuote], spot: float) -> list[OptionQuote]:
+    if spot <= 0:
+        return candidates
+    live = [q for q in candidates if q.premium >= _PICK_MIN_PREMIUM] or candidates
+    band = spot * _PICK_MAX_DIST_PCT / 100.0
+    near = [q for q in live if abs(q.strike - spot) <= band]
+    return near or [min(live, key=lambda q: abs(q.strike - spot))]
+
+
 def _select_option(chain: list[OptionQuote], spot: float, want_call: bool, atr_val: float) -> OptionRecommendation | None:
     otype = OptionType.CALL if want_call else OptionType.PUT
     candidates = [q for q in chain if q.option_type == otype]
     if not candidates:
         return None
+    candidates = _near_spot(candidates, spot)
     # Prefer slightly ITM/ATM with healthy OI and delta ~0.45-0.6 for intraday.
     def score(q: OptionQuote) -> float:
         target_delta = 0.52
@@ -1372,7 +1390,7 @@ def _select_option(chain: list[OptionQuote], spot: float, want_call: bool, atr_v
         liquidity = min(1.0, q.oi / 6000.0)
         return 0.6 * delta_fit + 0.4 * liquidity
 
-    best = max(candidates, key=score)
+    best = max(candidates, key=lambda q: (score(q), -abs(q.strike - spot)))
     return OptionRecommendation(
         option_symbol=best.symbol,
         strike=best.strike,

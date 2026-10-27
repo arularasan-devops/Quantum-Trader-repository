@@ -856,4 +856,5 @@ export interface Snapshot {
   intelligence?: Intelligence | null;
   selected_option_candles: Candle[];
   futures_candles: Candle[];
+  candles_tail?: boolean;
 }

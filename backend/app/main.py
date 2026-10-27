@@ -281,6 +281,9 @@ class Hub:
 
     def __init__(self) -> None:
         self.ws_send_drops = 0
+        # Per instrument: (candle-shape signature, monotonic time of the last
+        # full-candle frame). Between full frames only the forming bars travel.
+        self._candle_sent: dict[str, tuple] = {}
         # ws -> instrument it subscribed to
         self.clients: dict[WebSocket, str] = {}
         # instrument -> latest snapshot
@@ -390,8 +393,11 @@ class Hub:
         self._tick_cost = took if self._tick_cost is None else self._tick_cost * 0.9 + took * 0.1
         self._ticked_at[inst] = time.monotonic()
         self.latest[inst] = snapshot
-        payload = snapshot.model_dump(mode="json")
-        text = _json_text(payload, inst)
+        if not any(sub == inst for sub in list(self.clients.values())):
+            # Nobody is watching: skip serialising ~90 KB nobody will read.
+            _mark_feed_stage(inst, "render")
+            return
+        text = _json_text(self._frame(inst, snapshot), inst)
         dead = []
         for ws, sub in list(self.clients.items()):
             if sub != inst:
@@ -415,6 +421,37 @@ class Hub:
         # Close the timestamp chain: this is the moment the price the engine used
         # actually left the server. Observability only.
         _mark_feed_stage(inst, "render")
+
+    # Full candle history is resent at least this often (and whenever its
+    # shape changes); otherwise a frame carries only the last bars.
+    _CANDLE_FULL_EVERY = 15.0
+    _CANDLE_TAIL = 2
+
+    def _frame(self, inst: str, snapshot) -> dict:
+        """Snapshot payload for the socket. Display-only slimming: while the
+        candle arrays keep their shape (same first/last bar, length and chart
+        contract) the frame carries just the forming bars and
+        ``candles_tail: true``; the browser merges them into what it has."""
+        fc = snapshot.futures_candles or []
+        oc = snapshot.selected_option_candles or []
+        sig = (
+            len(fc), fc[0].time if fc else None, fc[-1].time if fc else None,
+            len(oc), oc[0].time if oc else None, oc[-1].time if oc else None,
+            snapshot.display_option_symbol, snapshot.position.option_symbol,
+            snapshot.decision.recommended_option,
+        )
+        now = time.monotonic()
+        prev = self._candle_sent.get(inst)
+        if prev is None or prev[0] != sig or now - prev[1] >= self._CANDLE_FULL_EVERY:
+            self._candle_sent[inst] = (sig, now)
+            return snapshot.model_dump(mode="json")
+        payload = snapshot.model_dump(
+            mode="json", exclude={"futures_candles", "selected_option_candles"})
+        n = self._CANDLE_TAIL
+        payload["futures_candles"] = [c.model_dump(mode="json") for c in fc[-n:]]
+        payload["selected_option_candles"] = [c.model_dump(mode="json") for c in oc[-n:]]
+        payload["candles_tail"] = True
+        return payload
 
     # Seconds between samples of the frozen pair's two legs. One minute bar is
     # the unit of the study, so a few seconds is enough to catch every bar while
