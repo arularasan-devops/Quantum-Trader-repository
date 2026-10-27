@@ -432,14 +432,15 @@ class AccountRisk:
             )
         if settings.max_trades_per_day > 0 and self.trades_today >= settings.max_trades_per_day:
             return f"account trade cap reached ({self.trades_today} today)"
-        # The streak is re-read against the CURRENT limit, so lowering
-        # max_consecutive_losses mid-day stands down an existing streak too.
+        # The streak and its stand-down follow the CURRENT settings: a changed
+        # limit or stand-down length applies to the streak already running.
         limit = max(1, settings.max_consecutive_losses)
         if (self.consecutive_losses >= limit and settings.risk_stand_down_sec > 0
                 and self.last_exit):
-            self.stand_down_until = max(
-                self.stand_down_until,
+            self.stand_down_until = (
                 max(self.last_exit.values()) + settings.risk_stand_down_sec)
+        else:
+            self.stand_down_until = 0.0
         if self.stand_down_until > now:
             return (
                 f"{self.consecutive_losses} losses in a row — standing down for "

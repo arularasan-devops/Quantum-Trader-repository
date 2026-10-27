@@ -2460,7 +2460,7 @@ class AppState:
                     prem = bid  # judge every exit on the price a sell fills at
             # Targets behave like a resting sell at the level: reached when the
             # last trade OR the bid gets there. Stops and trails stay on the bid.
-            tgt_px = max(prem, ltp_now) if not live else prem
+            tgt_px = max(prem, ltp_now)
             if ((not live or settings.auto_trade_live_loss_budget)
                     and self._auto_entry_prem is not None):
                 with contextlib.suppress(Exception):
@@ -2837,7 +2837,7 @@ class AppState:
         open_block = account_risk.account.opening_window_block(
             now, account_risk.session_open_min(get_spec(self._instrument).exchange)
         )
-        if open_block and (not eng or live):
+        if open_block and not eng:
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {open_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(
@@ -3252,8 +3252,7 @@ class AppState:
             budget = account_risk.entry_loss_budget(
                 acct.day_peak_equity, equity,
                 per_trade_cap=settings.auto_trade_max_loss_rupees,
-                lock=acct.lock_level(),
-                daily_room=account_risk.daily_loss_room(equity) if live else None)
+                lock=acct.lock_level())
             # Size on the price a buy fills at (the ask), not the signal premium.
             entry_est = max(float(decision.current_premium or 0.0),
                             float(getattr(self, "_auto_entry_ask", 0.0) or 0.0) if eng else 0.0,

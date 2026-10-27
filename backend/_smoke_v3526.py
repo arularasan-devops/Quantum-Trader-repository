@@ -78,7 +78,7 @@ day0 = ist_0905 - ((ist_0905 + 19800) % 86400) + (open_min + 5) * 60
 ok(acct.opening_window_block(day0, open_min) is not None, "09:05 IST MCX inside the 15-min window")
 ok(acct.opening_window_block(day0 + 11 * 60, open_min) is None, "09:16 IST MCX outside it")
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "state.py")).read()
-ok("if open_block and (not eng or live):" in src, "LIVE pullback-engine entries obey the opening window")
+ok("if open_block and not eng:" in src, "v3.5.28: pullback-engine entries (paper and live) skip the opening window, as in paper")
 
 
 # ---------- manual exit in Angel ----------
