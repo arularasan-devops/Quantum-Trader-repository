@@ -1461,6 +1461,21 @@ class AngelOneProvider(MarketDataProvider):
         nearest = opt_expiries[0]
         self._options = [o for o in options_all if o.expiry == nearest]
         self._by_token = {i.token: i for i in [self._future, *self._options]}
+        # Sizing, risk caps and the journal use the registry lot size, but the
+        # order quantity uses the broker's: keep them equal when the exchange
+        # revises a lot (BANKNIFTY 15 -> 30 doubled real risk).
+        _blots = {o.lot_size for o in self._options if o.lot_size and o.lot_size > 1}
+        if len(_blots) == 1:
+            from app.market.instruments import REGISTRY as _reg, resolve_key as _rk
+            _spec = _reg.get(getattr(self, "_store_key", None) or _rk(self._root))
+            _lot = _blots.pop()
+            if _spec is not None and _spec.symbol == self._root and _spec.lot_size != _lot:
+                _log.warning("%s: lot size %s -> %s (broker scrip master)",
+                             self._root, _spec.lot_size, _lot)
+                object.__setattr__(_spec, "lot_size", _lot)
+        elif len(_blots) > 1:
+            _log.warning("%s: mixed broker lot sizes %s; registry lot kept",
+                         self._root, sorted(_blots))
 
     # ----------------------------------------------------------- live pulls
     def _atm_option_tokens(self) -> list[str]:
