@@ -2786,6 +2786,18 @@ class AppState:
                 where="state.py:_auto_trade", reason="past the live intraday square-off time",
             )
             return
+        _only = {s.strip().upper() for s in (settings.auto_trade_instruments or "").split(",") if s.strip()}
+        if _only and (self._instrument or "").upper() not in _only:
+            self._auto_last_action = (
+                f"AUTO SKIP {opt}: {self._instrument} not in auto-trade instruments "
+                f"({','.join(sorted(_only))})")
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "SIGNAL", "INSTRUMENT_NOT_ALLOWED", instrument=self._instrument, option=opt,
+                value=self._instrument, threshold=",".join(sorted(_only)),
+                where="state.py:_auto_trade", reason="instrument not in QT_AUTO_TRADE_INSTRUMENTS",
+            )
+            return
         self._auto_entry_note = ""
         if settings.auto_trade_strategy_gate:
             trig = (decision.entry_trigger or "").upper()

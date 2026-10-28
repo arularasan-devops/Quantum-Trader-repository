@@ -192,6 +192,9 @@ class Settings(BaseSettings):
     auto_trade_strategy_gate: bool = True
     auto_trade_allowed_triggers: list[str] = ["PULLBACK"]
     auto_trade_allowed_regimes: list[str] = ["TRENDING"]
+    # Auto-buy only these instruments (comma-separated registry keys, e.g.
+    # CRUDEOIL,SILVER). Empty = every instrument. Same rule for paper and live.
+    auto_trade_instruments: str = ""
     # Dedicated PAPER pullback auto-buy engine. Entry path is exactly:
     # TRENDING -> PULLBACK (>= min confidence) -> QUOTE VALID -> SPREAD OK ->
     # RISK ACCEPTABLE -> AUTO BUY. Discretionary gates (kill switch, cooldown,
