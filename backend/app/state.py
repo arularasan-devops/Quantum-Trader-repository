@@ -673,6 +673,8 @@ class AppState:
             self._ledger_position = {"symbol": q.symbol, "lots": lots, "entry": entry,
                                      "order_ids": [order_id] if order_id else [],
                                      "ts": int(time.time()), "verified": True}
+            if self.is_live and adopted is None and self._buy_product():
+                self._ledger_position["product"] = self._buy_product()
             self._persist_state()
             self._event("POSITION_OPENED", {"order_id": order_id, "side": "BUY",
                                             "symbol": q.symbol, "lots": lots},
@@ -747,7 +749,9 @@ class AppState:
         # unknown, so new entries remain blocked until it is reconciled.
         from app.ai.safety import RealMoneyBlocked
         try:
-            res = self.provider.place_order(symbol, side, lots)
+            prod = (self._ledger_position or {}).get("product") if side == "SELL" else self._buy_product()
+            res = (self.provider.place_order(symbol, side, lots, product=prod) if prod
+                   else self.provider.place_order(symbol, side, lots))
         except RealMoneyBlocked as exc:
             # The build's real-money lock raises before any broker call, so the
             # outcome is known (nothing sent): clear the record, refuse cleanly.
@@ -1273,6 +1277,10 @@ class AppState:
             self._entry_factors = []
             self._entry_context = {"recovered": True, "entry_time": opened,
                                    "order_ids": list(c.get("order_ids") or [])}
+            if c.get("t1") or c.get("t2"):
+                self._auto_target1, self._auto_target2 = c.get("t1"), c.get("t2")
+                self._auto_entry_prem = entry
+                self._auto_entry_active = True
             c["verified"] = True
             self._order_recovery.pop("conflicts", None)
             self._event("OPERATOR_ADOPTED_POSITION", note=note, saved_position=c)
@@ -2446,7 +2454,7 @@ class AppState:
             if prem is None:
                 return
             ltp_now = prem
-            if live and self._live_squareoff_due(now):
+            if live and self._live_squareoff_due(now) and not self._carry_keep(p.option_symbol, now):
                 self._pending_exit_reason = "SQUARE-OFF"
                 self.sell(confirm=True)
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} · LIVE SQUARE-OFF"
@@ -3367,6 +3375,9 @@ class AppState:
             self._auto_target2 = decision.target2
             self._auto_target3 = decision.target3
             self._auto_stop = decision.stop_loss
+            if live and self._ledger_position is not None:
+                self._ledger_position.update(t1=decision.target1, t2=decision.target2)
+                self._persist_state()
             # Cap how far the hard stop may sit below entry (one-click Live
             # Auto-Buy sets this) so a single trade can't bleed to a distant stop.
             entry_fill = res.fill_premium
@@ -3409,6 +3420,29 @@ class AppState:
         except Exception:
             return False
         return spec.exchange in ("NFO", "BFO") and self._instrument.upper() not in INDEX_ROOTS
+
+    def _buy_product(self) -> str | None:
+        """v3.5.33: broker product for a new live buy (None = the default angel_product)."""
+        if settings.auto_trade_stock_hold_carry_forward and self._stock_hold_active(True):
+            return settings.angel_product_carry
+        return None
+
+    def _carry_keep(self, sym: str | None, now: float) -> bool:
+        """v3.5.33: keep a CARRYFORWARD stock hold past the square-off, unless expiry is near
+        (or unknown)."""
+        led = self._ledger_position or {}
+        if not (settings.auto_trade_stock_hold_carry_forward and sym and led.get("symbol") == sym
+                and led.get("product") == settings.angel_product_carry):
+            return False
+        import datetime as _dt
+        import re as _re
+        m = _re.search(r"(\d{2})([A-Z]{3})(\d{2})\d+(?:\.\d+)?(?:CE|PE)$", sym.upper())
+        try:
+            exp = _dt.datetime.strptime("".join(m.groups()), "%d%b%y").date()
+        except (AttributeError, ValueError):
+            return False
+        today = _dt.datetime.fromtimestamp(now, _dt.timezone(_dt.timedelta(hours=5, minutes=30))).date()
+        return (exp - today).days > settings.auto_trade_stock_hold_exit_days_before_expiry
 
     def _early_target_points(self, entry: float | None) -> float | None:
         """Premium points for the early profit-lock, floored at a minimum R.

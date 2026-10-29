@@ -772,6 +772,12 @@ class Settings(BaseSettings):
     auto_trade_stock_hold_to_target: bool = False
     # Optional rupee loss limit for those holds (0 = off, no stop at all).
     auto_trade_stock_hold_max_loss_rupees: float = 0.0
+    # v3.5.33: those holds are bought as CARRYFORWARD (NRML) and kept past the equity
+    # square-off until T2 (or the loss limit); sold at the square-off once the option is
+    # within auto_trade_stock_hold_exit_days_before_expiry calendar days of expiry.
+    auto_trade_stock_hold_carry_forward: bool = False
+    auto_trade_stock_hold_exit_days_before_expiry: int = 3
+    angel_product_carry: str = "CARRYFORWARD"
     auto_trade_live_exit_on_bid: bool = True
     # LIVE intraday square-off (IST): flatten and stop new live entries after
     # this time. Set a few minutes before the broker's own intraday cut-off.

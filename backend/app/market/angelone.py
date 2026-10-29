@@ -2059,7 +2059,8 @@ class AngelOneProvider(MarketDataProvider):
     def supports_trading(self) -> bool:
         return True
 
-    def place_order(self, option_symbol: str, side: str, lots: int) -> OrderResult:
+    def place_order(self, option_symbol: str, side: str, lots: int,
+                    product: str | None = None) -> OrderResult:
         # Phase 6 kill switch — must be the first statement, before any SDK call.
         safety.assert_order_allowed("angelone.place_order", option_symbol, side, lots)
         inst = next((o for o in self._options if o.symbol == option_symbol), None)
@@ -2074,7 +2075,7 @@ class AngelOneProvider(MarketDataProvider):
             "transactiontype": side.upper(),  # BUY / SELL
             "exchange": self._exchange,
             "ordertype": settings.angel_order_type,
-            "producttype": settings.angel_product,
+            "producttype": product or settings.angel_product,
             "duration": "DAY",
             "price": "0",
             "squareoff": "0",

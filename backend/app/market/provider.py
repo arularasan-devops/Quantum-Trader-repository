@@ -28,7 +28,8 @@ class MarketDataProvider(abc.ABC):
         ``None`` = this provider cannot report it."""
         return None
 
-    def place_order(self, option_symbol: str, side: str, lots: int) -> OrderResult:
+    def place_order(self, option_symbol: str, side: str, lots: int,
+                    product: str | None = None) -> OrderResult:
         """Place a real order (side = 'BUY' or 'SELL'). Providers that support
         trading override this. ``side`` refers to the option leg direction.
 
