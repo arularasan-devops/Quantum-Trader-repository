@@ -2478,6 +2478,23 @@ class AppState:
                         self._auto_last_action_ts = now
                         self._reset_auto_trade_marks()
                         return
+            if self._stock_hold_active(live):
+                tgt = self._auto_target2 or self._auto_target1
+                entry = self._auto_entry_prem or p.entry_premium or 0.0
+                cap = settings.auto_trade_stock_hold_max_loss_rupees
+                qty = get_spec(self._instrument).lot_size * p.quantity_lots
+                if tgt is not None and tgt_px >= tgt:
+                    why = "STOCK HOLD TARGET"
+                elif cap > 0 and entry > 0 and (entry - prem) * qty >= cap:
+                    why = "STOCK HOLD MAX LOSS"
+                else:
+                    return
+                self._pending_exit_reason = why
+                self.sell(confirm=live)
+                self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {tgt_px if why.endswith('TARGET') else prem:.1f} · {why}"
+                self._auto_last_action_ts = now
+                self._reset_auto_trade_marks()
+                return
             if not settings.auto_trade_ride_trail:
                 stop = max(self._auto_stop or 0.0, p.trailing_stop or 0.0)
                 if self._auto_target1 is not None and prem >= self._auto_target1:
@@ -3330,6 +3347,8 @@ class AppState:
                 return
             lots = min(lots, fit)
 
+        if self._stock_hold_active(live):
+            lots = 1
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")
         res = self.buy(decision.recommended_option, lots=lots, confirm=live,
@@ -3379,6 +3398,17 @@ class AppState:
                 f"· conf {decision.confidence:.0f}%"
             )
             self._auto_last_action_ts = now
+
+    def _stock_hold_active(self, live: bool) -> bool:
+        """v3.5.32: LIVE single-stock option under the hold-to-T2 rule."""
+        if not (live and settings.auto_trade_stock_hold_to_target):
+            return False
+        from app.analysis.instrument_family import INDEX_ROOTS
+        try:
+            spec = get_spec(self._instrument)
+        except Exception:
+            return False
+        return spec.exchange in ("NFO", "BFO") and self._instrument.upper() not in INDEX_ROOTS
 
     def _early_target_points(self, entry: float | None) -> float | None:
         """Premium points for the early profit-lock, floored at a minimum R.

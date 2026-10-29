@@ -766,6 +766,12 @@ class Settings(BaseSettings):
     # judged on the bid, profit-lock flatten.
     auto_trade_live_pullback_engine: bool = True
     auto_trade_live_capital_sizing: bool = True
+    # v3.5.32: LIVE single-stock option auto-buys only (not MCX, not index): 1 lot,
+    # no stop / trail / no-progress exit; sold when the bid or LTP reaches T2 (T1 if
+    # no T2), else at the live equity square-off. Profit lock still applies.
+    auto_trade_stock_hold_to_target: bool = False
+    # Optional rupee loss limit for those holds (0 = off, no stop at all).
+    auto_trade_stock_hold_max_loss_rupees: float = 0.0
     auto_trade_live_exit_on_bid: bool = True
     # LIVE intraday square-off (IST): flatten and stop new live entries after
     # this time. Set a few minutes before the broker's own intraday cut-off.
