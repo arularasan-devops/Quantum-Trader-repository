@@ -641,6 +641,9 @@ class Settings(BaseSettings):
     # PAPER/live auto: when the pre-T1 trail fires on 2+ lots, sell half and hold
     # the rest with a break-even stop until T1. False = sell everything (old).
     auto_trade_pre_t1_half_out: bool = True
+    # v3.5.35: the pre-T1 peak trail only runs on positions of at least this many lots;
+    # 2 = a 1-lot trade holds to the T1 lock (or its stop). 1 = old behaviour.
+    auto_trade_pre_t1_trail_min_lots: int = 1
     auto_trade_pre_t1_trail_arm_pct: float = 40.0     # arm once this % of the way to T1
     auto_trade_pre_t1_trail_giveback_pct: float = 30.0  # exit on giving back this % of the run from the peak
     # Also arm the pre-T1 trail as soon as the premium is at least this % ABOVE
@@ -743,6 +746,8 @@ class Settings(BaseSettings):
         "1000000:RISK", "1500000:FULL", "1500000:RISK",
     ]
     paper_books_risk_pct: float = 1.0
+    # v3.5.35: SELL research book — margin blocked per short lot, % of strike x lot size.
+    paper_sell_margin_pct: float = 15.0
     # Paper Books also listed in the Journal's Paper tab while the stack trades
     # LIVE, e.g. "5L-FULL". Off by default: the Books tab is their home.
     journal_paper_books: str = ""

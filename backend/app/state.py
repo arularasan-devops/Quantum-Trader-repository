@@ -2657,7 +2657,8 @@ class AppState:
             # T1: track the running high and, once we're meaningfully advanced
             # toward T1, exit if price gives back a share of the run from that peak
             # (locks the high instead of drifting back to the hard stop).
-            if self._auto_tgt_floor is None and settings.auto_trade_pre_t1_trail:
+            if (self._auto_tgt_floor is None and settings.auto_trade_pre_t1_trail
+                    and p.quantity_lots >= max(1, settings.auto_trade_pre_t1_trail_min_lots)):
                 entry = self._auto_entry_prem or p.entry_premium
                 if self._auto_peak is None or prem > self._auto_peak:
                     self._auto_peak = prem

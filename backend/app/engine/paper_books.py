@@ -56,7 +56,15 @@ _DAY_COLS = [("pause_until", "DOUBLE PRECISION"), ("resumes", "INTEGER"),
              ("lock_floor", "DOUBLE PRECISION"), ("lock_base", "DOUBLE PRECISION"),
              ("lock_carry", "DOUBLE PRECISION"), ("reset_done", "INTEGER")]
 
+_TRADE_COLS = [("side", "TEXT"), ("leg", "TEXT"), ("margin", "DOUBLE PRECISION")]
+
 _POS_COLS = ("stop", "peak", "floor", "mark")
+
+# v3.5.35 research books: SELL = write the opposite option of the BUY signal (a bullish
+# CE signal sells the PE, which falls when the move comes); STRADDLE = buy the CE and
+# the PE at the signal's strike, each leg on its own stop, so the losing side is cut and
+# the moving side rides the normal locks. Both are 1 lot, ledger-only.
+ALT_MODES = ("SELL", "STRADDLE")
 
 
 def _hhmm(raw: str) -> int | None:
@@ -97,6 +105,15 @@ class Pos:
     floor: float | None = None
     mark: float | None = None
     armed: bool = False
+    # SHORT legs are managed in a mirrored price space (x' = 2*entry - x), so a falling
+    # premium looks like a rising one to manage(); _real() converts back for storage.
+    side: str = "LONG"
+    leg: str = ""
+    margin: float = 0.0
+
+    @property
+    def key(self) -> str:
+        return f"{self.instrument}#{self.leg}" if self.leg else self.instrument
 
     @property
     def qty(self) -> int:
@@ -128,7 +145,8 @@ class Book:
         return combined_lock(self.day_peak, self.base, self.floor, self.carry)
 
     def deployed(self) -> float:
-        return sum(p.entry * p.qty for p in self.positions.values())
+        return sum(p.margin if p.side == "SHORT" else p.entry * p.qty
+                   for p in self.positions.values())
 
     def equity(self) -> float:
         return self.day_realized + sum(p.unrealized() for p in self.positions.values())
@@ -140,7 +158,7 @@ def parse_books(specs: list[str]) -> list[Book]:
         cap_s, _, mode = str(raw).partition(":")
         cap = float(cap_s)
         mode = (mode or "FULL").strip().upper()
-        if mode not in ("FULL", "RISK") or cap <= 0:
+        if mode not in ("FULL", "RISK") + ALT_MODES or cap <= 0:
             raise ValueError(f"bad paper book spec {raw!r}")
         lakh = cap / 100000.0
         out.append(Book(f"{lakh:g}L-{mode}", cap, mode))
@@ -190,7 +208,7 @@ def manage(pos: Pos, mark: float, capital: float) -> str | None:
                 return "T2 TRAIL"
             return "T1 LOCK"
         return None
-    if settings.auto_trade_pre_t1_trail:
+    if settings.auto_trade_pre_t1_trail and pos.lots >= max(1, settings.auto_trade_pre_t1_trail_min_lots):
         arm_rs = settings.auto_trade_pre_t1_trail_arm_rupees * capital / max(1.0, settings.paper_capital)
         armed = (
             (t1 is not None and t1 > e
@@ -246,6 +264,14 @@ class PaperBooks:
                     self.db.execute(f"ALTER TABLE jr_book_days ADD COLUMN {col} {typ}")
             except Exception:  # sqlite: column already exists
                 pass
+        for col, typ in _TRADE_COLS:
+            try:
+                if self.db.is_postgres:
+                    self.db.execute(f"ALTER TABLE jr_book_trades ADD COLUMN IF NOT EXISTS {col} {typ}")
+                else:
+                    self.db.execute(f"ALTER TABLE jr_book_trades ADD COLUMN {col} {typ}")
+            except Exception:  # sqlite: column already exists
+                pass
         self.books = parse_books(specs if specs is not None else settings.paper_books)
         self._lock = threading.Lock()
         self.last_skip: dict[str, str] = {}
@@ -258,12 +284,17 @@ class PaperBooks:
             b = by_id.get(r["book"])
             if b is None:
                 continue
-            b.positions[r["instrument"]] = Pos(
+            side = str(r.get("side") or "LONG").upper()
+            e = float(r["entry_price"])
+            m = (lambda v: v) if side != "SHORT" else (lambda v: None if v is None else 2 * e - float(v))
+            p = Pos(
                 r["trade_id"], r["instrument"], r["option_symbol"], int(r["lot_size"]),
-                int(r["lots"]), float(r["entry_price"]), float(r["stop"]),
-                r["target1"], r["target2"], r["target3"], float(r["entry_ts"]),
-                float(r["peak"] or r["entry_price"]), r["floor"], r["mark"],
-                armed=float(r["stop"]) >= float(r["entry_price"]))
+                int(r["lots"]), e, m(float(r["stop"])),
+                m(r["target1"]), m(r["target2"]), m(r["target3"]), float(r["entry_ts"]),
+                m(float(r["peak"] or e)), m(r["floor"]), m(r["mark"]),
+                side=side, leg=str(r.get("leg") or ""), margin=float(r.get("margin") or 0.0))
+            p.armed = p.stop >= e
+            b.positions[p.key] = p
         self._roll(time.time(), force=True)
 
     def _roll(self, now: float, force: bool = False) -> None:
@@ -305,17 +336,28 @@ class PaperBooks:
              b.lock_level(), b.pause_until, b.resumes, b.floor, b.base, b.carry,
              int(b.reset_done)))
 
+    @staticmethod
+    def _real(p: Pos, v: float | None) -> float | None:
+        """Mirrored (manage) price <-> real premium; identity for LONG."""
+        return v if v is None or p.side != "SHORT" else 2 * p.entry - v
+
     def _close(self, b: Book, p: Pos, price: float, reason: str, now: float) -> None:
-        gross = (price - p.entry) * p.qty
-        costs = option_costs.charges(p.entry, price, p.qty, p.instrument).total
+        """``price`` is the REAL premium (bid for a long, ask to buy a short back)."""
+        if p.side == "SHORT":
+            gross = (p.entry - price) * p.qty
+            costs = option_costs.charges(price, p.entry, p.qty, p.instrument).total
+        else:
+            gross = (price - p.entry) * p.qty
+            costs = option_costs.charges(p.entry, price, p.qty, p.instrument).total
         net = gross - costs
         self.db.execute(
             "UPDATE jr_book_trades SET status = 'CLOSED', exit_ts = ?, exit_ts_iso = ?, "
             "exit_price = ?, exit_reason = ?, gross_pnl = ?, costs = ?, net_pnl = ?, "
             "stop = ?, peak = ?, floor = ?, mark = ? WHERE trade_id = ?",
             (now, iso(now), price, reason, round(gross, 2), round(costs, 2), round(net, 2),
-             p.stop, p.peak, p.floor, price, p.trade_id))
-        b.positions.pop(p.instrument, None)
+             self._real(p, p.stop), self._real(p, p.peak), self._real(p, p.floor), price,
+             p.trade_id))
+        b.positions.pop(p.key, None)
         b.day_realized += net
         _log.info("BOOK %s EXIT %s @ %.2f · %s · net ₹%.0f", b.id, p.option, price, reason, net)
 
@@ -328,23 +370,25 @@ class PaperBooks:
             inst = st.instrument
             quotes = {q.symbol: q for q in chain or []}
             for b in self.books:
-                p = b.positions.get(inst)
-                if p is None:
-                    continue
-                q = quotes.get(p.option)
-                if q is None:
-                    continue
-                mark = float(q.bid or 0) if q.bid else float(q.premium or 0)
-                if mark <= 0:
-                    continue
-                before = tuple(getattr(p, c) for c in _POS_COLS)
-                reason = self._session_exit(p, now) or manage(p, mark, b.capital)
-                if reason:
-                    self._close(b, p, mark, reason, now)
-                elif tuple(getattr(p, c) for c in _POS_COLS) != before:
-                    self.db.execute(
-                        "UPDATE jr_book_trades SET stop = ?, peak = ?, floor = ?, mark = ? "
-                        "WHERE trade_id = ?", (p.stop, p.peak, p.floor, p.mark, p.trade_id))
+                for p in [x for x in b.positions.values() if x.instrument == inst]:
+                    q = quotes.get(p.option)
+                    if q is None:
+                        continue
+                    if p.side == "SHORT":  # a short is closed by buying at the ask
+                        real = float(q.ask or 0) if q.ask else float(q.premium or 0)
+                    else:
+                        real = float(q.bid or 0) if q.bid else float(q.premium or 0)
+                    if real <= 0:
+                        continue
+                    before = tuple(getattr(p, c) for c in _POS_COLS)
+                    reason = self._session_exit(p, now) or manage(p, self._real(p, real), b.capital)
+                    if reason:
+                        self._close(b, p, real, reason, now)
+                    elif tuple(getattr(p, c) for c in _POS_COLS) != before:
+                        self.db.execute(
+                            "UPDATE jr_book_trades SET stop = ?, peak = ?, floor = ?, mark = ? "
+                            "WHERE trade_id = ?", (self._real(p, p.stop), self._real(p, p.peak),
+                                                   self._real(p, p.floor), real, p.trade_id))
             for b in self.books:
                 self._profit_lock(b, now)
             self._entries(st, decision, quotes, now)
@@ -399,7 +443,8 @@ class PaperBooks:
                          b.id, eq, lvl, b.day_peak)
             if settings.profit_lock_flatten:
                 for p in list(b.positions.values()):
-                    self._close(b, p, p.mark if p.mark is not None else p.entry, "PROFIT LOCK", now)
+                    self._close(b, p, self._real(p, p.mark if p.mark is not None else p.entry),
+                                "PROFIT LOCK", now)
         if changed:
             self._save_day(b, now)
 
@@ -438,12 +483,20 @@ class PaperBooks:
         if why:
             return self._skip(inst, why)
         stop = float(d.stop_loss)
+        risk_frac = (entry - stop) / entry
+        pts = float(settings.auto_trade_stop_points.get(inst) or 0.0)
+        if 0 < pts < entry:  # the per-instrument point stop the engine applies after fill
+            stop = entry - pts
         key = f"{opt}|{d.option_type.value if d.option_type else ''}"
         lot_size = int(get_spec(inst).lot_size or 0)
         for b in self.books:
-            if b.locked or inst in b.positions or b.last_key.get(inst) == key:
+            if (b.locked or any(x.instrument == inst for x in b.positions.values())
+                    or b.last_key.get(inst) == key):
                 continue
             b.last_key[inst] = key
+            if b.sizing in ALT_MODES:
+                self._alt_entry(b, st, d, q, quotes, entry, risk_frac, pts, lot_size, now)
+                continue
             lots, risk = size_lots(b, entry, stop, lot_size)
             if lots < 1:
                 self._skip(inst, f"{b.id}: capital")
@@ -475,6 +528,76 @@ class PaperBooks:
                                     d.target1, d.target2, d.target3, now, entry, mark=entry)
             _log.info("BOOK %s BUY %s x%d @ %.2f (stop %.2f, risk ₹%.0f)",
                       b.id, opt, lots, entry, stop, risk)
+
+    def _open(self, b: Book, st, d, p: Pos, real: dict, risk: float, depth: str,
+              now: float) -> None:
+        self.db.execute(
+            "INSERT INTO jr_book_trades (trade_id, book, capital, sizing, instrument, "
+            "option_symbol, lot_size, lots, capital_used, risk_rupees, entry_ts, "
+            "entry_ts_iso, entry_price, initial_stop, stop, target1, target2, target3, "
+            "peak, floor, mark, setup, regime, confidence, depth_note, status, side, leg, margin) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT (trade_id) DO NOTHING",
+            (p.trade_id, b.id, b.capital, b.sizing, p.instrument, p.option, p.lot_size, p.lots,
+             round(p.margin if p.side == "SHORT" else p.entry * p.qty, 2), risk, now, iso(now),
+             p.entry, real["stop"], real["stop"], real["t1"], real["t2"], real["t3"],
+             p.entry, None, p.entry, d.entry_trigger, getattr(st, "_last_market_status", None),
+             d.confidence, depth, "OPEN", p.side, p.leg or None, p.margin))
+        b.positions[p.key] = p
+        _log.info("BOOK %s %s %s x%d @ %.2f (stop %.2f, risk ₹%.0f)", b.id,
+                  "SELL" if p.side == "SHORT" else "BUY", p.option, p.lots, p.entry,
+                  real["stop"], risk)
+
+    def _alt_entry(self, b: Book, st, d, q, quotes: dict, sig_entry: float, risk_frac: float,
+                   pts: float, lot_size: int, now: float) -> None:
+        """SELL / STRADDLE research entry on the same gated BUY signal; 1 lot."""
+        inst = st.instrument
+        other_type = "PE" if q.option_type.value == "CE" else "CE"
+        o = next((x for x in quotes.values() if x.strike == q.strike
+                  and x.option_type.value == other_type), None)
+        if o is None:
+            return self._skip(inst, f"{b.id}: no {other_type} at strike {q.strike:g}")
+        simulated = str(settings.data_provider).lower() == "simulated"
+        gains = [None if t is None else (float(t) - sig_entry) / sig_entry
+                 for t in (d.target1, d.target2, d.target3)]
+        tid = lambda sym: stable_id("book", b.id, inst, sym, int(now))  # noqa: E731
+        if b.sizing == "SELL":
+            bid, ask = float(o.bid or 0), float(o.ask or 0)
+            if not simulated and (bid <= 0 or ask < bid):
+                return self._skip(inst, f"{b.id}: no two-sided quote on {o.symbol}")
+            e = bid if bid > 0 else float(o.premium or 0)
+            if e <= 0:
+                return self._skip(inst, f"{b.id}: no premium on {o.symbol}")
+            margin = float(q.strike) * lot_size * settings.paper_sell_margin_pct / 100.0
+            if b.capital - b.deployed() < margin:
+                return self._skip(inst, f"{b.id}: margin")
+            stop_real = e + pts if pts > 0 else e * (1.0 + risk_frac)
+            tg_real = [None if g is None or g >= 0.95 else e * (1.0 - g) for g in gains]
+            p = Pos(tid(o.symbol), inst, o.symbol, lot_size, 1, e, 2 * e - stop_real,
+                    *[None if t is None else 2 * e - t for t in tg_real], now, e, mark=e,
+                    side="SHORT", margin=round(margin, 2))
+            self._open(b, st, d, p, {"stop": stop_real, "t1": tg_real[0], "t2": tg_real[1],
+                                     "t3": tg_real[2]},
+                       round((stop_real - e) * lot_size, 2), f"margin est ₹{margin:,.0f}", now)
+            return
+        legs = []
+        for x in (q, o):
+            bid, ask = float(x.bid or 0), float(x.ask or 0)
+            if not simulated and (bid <= 0 or ask < bid):
+                return self._skip(inst, f"{b.id}: no two-sided quote on {x.symbol}")
+            e = ask if ask > 0 else float(x.premium or 0)
+            if e <= 0:
+                return self._skip(inst, f"{b.id}: no premium on {x.symbol}")
+            legs.append((x, e))
+        if b.capital - b.deployed() < sum(e for _, e in legs) * lot_size:
+            return self._skip(inst, f"{b.id}: capital")
+        for x, e in legs:
+            stop = max(0.05, e - pts) if 0 < pts < e else e * (1.0 - risk_frac)
+            tg = [None if g is None else e * (1.0 + g) for g in gains]
+            p = Pos(tid(x.symbol), inst, x.symbol, lot_size, 1, e, stop, *tg, now, e, mark=e,
+                    leg=x.option_type.value)
+            self._open(b, st, d, p, {"stop": stop, "t1": tg[0], "t2": tg[1], "t3": tg[2]},
+                       round((e - stop) * lot_size, 2), "straddle leg", now)
 
     # ------------------------------------------------------------ read API
     def summary(self) -> dict:
@@ -513,8 +636,10 @@ class PaperBooks:
                     "locked": b.locked,
                     "deployed": round(b.deployed(), 2),
                     "open": [{"instrument": p.instrument, "option": p.option, "lots": p.lots,
-                              "entry": p.entry, "mark": p.mark, "stop": p.stop,
-                              "floor": p.floor, "unrealized": round(p.unrealized(), 2)}
+                              "side": p.side, "entry": p.entry,
+                              "mark": self._real(p, p.mark), "stop": self._real(p, p.stop),
+                              "floor": self._real(p, p.floor),
+                              "unrealized": round(p.unrealized(), 2)}
                              for p in b.positions.values()],
                 })
             return {"enabled": settings.paper_books_enabled,
