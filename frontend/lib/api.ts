@@ -100,6 +100,15 @@ export interface OrderResult {
   filled_lots?: number | null;
 }
 
+// A rejected order call (401 no live token, 409 kill switch...) has no ``result``;
+// turn it into a failed OrderResult so the UI shows why instead of failing silently.
+async function orderReply(res: Response, side: "BUY" | "SELL", option_symbol: string) {
+  if (res.ok) return res.json() as Promise<{ result: OrderResult; position: unknown }>;
+  let msg = await errorDetail(res);
+  if (res.status === 401) msg = `Live token missing or wrong — enter it in the Live panel, then retry. (${msg})`;
+  return { result: { ok: false, side, option_symbol, message: msg } as unknown as OrderResult, position: null };
+}
+
 export async function buyOption(
   option_symbol: string,
   lots = 1,
@@ -111,7 +120,7 @@ export async function buyOption(
     headers: liveHeaders(),
     body: JSON.stringify({ option_symbol, lots, confirm, instrument }),
   });
-  return res.json() as Promise<{ result: OrderResult; position: unknown }>;
+  return orderReply(res, "BUY", option_symbol);
 }
 
 export async function fetchSignal(instrument?: string) {
@@ -173,7 +182,7 @@ export async function sellPosition(confirm = false, instrument?: string) {
     headers: liveHeaders(),
     body: JSON.stringify({ confirm, instrument }),
   });
-  return res.json() as Promise<{ result: OrderResult; position: unknown }>;
+  return orderReply(res, "SELL", "");
 }
 
 export interface AutoTradeConfig {

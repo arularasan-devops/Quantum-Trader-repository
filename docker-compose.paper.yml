@@ -1,26 +1,21 @@
-# Second, PAPER-only stack beside the main one (v3.5.14). Own database, Redis,
-# data volume and ports (backend 8001, dashboard 3001), so the main stack can
-# run live while this one keeps the 5L paper journal. It can never trade live:
-# QT_TRADE_MODE is forced to paper here and the live arm/token are cleared.
+# Quantum Trader — separate PAPER app, run beside the live stack without touching it.
 #   docker compose -f docker-compose.paper.yml up -d --build
+# Own project name => own containers, network and volumes (own Postgres, Redis,
+# SQLite data). Backend on :8001, UI on :3001. Reads .env.paper (never .env).
+# QT_TRADE_MODE is forced to paper here, so this app can never send a live order.
+# Angel: give .env.paper its OWN SmartAPI key (a second SmartAPI app) so its
+# login and rate limit don't compete with the live app's key.
 name: quantum-trader-paper
 
 services:
   backend:
     build: ./backend
-    env_file: .env
+    env_file: .env.paper
     environment:
       QT_TRADE_MODE: paper
       QT_AUTO_TRADE_ALLOW_LIVE: "false"
-      QT_AUTO_TRADE_USE_LIVE_BALANCE: "false"
-      QT_LIVE_ARM_TOKEN: ""
-      QT_CAPITAL: "500000"
-      QT_PAPER_CAPITAL: "500000"
-      QT_AUTO_TRADE_MAX_LOSS_RUPEES: ${QT_PAPER_MAX_LOSS_RUPEES:-10000}
-      QT_MAX_DAILY_LOSS: ${QT_PAPER_MAX_DAILY_LOSS:-0}
-      QT_PAPER_BOOKS_ENABLED: "false"
       QT_CORS_ORIGINS: http://localhost:3001
-      QT_DB_URL: postgresql://quantum:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/quantum
+      QT_DB_URL: postgresql://quantum:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/quantum
       QT_DATA_DIR: /app/data
     volumes:
       - backend-data:/app/data
@@ -73,7 +68,7 @@ services:
     environment:
       POSTGRES_DB: quantum
       POSTGRES_USER: quantum
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -81,30 +76,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    restart: unless-stopped
-
-  db-backup:
-    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
-    environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      EVERY_MIN: ${QT_BACKUP_EVERY_MIN:-5}
-      KEEP: ${QT_BACKUP_KEEP:-12}
-      KEEP_DAYS: ${QT_BACKUP_KEEP_DAYS:-7}
-    volumes:
-      - ./backups-paper:/backups
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        while true; do
-          f=/backups/quantum_$$(date +%Y%m%d_%H%M%S).dump
-          if pg_dump -h postgres -U quantum -d quantum -Fc -f "$$f.tmp"; then mv "$$f.tmp" "$$f"; cp "$$f" /backups/quantum_latest.dump; cp "$$f" /backups/quantum_daily_$$(date +%Y%m%d).dump; else rm -f "$$f.tmp"; fi
-          ls -1t /backups/quantum_2*.dump 2>/dev/null | tail -n +$$((KEEP + 1)) | xargs -r rm -f
-          ls -1t /backups/quantum_daily_*.dump 2>/dev/null | tail -n +$$((KEEP_DAYS + 1)) | xargs -r rm -f
-          sleep $$((EVERY_MIN * 60))
-        done
-    depends_on:
-      postgres:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:
