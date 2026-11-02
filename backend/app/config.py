@@ -684,6 +684,20 @@ class Settings(BaseSettings):
     # and the trade drifted to the hard stop. Noise scales with the premium, so the
     # floor must too. When > 0 this replaces the points value; 0 = points only.
     auto_trade_pre_t1_trail_min_giveback_pct: float = 0.8
+    # Pre-T1 POINT PROFIT LOCK. Once the bid is this many option-premium points
+    # above entry (plus round-trip charges), the exit floor locks there; the
+    # pre-T1 peak trail above then rides, never below that floor; T1/T2/T3
+    # ratchet as before. 0 = off (percentage arming only).
+    auto_trade_pre_t1_lock_points: float = 5.0
+    # Large-lot contracts (lot size >= this) lock fewer points: 1 pt on a
+    # 300+ qty lot is already Rs300+.
+    auto_trade_pre_t1_lock_high_qty: int = 300
+    auto_trade_pre_t1_lock_points_high_qty: float = 1.0
+    # Per-instrument override (JSON env), e.g. {"CRUDEOIL": 5, "CIPLA": 0.5}.
+    auto_trade_pre_t1_lock_points_by_instrument: dict[str, float] = {}
+    # Break-even stops and profit floors include round-trip charges per unit,
+    # so a "break-even" or "locked" exit does not book a net loss.
+    auto_trade_lock_covers_charges: bool = True
     # Daily profit GOAL (₹). When day P&L >= this, the bot stops opening NEW trades
     # for the day (locks the gain). 0 = disabled. This is a stop-FOR-the-day, NOT a
     # guaranteed minimum — losing days are normal and cannot be ruled out.

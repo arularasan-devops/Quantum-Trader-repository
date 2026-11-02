@@ -275,6 +275,10 @@ class AppState:
         self._wa_last_key: str | None = None
         # --- paper auto-trader (simulated fills only; never live) ---
         self._auto_last_key: str | None = None   # one auto-entry per signal episode
+        # when the episode key was consumed by a successful auto-buy; a closed
+        # trade re-arms the same episode once the re-entry cooldown has passed
+        self._auto_key_traded_ts: float | None = None
+        self._auto_last_exit_was_stop = False
         self._auto_target1: float | None = None  # T1 captured at auto-entry
         self._auto_target2: float | None = None  # T2 captured at auto-entry
         self._auto_target3: float | None = None  # T3 captured at auto-entry
@@ -1504,6 +1508,8 @@ class AppState:
         self._entry_factors = []
         self._entry_context = {}
         self._auto_last_exit_ts = int(time.time())
+        self._auto_last_exit_was_stop = str(
+            trade_row.get("exit_reason") or "").upper().startswith("STOP")
         self._add_alert("EXIT_NOW", f"[{mode}] Exited {sym} net {pnl:+.0f}", "info")
         self.position = Position()
         self._entry_time = None
@@ -2709,11 +2715,18 @@ class AppState:
                         arm_rs > 0 and peak is not None and qty > 0
                         and (peak - entry) * qty >= arm_rs
                     )
-                    if peak is not None and (arm_by_t1 or arm_by_profit or arm_by_rupees):
+                    lock_pts = self._pre_t1_lock_points()
+                    be = entry + self._exit_cost_per_unit(entry)
+                    lock_px = be + lock_pts if lock_pts > 0 else None
+                    locked = lock_px is not None and peak is not None and peak >= lock_px
+                    if peak is not None and (locked or arm_by_t1 or arm_by_profit or arm_by_rupees):
                         # Once we've seen real profit, ratchet the hard stop up to
-                        # break-even so a green trade can't become a full loss.
+                        # break-even (after charges) so a green trade can't become a loss.
                         if settings.auto_trade_breakeven_after_arm:
-                            self._auto_stop = max(self._auto_stop or 0.0, entry)
+                            self._auto_stop = max(self._auto_stop or 0.0, be)
+                        if locked:
+                            self._auto_stop = max(self._auto_stop or 0.0, lock_px)
+                        base_floor = lock_px if locked else be
                         run = peak - entry
                         pct_floor = settings.auto_trade_pre_t1_trail_min_giveback_pct
                         floor = (
@@ -2725,32 +2738,35 @@ class AppState:
                             floor,
                             run * (settings.auto_trade_pre_t1_trail_giveback_pct / 100.0),
                         )
-                        trail = peak - giveback
+                        trail = max(peak - giveback, base_floor)
+                        hit = prem <= trail and (locked or prem > entry)
                         halved = getattr(self, "_auto_pre_t1_halved", False)
-                        if (prem <= trail and prem > entry and not halved
+                        if (hit and not halved
                                 and settings.auto_trade_pre_t1_half_out
                                 and p.quantity_lots >= 2):
-                            # Bank half; the rest holds with a break-even stop
-                            # until T1 (price-path replay: early trails left
+                            # Bank half; the rest holds with the locked / break-even
+                            # stop until T1 (price-path replay: early trails left
                             # T1 runs on the table).
                             book = p.quantity_lots // 2
                             self._pending_exit_reason = "PRE-T1 HALF OUT"
                             res = self.sell(confirm=live, lots=book)
                             if res.ok:
                                 self._auto_pre_t1_halved = True
-                                self._auto_stop = max(self._auto_stop or 0.0, entry)
+                                self._auto_stop = max(self._auto_stop or 0.0, base_floor)
                                 self._auto_last_action = (
                                     f"AUTO HALF OUT {book} lot(s) {p.option_symbol} @ "
                                     f"{prem:.1f} · peak trail — rest holds to T1, stop at "
-                                    f"break-even")
+                                    f"{base_floor:.1f}")
                                 self._auto_last_action_ts = now
                             return
-                        if prem <= trail and prem > entry and not halved:
-                            self._pending_exit_reason = "PRE-T1 PEAK TRAIL"
+                        if hit and not halved:
+                            why = ("PRE-T1 PROFIT LOCK" if locked and trail <= base_floor
+                                   else "PRE-T1 PEAK TRAIL")
+                            self._pending_exit_reason = why
                             self.sell(confirm=live)
                             self._auto_last_action = (
-                                f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · peak trail "
-                                f"(high {peak:.1f})"
+                                f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why.lower()} "
+                                f"(high {peak:.1f}, floor {trail:.1f})"
                             )
                             self._auto_last_action_ts = now
                             self._reset_auto_trade_marks()
@@ -2770,8 +2786,9 @@ class AppState:
                 return
             # before any target is reached the hard stop still protects the trade
             if self._auto_tgt_floor is None and self._auto_stop and prem <= self._auto_stop:
+                ent = self._auto_entry_prem or p.entry_premium or 0.0
                 why = ("BREAK-EVEN STOP" if getattr(self, "_auto_pre_t1_halved", False)
-                       else "STOP LOSS")
+                       or (ent > 0 and self._auto_stop >= ent) else "STOP LOSS")
                 self._pending_exit_reason = why
                 self.sell(confirm=live)
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why}"
@@ -2878,10 +2895,17 @@ class AppState:
             )
             return
         if self._auto_last_key == key:
+            left = self._episode_rearm_wait(now)
+            if left is not None and left <= 0:
+                self._auto_last_key = None
+                self._auto_key_traded_ts = None
+        if self._auto_last_key == key:
+            left = self._episode_rearm_wait(now)
             exec_funnel.blocked(
                 "SIGNAL", "EPISODE_ALREADY_TRADED", instrument=self._instrument,
                 option=opt, where="state.py:_auto_trade",
-                reason="this signal episode has already been auto-traded",
+                reason=("this signal episode has already been auto-traded" if left is None
+                        else f"same setup was traded and closed; re-arms in {int(left)}s"),
             )
             return  # already auto-traded this signal episode; wait for a new one
         exec_funnel.reached("RISK")
@@ -3368,6 +3392,7 @@ class AppState:
         res = self.buy(decision.recommended_option, lots=lots, confirm=live,
                        manual=False)
         self._auto_last_key = key
+        self._auto_key_traded_ts = float(now) if res.ok else None
         if not res.ok:
             exec_funnel.blocked(
                 "ACCEPTED", "ORDER_REJECTED", instrument=self._instrument, option=opt,
@@ -3474,6 +3499,43 @@ class AppState:
         if stop is not None and 0 < stop < entry:
             target = max(target, (entry - stop) * settings.auto_trade_min_target_r)
         return target
+
+    def _pre_t1_lock_points(self) -> float:
+        by = settings.auto_trade_pre_t1_lock_points_by_instrument or {}
+        if self._instrument in by:
+            return max(0.0, float(by[self._instrument] or 0.0))
+        base = settings.auto_trade_pre_t1_lock_points
+        if base <= 0:
+            return 0.0
+        hq = settings.auto_trade_pre_t1_lock_high_qty
+        if hq > 0 and int(get_spec(self._instrument).lot_size or 0) >= hq:
+            return max(0.0, settings.auto_trade_pre_t1_lock_points_high_qty)
+        return base
+
+    def _exit_cost_per_unit(self, entry: float) -> float:
+        """Round-trip charges per unit of premium, so a floor at entry + this
+        books zero net, not a loss."""
+        if not settings.auto_trade_lock_covers_charges or entry <= 0:
+            return 0.0
+        qty = int(get_spec(self._instrument).lot_size or 0) * int(
+            self._auto_entry_lots or self.position.quantity_lots or 1)
+        if qty <= 0:
+            return 0.0
+        try:
+            return float(option_costs.charges(entry, entry, qty, self._instrument).total) / qty
+        except Exception:
+            return 0.0
+
+    def _episode_rearm_wait(self, now: float) -> float | None:
+        """Seconds until a traded-and-closed episode may be bought again; None
+        when the episode is still held (open, or an order whose fate is unknown)."""
+        traded, ex = self._auto_key_traded_ts, self._auto_last_exit_ts
+        if (traded is None or ex is None or ex < traded or self.position.option_symbol
+                or self._pending_order or self._pending_exit):
+            return None
+        wait = (settings.auto_trade_post_stop_cooldown_sec if self._auto_last_exit_was_stop
+                else settings.auto_trade_reentry_cooldown_sec)
+        return max(0.0, wait - (now - ex))
 
     def _reset_auto_trade_marks(self) -> None:
         """Clear the per-trade exit marks after an auto-exit so the next entry
