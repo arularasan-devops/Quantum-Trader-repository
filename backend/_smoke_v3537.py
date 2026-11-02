@@ -80,6 +80,7 @@ settings.auto_trade_capital_sizing = False
 settings.auto_trade_risk_balanced_lots = False
 settings.auto_trade_safe_sizing = False
 settings.auto_trade_instrument_lots = {}
+settings.mcx_hold_arm_points = 0  # v3.5.38 MCX hold off: tests the generic +5 lock
 
 # 1. lock points by contract size
 eng, sym, prem = fresh()

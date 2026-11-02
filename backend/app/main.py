@@ -1260,6 +1260,27 @@ async def sell(req: SellRequest | None = None,
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
 
 
+@app.post("/api/auto-trade/levels")
+async def auto_trade_levels(req: dict,
+                            x_qt_live_token: str | None = Header(default=None)) -> dict:
+    """Re-set the open bot trade's stop/T1/T2/T3 (pre-T1). ``{"instrument": ..,
+    "volatility": true}`` recomputes them from the option's 1-min ATR, or pass
+    stop/target1/target2/target3. Never sends an order."""
+    st = registry.get(_norm_instrument(req.get("instrument")))
+    if st.is_live:
+        live_control.require_live_auth(x_qt_live_token)
+
+    def _num(k):
+        v = req.get(k)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    res = st.relevel_auto(use_vol=bool(req.get("volatility")), stop=_num("stop"),
+                          t1=_num("target1"), t2=_num("target2"), t3=_num("target3"))
+    if not res.get("ok"):
+        raise HTTPException(409, res.get("message"))
+    return res
+
+
 @app.post("/api/auto-trade")
 async def auto_trade(req: AutoTradeRequest,
                      x_qt_live_token: str | None = Header(default=None)) -> dict:
@@ -1441,6 +1462,17 @@ async def get_settings() -> dict:
         "min_reward_risk": settings.min_reward_risk,
         "target_scale": settings.decision_target_scale,
         "min_stop_pct_of_premium": settings.min_stop_pct_of_premium,
+        "vol_levels": {
+            "enabled": settings.vol_levels_enabled,
+            "stop_atr_mult": settings.vol_stop_atr_mult,
+            "target_atr_mults": settings.vol_target_atr_mults,
+            "stop_min_pct": settings.vol_stop_min_pct,
+            "stop_max_pct": settings.vol_stop_max_pct,
+            "mcx_t1_min_points": settings.vol_mcx_t1_min_points,
+            "mcx_hold_arm_points": settings.mcx_hold_arm_points,
+            "mcx_hold_floor_points": settings.mcx_hold_floor_points,
+            "mcx_hold_min_giveback_points": settings.mcx_hold_min_giveback_points,
+        },
         "pre_t1_arm_profit_pct": settings.auto_trade_pre_t1_trail_arm_profit_pct,
         "pre_t1_giveback_min_pct": settings.auto_trade_pre_t1_trail_min_giveback_pct,
         "blocked_entry_hours": settings.blocked_entry_hours,
@@ -1592,6 +1624,26 @@ async def set_settings(req: dict) -> dict:
     mrr = req.get("min_reward_risk")
     if isinstance(mrr, (int, float)) and not isinstance(mrr, bool) and 0 <= mrr <= 10:
         settings.min_reward_risk = float(mrr)
+    vl = req.get("vol_levels")
+    if isinstance(vl, dict):
+        if isinstance(vl.get("enabled"), bool):
+            settings.vol_levels_enabled = vl["enabled"]
+        for k, attr, lo, hi in (
+            ("stop_atr_mult", "vol_stop_atr_mult", 0.5, 10),
+            ("stop_min_pct", "vol_stop_min_pct", 0, 50),
+            ("stop_max_pct", "vol_stop_max_pct", 0, 50),
+            ("mcx_t1_min_points", "vol_mcx_t1_min_points", 0, 500),
+            ("mcx_hold_arm_points", "mcx_hold_arm_points", 0, 500),
+            ("mcx_hold_floor_points", "mcx_hold_floor_points", 0, 500),
+            ("mcx_hold_min_giveback_points", "mcx_hold_min_giveback_points", 0, 500),
+        ):
+            v = vl.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi:
+                setattr(settings, attr, float(v))
+        tm = vl.get("target_atr_mults")
+        if (isinstance(tm, list) and len(tm) == 3
+                and all(isinstance(x, (int, float)) and 0 < x <= 50 for x in tm)):
+            settings.vol_target_atr_mults = [float(x) for x in tm]
     msp = req.get("min_stop_pct_of_premium")
     if isinstance(msp, (int, float)) and not isinstance(msp, bool) and 0 <= msp <= 50:
         settings.min_stop_pct_of_premium = float(msp)

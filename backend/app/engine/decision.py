@@ -608,6 +608,29 @@ def rank_gate_trace(trace: GateTrace) -> GateTrace:
     return trace
 
 
+def vol_levels(premium: float, opt_atr: float, exchange: str | None = None,
+               lot_size: int | None = None) -> tuple[float, float, float, float] | None:
+    """(stop distance, T1, T2, T3 distances) in premium points from the option's
+    own 1-min ATR; None when the inputs can't support it."""
+    if not premium or premium <= 0 or not opt_atr or opt_atr <= 0:
+        return None
+    stop = settings.vol_stop_atr_mult * opt_atr
+    lo = premium * settings.vol_stop_min_pct / 100.0
+    hi = premium * settings.vol_stop_max_pct / 100.0
+    if hi > 0:
+        stop = min(stop, hi)
+    stop = max(stop, lo, 0.5)
+    m = (list(settings.vol_target_atr_mults) + [3.0, 5.0, 8.0])[:3]
+    d1, d2, d3 = (max(0.5, k * opt_atr) for k in m)
+    hq = settings.auto_trade_pre_t1_lock_high_qty
+    if (str(exchange or "").upper() == "MCX" and settings.vol_mcx_t1_min_points > 0
+            and not (hq > 0 and int(lot_size or 0) >= hq)):
+        d1 = max(d1, settings.vol_mcx_t1_min_points)
+    d2 = max(d2, d1 + opt_atr)
+    d3 = max(d3, d2 + opt_atr)
+    return round(stop, 2), round(d1, 2), round(d2, 2), round(d3, 2)
+
+
 def decide(
     candles: list[Candle],
     chain: list[OptionQuote],
@@ -619,6 +642,9 @@ def decide(
     position_option_type: OptionType | None,
     news_factor: float = 1.0,
     spot: float | None = None,
+    option_atr=None,
+    exchange: str | None = None,
+    lot_size: int | None = None,
 ) -> tuple[Decision, list[ScoreBreakdown]]:
     # No candles yet (feed warming up / historical API rate-limited): emit a
     # neutral WAIT instead of indexing an empty array (which would 500 the snapshot).
@@ -1179,6 +1205,16 @@ def decide(
         # premium (e.g. a ~₹280 crude CE) can't open an ₹8-wide band that makes a
         # top-of-band fill risk far more to the stop than a mid fill — the stop
         # then stays consistent with the entry regardless of where you fill.
+        vol = None
+        if settings.vol_levels_enabled and option_atr is not None and premium and premium > 0:
+            try:
+                opt_atr = option_atr(rec.option_symbol)
+            except Exception:
+                opt_atr = None
+            vol = vol_levels(premium, opt_atr, exchange, lot_size) if opt_atr else None
+            if vol is not None:
+                prem_stop = vol[0]
+                level_scale = max(1.0, prem_stop / max(1.0, stop_dist_u * delta))
         band = max(0.5, min(premium * 0.015, 0.30 * prem_stop))
         entry_range = (round(premium - band, 1), round(premium + band, 1))
         sl = round(max(0.5, premium - prem_stop), 1)
@@ -1192,6 +1228,8 @@ def decide(
         t1 = round(premium + tgt_mults[0] * atr_val * delta * tscale, 1)
         t2 = round(premium + tgt_mults[1] * atr_val * delta * tscale, 1)
         t3 = round(premium + tgt_mults[2] * atr_val * delta * tscale, 1)
+        if vol is not None:
+            t1, t2, t3 = (round(premium + d, 1) for d in vol[1:])
         # A wider stop/target needs proportionally longer to play out.
         hold_minutes = int(max(5, min(
             240, (30 / max(0.15, directional_strength)) * min(level_scale, 4.0)
@@ -1203,6 +1241,7 @@ def decide(
         reasons = reasons[:3] + [
             f"ATR stop/targets ({market_status.value.split('_')[0].lower()} regime, "
             f"ATR≈{round(atr_val, 1)} pts, R:R≈{rr})"
+            + (f"; volatility levels (option 1-min ATR≈{round(opt_atr, 1)})" if vol else "")
         ]
         # Reward:Risk gate — refuse a FRESH BUY that risks more than it can make
         # (e.g. the 0.64 R:R chase). Downgrade to WAIT rather than take bad math.

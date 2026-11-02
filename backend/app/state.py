@@ -1610,6 +1610,9 @@ class AppState:
             market_status, in_pos, pos_type,
             news_factor=news_session["factor"] * eg["factor"],
             spot=price,
+            option_atr=self._option_atr,
+            exchange=get_spec(self._instrument).exchange,
+            lot_size=int(get_spec(self._instrument).lot_size or 0),
         )
         self._last_breakdown = breakdown
         _mark_stage(self._instrument, "decision")
@@ -2719,6 +2722,12 @@ class AppState:
                     be = entry + self._exit_cost_per_unit(entry)
                     lock_px = be + lock_pts if lock_pts > 0 else None
                     locked = lock_px is not None and peak is not None and peak >= lock_px
+                    mcx_hold = self._mcx_hold()
+                    if mcx_hold:
+                        # MCX: let small profits run; nothing arms before +arm pts.
+                        lock_px = be + settings.mcx_hold_floor_points
+                        locked = peak is not None and peak >= be + settings.mcx_hold_arm_points
+                        arm_by_t1 = arm_by_profit = arm_by_rupees = False
                     if peak is not None and (locked or arm_by_t1 or arm_by_profit or arm_by_rupees):
                         # Once we've seen real profit, ratchet the hard stop up to
                         # break-even (after charges) so a green trade can't become a loss.
@@ -2738,6 +2747,8 @@ class AppState:
                             floor,
                             run * (settings.auto_trade_pre_t1_trail_giveback_pct / 100.0),
                         )
+                        if mcx_hold:
+                            giveback = max(giveback, settings.mcx_hold_min_giveback_points)
                         trail = max(peak - giveback, base_floor)
                         hit = prem <= trail and (locked or prem > entry)
                         halved = getattr(self, "_auto_pre_t1_halved", False)
@@ -3511,6 +3522,84 @@ class AppState:
         if hq > 0 and int(get_spec(self._instrument).lot_size or 0) >= hq:
             return max(0.0, settings.auto_trade_pre_t1_lock_points_high_qty)
         return base
+
+    def _option_atr(self, symbol: str | None) -> float | None:
+        """The option's own 1-min ATR (premium points); None without enough candles."""
+        n = max(2, int(settings.vol_atr_period or 14))
+        if not symbol:
+            return None
+        try:
+            cs = self.provider.option_candles(symbol, limit=n + 30) or []
+        except Exception:
+            return None
+        cs = [c for c in cs if c.high and c.low and c.close and c.high >= c.low]
+        if len(cs) < n + 1:
+            return None
+        tr = [max(cs[i].high - cs[i].low, abs(cs[i].high - cs[i - 1].close),
+                  abs(cs[i].low - cs[i - 1].close)) for i in range(len(cs) - n, len(cs))]
+        v = sum(tr) / n
+        return float(v) if v > 0 else None
+
+    def _mcx_hold(self) -> bool:
+        spec = get_spec(self._instrument)
+        hq = settings.auto_trade_pre_t1_lock_high_qty
+        return (str(spec.exchange).upper() == "MCX" and settings.mcx_hold_arm_points > 0
+                and not (hq > 0 and int(spec.lot_size or 0) >= hq))
+
+    def relevel_auto(self, use_vol: bool = False, stop: float | None = None,
+                     t1: float | None = None, t2: float | None = None,
+                     t3: float | None = None) -> dict:
+        """Re-set the OPEN bot trade's stop and targets (pre-T1 only). Never sends
+        an order; refuses a stop at/above the current price (that would sell now)."""
+        p = self.position
+        if not p.option_symbol or not self._auto_entry_active:
+            return {"ok": False, "message": "No open bot trade on this instrument."}
+        if self._auto_tgt_floor is not None:
+            return {"ok": False, "message": "T1 already locked; levels are managed by the ratchet."}
+        entry = float(self._auto_entry_prem or p.entry_premium or 0.0)
+        if entry <= 0:
+            return {"ok": False, "message": "Entry premium unknown."}
+        atr_v = None
+        if use_vol:
+            atr_v = self._option_atr(p.option_symbol)
+            spec = get_spec(self._instrument)
+            lv = eng.vol_levels(entry, atr_v, spec.exchange, int(spec.lot_size or 0)) if atr_v else None
+            if lv is None:
+                return {"ok": False, "message": "No option 1-min candles yet; try again in a minute."}
+            stop, t1, t2, t3 = (round(entry - lv[0], 1), round(entry + lv[1], 1),
+                                round(entry + lv[2], 1), round(entry + lv[3], 1))
+        stop = self._auto_stop if stop is None else float(stop)
+        t1 = self._auto_target1 if t1 is None else float(t1)
+        t2 = self._auto_target2 if t2 is None else float(t2)
+        t3 = self._auto_target3 if t3 is None else float(t3)
+        now_px = self._own_bid() or p.current_premium
+        if stop is None or stop <= 0:
+            return {"ok": False, "message": "Stop must be above 0."}
+        if now_px is not None and stop >= float(now_px):
+            return {"ok": False, "message": (
+                f"Stop {stop:.1f} is at/above the current price {float(now_px):.1f}; that would sell "
+                "immediately. Use Exit instead.")}
+        if not (t1 and t2 and t3 and entry < t1 < t2 < t3):
+            return {"ok": False, "message": "Targets must be above entry and T1 < T2 < T3."}
+        old = (self._auto_stop, self._auto_target1, self._auto_target2, self._auto_target3)
+        # A profit lock already above entry is never loosened.
+        if old[0] is not None and old[0] >= entry:
+            stop = max(stop, old[0])
+        self._auto_stop = round(stop, 2)
+        self._auto_target1, self._auto_target2, self._auto_target3 = t1, t2, t3
+        if self.is_live and self._ledger_position is not None:
+            self._ledger_position.update(t1=t1, t2=t2)
+            self._persist_state()
+        else:
+            with contextlib.suppress(Exception):
+                self._save_paper_position(time.time())
+        msg = (f"Levels re-set {p.option_symbol}: stop {self._auto_stop:.1f}, T1 {t1:.1f}, "
+               f"T2 {t2:.1f}, T3 {t3:.1f}" + (f" (option ATR {atr_v:.1f})" if atr_v else ""))
+        self._add_alert("LEVELS", msg, "info")
+        self._auto_last_action = msg
+        self._auto_last_action_ts = int(time.time())
+        return {"ok": True, "message": msg, "old": old,
+                "new": (self._auto_stop, t1, t2, t3), "option_atr": atr_v}
 
     def _exit_cost_per_unit(self, entry: float) -> float:
         """Round-trip charges per unit of premium, so a floor at entry + this

@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { QuantumSignalView, SignalScan } from "@/lib/types";
-import { fetchSignal, fetchSignalScan } from "@/lib/api";
+import { fetchSignal, fetchSignalScan, hasLiveToken, sellPosition, setAutoLevels, setLiveToken } from "@/lib/api";
 import FuturesChart from "@/components/FuturesChart";
 import AutoBotPanel from "@/components/AutoBotPanel";
 import { playBuySound, playExitSound } from "@/lib/sound";
@@ -47,6 +47,7 @@ export default function QuantumSignal({
   const [scan, setScan] = useState<SignalScan | null>(null);
   const [auto, setAuto] = useState(true);
   const [stale, setStale] = useState(false);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoRef = useRef(auto);
   autoRef.current = auto;
@@ -129,6 +130,30 @@ export default function QuantumSignal({
   const p = view.plan;
   const at = view.auto_trade;
   const ent = at?.entry ?? null;
+  const ensureToken = () => {
+    if (at?.mode !== "live" || hasLiveToken()) return true;
+    const t = window.prompt("Live token (QT_LIVE_ARM_TOKEN) — kept in memory only:");
+    if (!t) return false;
+    setLiveToken(t);
+    return true;
+  };
+  const onExitNow = async () => {
+    const sym = pos?.option_symbol || "this position";
+    const live = at?.mode === "live";
+    const warn = live
+      ? `EXIT ${sym}: sends a REAL SELL to Angel One.\n\nOnly do this if Angel still shows it OPEN. If you already closed it in the Angel app, press Cancel (a SELL would open a short).`
+      : `EXIT ${sym} (paper)?`;
+    if (!window.confirm(warn) || !ensureToken()) return;
+    setActionMsg("Exiting…");
+    const r = await sellPosition(true, view.instrument);
+    setActionMsg(r.result?.ok ? `Exit sent: ${r.result?.message ?? "ok"}` : `Exit failed: ${r.result?.message ?? "error"}`);
+  };
+  const onRelevel = async () => {
+    if (!window.confirm("Re-set this trade's stop and T1/T2/T3 from the option's volatility (1-min ATR)? No order is sent.")
+      || !ensureToken()) return;
+    const r = await setAutoLevels(view.instrument, { volatility: true });
+    setActionMsg(r.message);
+  };
   const history = at?.history ?? [];
 
   return (
@@ -374,6 +399,24 @@ export default function QuantumSignal({
                 <div className="mt-2 text-[10px] text-white/35 leading-4">
                   Ratchet exit: hard stop until T1, then the floor steps up to each target reached. Above T3 it keeps
                   riding for higher highs and exits only if it falls back to T3 — a hit target is never given back.
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={onExitNow}
+                    className="px-3 py-1.5 rounded-lg text-xs font-bold bg-red-500/20 text-red-200 border border-red-500/40 hover:bg-red-500/30"
+                    title="Sell this bot position now (only if it is still open at the broker)"
+                  >
+                    Exit now
+                  </button>
+                  <button
+                    onClick={onRelevel}
+                    disabled={ent.locked_floor != null}
+                    className="px-3 py-1.5 rounded-lg text-xs font-bold bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 disabled:opacity-40"
+                    title="Recompute stop and T1/T2/T3 from the option's 1-min volatility (pre-T1 only, no order sent)"
+                  >
+                    Tighten to volatility
+                  </button>
+                  {actionMsg ? <span className="text-[11px] text-white/60">{actionMsg}</span> : null}
                 </div>
               </div>
             ) : null}

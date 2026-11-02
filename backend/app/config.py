@@ -698,6 +698,26 @@ class Settings(BaseSettings):
     # Break-even stops and profit floors include round-trip charges per unit,
     # so a "break-even" or "locked" exit does not book a net loss.
     auto_trade_lock_covers_charges: bool = True
+    # v3.5.38 VOLATILITY LEVELS: stop and T1/T2/T3 from the option's own 1-min
+    # ATR (its average 1-minute move) instead of the % floor that stretched the
+    # targets. Stop = vol_stop_atr_mult x ATR, kept within vol_stop_min/max_pct
+    # of the premium; targets = vol_target_atr_mults x ATR, never stretched by the
+    # stop. No option candles yet -> the old ATR x delta model is used.
+    vol_levels_enabled: bool = True
+    vol_atr_period: int = 14
+    vol_stop_atr_mult: float = 2.0
+    vol_target_atr_mults: list[float] = [3.0, 5.0, 8.0]
+    vol_stop_min_pct: float = 6.0
+    vol_stop_max_pct: float = 12.0
+    # MCX (lot < auto_trade_pre_t1_lock_high_qty): T1 at least this many points.
+    vol_mcx_t1_min_points: float = 10.0
+    # MCX PROFIT HOLD (lot < auto_trade_pre_t1_lock_high_qty): no pre-T1 lock or
+    # trail until the bid is mcx_hold_arm_points above entry + charges; the
+    # floor then sits at entry + charges + mcx_hold_floor_points and the trail
+    # gives back at least mcx_hold_min_giveback_points. 0 arm = off.
+    mcx_hold_arm_points: float = 10.0
+    mcx_hold_floor_points: float = 5.0
+    mcx_hold_min_giveback_points: float = 5.0
     # Daily profit GOAL (₹). When day P&L >= this, the bot stops opening NEW trades
     # for the day (locks the gain). 0 = disabled. This is a stop-FOR-the-day, NOT a
     # guaranteed minimum — losing days are normal and cannot be ruled out.

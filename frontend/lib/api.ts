@@ -185,6 +185,21 @@ export async function sellPosition(confirm = false, instrument?: string) {
   return orderReply(res, "SELL", "");
 }
 
+export async function setAutoLevels(
+  instrument: string,
+  levels: { volatility?: boolean; stop?: number; target1?: number; target2?: number; target3?: number },
+): Promise<{ ok: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/api/auto-trade/levels`, {
+    method: "POST",
+    headers: liveHeaders(),
+    body: JSON.stringify({ instrument, ...levels }),
+  });
+  if (res.ok) return res.json();
+  let msg = await errorDetail(res);
+  if (res.status === 401) msg = `Live token missing or wrong — enter it in the Live panel, then retry. (${msg})`;
+  return { ok: false, message: msg };
+}
+
 export interface AutoTradeConfig {
   enabled: boolean;
   min_confidence: number;
