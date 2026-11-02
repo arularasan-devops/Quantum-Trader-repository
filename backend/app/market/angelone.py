@@ -1275,6 +1275,7 @@ class AngelOneProvider(MarketDataProvider):
         self._quotes: dict[str, dict] = {}  # token -> {ltp, oi, volume}
         self._fut_candles: list[Candle] = []
         self._opt_candles: dict[str, list[Candle]] = {}
+        self._opt_candles_at: dict[str, float] = {}
         self._last_quote_at = 0.0
         self._last_fut_candles_at = 0.0
         self._candle_diag: str = ""
@@ -1928,9 +1929,11 @@ class AngelOneProvider(MarketDataProvider):
         if inst is None:
             return []
         cached = self._opt_candles.get(symbol)
-        if cached:
+        ttl = float(settings.option_candles_refresh_sec or 0)
+        fresh = time.time() - getattr(self, "_opt_candles_at", {}).get(symbol, 0.0) < ttl
+        if cached and (ttl <= 0 or fresh):
             return cached[-limit:]
-        if self._shard.hist.warming_count():
+        if not cached and self._shard.hist.warming_count():
             # An instrument still has no futures history: its first candles
             # outrank an option chart, or it can starve on the shared budget.
             return []
@@ -1948,6 +1951,11 @@ class AngelOneProvider(MarketDataProvider):
         candles = _to_candles(rows)
         if candles:
             self._opt_candles[symbol] = candles
+            if not hasattr(self, "_opt_candles_at"):
+                self._opt_candles_at = {}
+            self._opt_candles_at[symbol] = time.time()
+        elif cached:
+            return cached[-limit:]
         return candles[-limit:]
 
     def news(self) -> list[NewsItem]:

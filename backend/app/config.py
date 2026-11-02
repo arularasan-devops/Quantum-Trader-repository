@@ -166,7 +166,7 @@ class Settings(BaseSettings):
     # something about the next hour, not about the whole session, so this is a
     # timed stand-down rather than a halt for the day.
     risk_stand_down_sec: float = 3600.0
-    auto_squareoff_ist: str = "23:25"    # advise square-off after this IST time
+    auto_squareoff_ist: str = "23:15"    # advise square-off after this IST time
 
     # --- Paper auto-trading (simulated fills only; NEVER places live orders) ---
     # When enabled, the engine auto-enters a paper position on a BUY at/above the
@@ -705,6 +705,10 @@ class Settings(BaseSettings):
     # stop. No option candles yet -> the old ATR x delta model is used.
     vol_levels_enabled: bool = True
     vol_atr_period: int = 14
+    # Re-fetch an option's 1-min candles after this many seconds so the option ATR
+    # (and the option chart) stay current; the fetch is non-blocking and shares the
+    # historical rate budget, the old candles are kept until it succeeds. 0 = never.
+    option_candles_refresh_sec: float = 180.0
     vol_stop_atr_mult: float = 2.0
     vol_target_atr_mults: list[float] = [3.0, 5.0, 8.0]
     vol_stop_min_pct: float = 6.0
@@ -820,8 +824,8 @@ class Settings(BaseSettings):
     auto_trade_live_exit_on_bid: bool = True
     # LIVE intraday square-off (IST): flatten and stop new live entries after
     # this time. Set a few minutes before the broker's own intraday cut-off.
-    auto_trade_live_squareoff_equity_ist: str = "15:20"
-    auto_trade_live_squareoff_mcx_ist: str = "23:00"
+    auto_trade_live_squareoff_equity_ist: str = "15:15"
+    auto_trade_live_squareoff_mcx_ist: str = "23:15"
 
     # --- Zero-to-Hero expiry sleeve (SPECULATIVE, HIGH RISK, SEPARATE budget) ---
     # A deliberately tiny, isolated punt on EXPIRY DAY only: buy a cheap far-OTM
