@@ -1585,10 +1585,10 @@ class AngelOneProvider(MarketDataProvider):
         if (self._fut_candles and limiter.warming_count()
                 and time.time() - self._fut_candles_cached_at < _HIST_YIELD_MAX_AGE):
             return
-        # 48h IST lookback: enough 1-minute bars for the indicators even right
-        # after the open (covers the previous session), and in IST so the window
+        # 96h IST lookback: enough 1-minute bars for the indicators even right
+        # after the open (covers the previous session, incl. Friday on a Monday), and in IST so the window
         # actually overlaps daytime-only markets (Nifty/Sensex).
-        frm, to = _ist_window(48)
+        frm, to = _ist_window(96)
         params = {
             "exchange": self._exchange,
             "symboltoken": self._future.token,
@@ -1934,7 +1934,7 @@ class AngelOneProvider(MarketDataProvider):
             # An instrument still has no futures history: its first candles
             # outrank an option chart, or it can starve on the shared budget.
             return []
-        frm, to = _ist_window(48)
+        frm, to = _ist_window(96)
         # Non-blocking: option charts are secondary to the futures decision, so
         # they must never stall the tick. They share the same historical budget
         # via the limiter and simply fill in once the rate limit allows.

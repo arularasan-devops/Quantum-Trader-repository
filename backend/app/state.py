@@ -2146,6 +2146,7 @@ class AppState:
         c.htf_trend = raw.htf_trend
         c.htf_strength = raw.htf_strength
         c.entry_trigger = raw.entry_trigger
+        c.entry_triggers = list(raw.entry_triggers)
         if c.signal not in (Signal.BUY, Signal.HOLD, Signal.EXIT):
             # No plan is held on a stand-aside call, so its strike is display
             # only: follow this tick's pick, else one committed before the chain
@@ -2830,8 +2831,12 @@ class AppState:
             regime = (getattr(self, "_last_market_status", "") or "").upper()
             allowed_t = {t.upper() for t in settings.auto_trade_allowed_triggers}
             allowed_r = {r.upper() for r in settings.auto_trade_allowed_regimes}
-            if trig not in allowed_t or regime not in allowed_r:
-                blocker = "STRATEGY_TRIGGER" if trig not in allowed_t else "STRATEGY_REGIME"
+            # A tick can satisfy several triggers; entry_trigger names only the
+            # highest-priority one (PULLBACK outranks MOMENTUM/RETEST), so check all.
+            trig_ok = trig in allowed_t or any(
+                t.upper() in allowed_t for t in (decision.entry_triggers or []))
+            if not trig_ok or regime not in allowed_r:
+                blocker = "STRATEGY_TRIGGER" if not trig_ok else "STRATEGY_REGIME"
                 self._auto_last_action = (
                     f"AUTO SKIP {opt}: strategy needs {'/'.join(sorted(allowed_t))} in "
                     f"{'/'.join(sorted(allowed_r))} (got {trig or 'none'} in {regime or 'unknown'})"

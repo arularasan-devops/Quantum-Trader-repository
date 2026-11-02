@@ -920,6 +920,8 @@ class Decision(BaseModel):
     htf_trend: str | None = None  # UP / DOWN / SIDEWAYS
     htf_strength: float | None = None  # 0..100
     entry_trigger: str | None = None  # PULLBACK / BREAKOUT_RETEST / WAIT_PULLBACK / NONE
+    # Every entry trigger satisfied this tick (entry_trigger is only the first by priority).
+    entry_triggers: list[str] = []
     # ATR-based dynamic risk (Phase 1): stop/targets scale with volatility+regime.
     atr_points: float | None = None       # 1x ATR in underlying points
     underlying_stop: float | None = None  # invalidation level on the FUTURES price

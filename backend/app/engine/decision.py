@@ -906,6 +906,10 @@ def decide(
         entry_trigger = "WAIT_PATTERN" if settings.entry_mode == "pattern" else "WAIT_SETUP"
     else:
         entry_trigger = "NONE"
+    entry_triggers = [name for name, ok in (
+        ("SUPERTREND", supertrend_ok), ("IGNITION", ignition_ok), ("PULLBACK", pullback_ok),
+        ("BREAKOUT_RETEST", retest_ok), ("MOMENTUM", momentum_ok), ("PATTERN", pattern_ok),
+    ) if ok]
 
     # ---- Position-INDEPENDENT market scan -> BUY / WAIT / AVOID (+ NO_TRADE).
     # Gate trace (observability only): filled in as each gate is evaluated below,
@@ -1039,11 +1043,13 @@ def decide(
         market_confidence = supertrend_confidence
         confidence = supertrend_confidence
         entry_trigger = "SUPERTREND"
+        entry_triggers = ["SUPERTREND", *[t for t in entry_triggers if t != "SUPERTREND"]]
     elif reversal_buy_ok:
         market_signal = Signal.BUY
         market_confidence = reversal_confidence
         confidence = reversal_confidence
         entry_trigger = "REVERSAL"
+        entry_triggers = ["REVERSAL", *entry_triggers]
     elif avoid:
         market_signal = Signal.AVOID
         market_confidence = confidence
@@ -1311,6 +1317,7 @@ def decide(
         htf_trend=htf_dir,
         htf_strength=round(htf_str * 100, 1),
         entry_trigger=entry_trigger,
+        entry_triggers=entry_triggers,
         atr_points=round(atr_val, 1),
         underlying_stop=underlying_stop if signal in (Signal.BUY, Signal.HOLD) else None,
         recommended_option=rec.option_symbol if rec else None,
