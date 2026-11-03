@@ -29,6 +29,10 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "NATURALGAS": InstrumentSpec("NATURALGAS", "Natural Gas", "MCX", "MCX:NATURALGAS", 250.0, 0.55, 5, 1250, 7),
     "GOLD": InstrumentSpec("GOLD", "Gold", "MCX", "MCX:GOLD", 71000.0, 0.14, 100, 100, 30),
     "SILVER": InstrumentSpec("SILVER", "Silver", "MCX", "MCX:SILVER", 85000.0, 0.24, 100, 30, 30),
+    # Mini metals for small capital. GOLDM: 100 g quoted per 10 g = Rs 10 per point
+    # per lot (Angel's lotsize 100 is grams, the order quantity). SILVERM: 5 kg.
+    "GOLDM": InstrumentSpec("GOLDM", "Gold Mini", "MCX", "MCX:GOLDM", 71000.0, 0.14, 100, 10, 30),
+    "SILVERM": InstrumentSpec("SILVERM", "Silver Mini", "MCX", "MCX:SILVERM", 85000.0, 0.24, 100, 5, 30),
     "COPPER": InstrumentSpec("COPPER", "Copper", "MCX", "MCX:COPPER", 800.0, 0.20, 5, 2500, 30),
     # NSE / BSE index options. Live Angel One uses NFO (Nifty) and BFO (Sensex).
     "NIFTY": InstrumentSpec("NIFTY", "Nifty", "NFO", "NSE:NIFTY", 24000.0, 0.12, 50, 65, 7),
@@ -112,6 +116,10 @@ REGISTRY: dict[str, InstrumentSpec] = {
 
 DEFAULT_INSTRUMENT = "CRUDEOIL"
 
+# Roots whose broker lotsize is a gram count while the premium is quoted per
+# 10 g: the registry lot_size (rupees per point per lot) is authoritative.
+PNL_LOT_FIXED: frozenset[str] = frozenset({"GOLD", "GOLDM"})
+
 # ``REGISTRY`` above is the FULL master (all specs — get_spec always resolves).
 # ``UNIVERSE`` is the ACTIVE subset the app actually warms / streams / scans and
 # shows in the dropdown. It can be narrowed statically (QT_INSTRUMENTS) or set at
@@ -137,6 +145,8 @@ PINNED: tuple[str, ...] = (
     "NATURALGAS",
     "GOLD",
     "SILVER",
+    "GOLDM",
+    "SILVERM",
     "NIFTY",
     "BANKNIFTY",
     "SENSEX",

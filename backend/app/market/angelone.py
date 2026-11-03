@@ -1481,7 +1481,9 @@ class AngelOneProvider(MarketDataProvider):
             from app.market.instruments import REGISTRY as _reg, resolve_key as _rk
             _spec = _reg.get(getattr(self, "_store_key", None) or _rk(self._root))
             _lot = _blots.pop()
-            if _spec is not None and _spec.symbol == self._root and _spec.lot_size != _lot:
+            from app.market.instruments import PNL_LOT_FIXED as _fixed
+            if (_spec is not None and _spec.symbol == self._root and _spec.lot_size != _lot
+                    and self._root not in _fixed):
                 _log.warning("%s: lot size %s -> %s (broker scrip master)",
                              self._root, _spec.lot_size, _lot)
                 object.__setattr__(_spec, "lot_size", _lot)

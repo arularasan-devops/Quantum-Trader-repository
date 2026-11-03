@@ -2863,6 +2863,18 @@ class AppState:
                 where="state.py:_auto_trade", reason="instrument not in QT_AUTO_TRADE_INSTRUMENTS",
             )
             return
+        _mini = dict(p.split(":", 1) for p in (settings.auto_trade_metal_mini or "").upper()
+                     .replace(" ", "").split(",") if ":" in p)
+        if (self._instrument or "").upper() in _mini:
+            m = _mini[(self._instrument or "").upper()]
+            self._auto_last_action = f"AUTO SKIP {opt}: {self._instrument} is bought as {m} (mini)"
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "SIGNAL", "TRADED_AS_MINI", instrument=self._instrument, option=opt, value=m,
+                where="state.py:_auto_trade",
+                reason=f"{self._instrument} auto-buys go to {m} (QT_AUTO_TRADE_METAL_MINI)",
+            )
+            return
         self._auto_entry_note = ""
         if settings.auto_trade_strategy_gate:
             trig = (decision.entry_trigger or "").upper()

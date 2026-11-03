@@ -195,6 +195,9 @@ class Settings(BaseSettings):
     # Auto-buy only these instruments (comma-separated registry keys, e.g.
     # CRUDEOIL,SILVER). Empty = every instrument. Same rule for paper and live.
     auto_trade_instruments: str = ""
+    # Small-capital metals: a BUY on the big contract is taken on its mini instead
+    # (the mini runs its own signal on its own futures). "" = off.
+    auto_trade_metal_mini: str = "GOLD:GOLDM,SILVER:SILVERM"
     # Dedicated PAPER pullback auto-buy engine. Entry path is exactly:
     # TRENDING -> PULLBACK (>= min confidence) -> QUOTE VALID -> SPREAD OK ->
     # RISK ACCEPTABLE -> AUTO BUY. Discretionary gates (kill switch, cooldown,
