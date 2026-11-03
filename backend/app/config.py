@@ -281,6 +281,10 @@ class Settings(BaseSettings):
     # A STOP earns a longer wait than a target — the view has just been proven
     # wrong, not completed.
     auto_trade_post_stop_cooldown_sec: float = 1800.0
+    # A live auto-buy whose connection to Angel never opened (nothing sent) is
+    # retried while the signal stays valid: wait this long, at most this many times.
+    auto_trade_unsent_retry_sec: float = 15.0
+    auto_trade_unsent_max_retries: int = 3
     # No entries in the first N minutes of a session. An option premium gaps
     # straight through its stop in the opening auction volatility: measured
     # 13 Aug, four such entries exited at -47.8% / -22.4% / -16.7% / -15.9%

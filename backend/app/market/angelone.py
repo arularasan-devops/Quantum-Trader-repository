@@ -860,6 +860,17 @@ class _LiveStream:
             pass
 
 
+_NOT_SENT_MARKERS = ("ConnectTimeoutError", "NewConnectionError", "NameResolutionError",
+                     "Failed to establish a new connection",
+                     "Temporary failure in name resolution")
+
+
+def order_not_sent(exc: object) -> bool:
+    """True only when the request provably never reached Angel (connect phase)."""
+    text = f"{type(exc).__name__}: {exc}"
+    return any(m in text for m in _NOT_SENT_MARKERS)
+
+
 def _login_with(creds: dict) -> object:
     """Log in one Angel API key and stash the tokens the WebSocket needs."""
     try:
@@ -2104,8 +2115,12 @@ class AngelOneProvider(MarketDataProvider):
         try:
             resp = order_smart.placeOrder(params)
         except Exception as exc:  # pragma: no cover - live API
+            # NOT_SENT: the connection never opened, so Angel cannot have the
+            # order. Anything else (read timeout, dropped reply) is UNKNOWN: the
+            # order may be live at Angel and must be reconciled, never re-sent.
             return OrderResult(ok=False, mode="live", side=side, option_symbol=option_symbol,
-                               lots=lots, message=f"Order error: {exc}")
+                               lots=lots, message=f"Order error: {exc}",
+                               status="NOT_SENT" if order_not_sent(exc) else "UNKNOWN")
         order_id = str(resp) if resp else None
         # placeOrder returns an order id = an ACKNOWLEDGEMENT, not a fill. The
         # fill price/quantity come from order_status(), never from the quote.

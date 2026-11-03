@@ -766,6 +766,16 @@ class AppState:
             return OrderResult(ok=False, mode="live", side=side, option_symbol=symbol, lots=lots,
                                message="Live order not sent: real-money execution is "
                                        "disabled in this build.")
+        if not res.ok and res.status == "UNKNOWN":
+            # The request may have reached Angel: keep the SUBMITTING record so no
+            # duplicate is sent; it is resolved via /api/order-recovery.
+            pend["last_status"] = "UNKNOWN"
+            self._persist_state()
+            self._event("SUBMIT_UNKNOWN", pend, res)
+            self._add_alert("ORDER_UNRESOLVED", f"{side} {symbol}: outcome unknown "
+                            f"({res.message}) — check the Angel order book; not sending "
+                            "another until resolved via /api/order-recovery", "critical")
+            return res
         if not res.ok:
             setattr(self, attr, None)
             self._persist_state()
@@ -2919,6 +2929,14 @@ class AppState:
                         else f"same setup was traded and closed; re-arms in {int(left)}s"),
             )
             return  # already auto-traded this signal episode; wait for a new one
+        retry_at = getattr(self, "_auto_unsent_retry_at", 0.0)
+        if now < retry_at:
+            exec_funnel.blocked(
+                "SIGNAL", "ORDER_NOT_SENT_RETRY", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade",
+                reason=f"last order never reached Angel; retrying in {int(retry_at - now)}s",
+            )
+            return
         exec_funnel.reached("RISK")
 
         # --- opening-window block: an option premium gaps THROUGH its stop in
@@ -3404,6 +3422,16 @@ class AppState:
                        manual=False)
         self._auto_last_key = key
         self._auto_key_traded_ts = float(now) if res.ok else None
+        prev_key, tries = getattr(self, "_auto_unsent", (None, 0))
+        tries = tries if prev_key == key else 0
+        if (not res.ok and res.status == "NOT_SENT" and not res.order_id
+                and not self._pending_order and tries < settings.auto_trade_unsent_max_retries):
+            # Nothing reached Angel: the still-valid signal may buy again shortly.
+            self._auto_unsent = (key, tries + 1)
+            self._auto_last_key = None
+            self._auto_unsent_retry_at = float(now) + settings.auto_trade_unsent_retry_sec
+        elif res.ok:
+            self._auto_unsent = (None, 0)
         if not res.ok:
             exec_funnel.blocked(
                 "ACCEPTED", "ORDER_REJECTED", instrument=self._instrument, option=opt,
