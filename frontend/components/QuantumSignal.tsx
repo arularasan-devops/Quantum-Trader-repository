@@ -51,6 +51,17 @@ export default function QuantumSignal({
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoRef = useRef(auto);
   autoRef.current = auto;
+  // An instrument picked anywhere else (top bar, position chip) must stick:
+  // only a jump made by the auto-scan itself keeps Auto on.
+  const autoPick = useRef<string | null>(null);
+  const firstInstrument = useRef(true);
+  useEffect(() => {
+    if (firstInstrument.current) {
+      firstInstrument.current = false;
+      return;
+    }
+    if (instrument !== autoPick.current) setAuto(false);
+  }, [instrument]);
   // Sound on bot entry/exit: fire a chime whenever the bot posts a NEW action
   // whose text is a BUY (entry) or EXIT. Tracks the last-action timestamp so we
   // only play once per event and never on the first render.
@@ -85,7 +96,9 @@ export default function QuantumSignal({
         .then((s) => {
           if (!alive) return;
           setScan(s);
-          if (autoRef.current && s.best_actionable && s.best_actionable !== instrument) {
+          const holding = s.rows.some((r) => r.instrument === instrument && r.in_position);
+          if (autoRef.current && !holding && s.best_actionable && s.best_actionable !== instrument) {
+            autoPick.current = s.best_actionable;
             onInstrument(s.best_actionable);
           }
         })
@@ -141,7 +154,7 @@ export default function QuantumSignal({
     const sym = pos?.option_symbol || "this position";
     const live = at?.mode === "live";
     const warn = live
-      ? `EXIT ${sym}: sends a REAL SELL to Angel One.\n\nOnly do this if Angel still shows it OPEN. If you already closed it in the Angel app, press Cancel (a SELL would open a short).`
+      ? `EXIT ${sym}: the app first checks Angel. If you already closed it in the Angel app, it books Angel's price in the journal and sends nothing. If Angel still shows it open, a REAL SELL is sent.`
       : `EXIT ${sym} (paper)?`;
     if (!window.confirm(warn) || !ensureToken()) return;
     setActionMsg("Exiting…");
@@ -210,6 +223,30 @@ export default function QuantumSignal({
             {auto ? "Live scan — auto-showing the best trade" : "Live scan — click to open"}
             {scan.best_actionable ? "" : " · nothing clean right now"}
           </div>
+          {scan.rows.some((r) => r.in_position) ? (
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              <span className="text-[10px] uppercase tracking-wide text-white/35">Open positions</span>
+              {scan.rows
+                .filter((r) => r.in_position)
+                .map((r) => (
+                  <button
+                    key={`pos-${r.instrument}`}
+                    onClick={() => {
+                      setAuto(false);
+                      onInstrument(r.instrument);
+                    }}
+                    className="px-2.5 py-1 rounded-lg text-xs font-bold border"
+                    style={{
+                      borderColor: r.instrument === view.instrument ? "#ffb020" : "rgba(255,176,32,0.4)",
+                      background: "rgba(255,176,32,0.10)",
+                      color: "#ffd27a",
+                    }}
+                  >
+                    {r.instrument_name || r.instrument}
+                  </button>
+                ))}
+            </div>
+          ) : null}
           <div className="flex gap-2 overflow-x-auto pb-1">
             {scan.rows.map((r) => {
               const active = r.instrument === view.instrument;

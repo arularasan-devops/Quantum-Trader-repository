@@ -617,6 +617,7 @@ export interface SignalScanRow {
   regime: { label: string; color: string; raw: string };
   spot: number;
   change_pct: number;
+  in_position?: boolean;
 }
 
 export interface SignalScan {

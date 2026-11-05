@@ -1262,7 +1262,7 @@ async def sell(req: SellRequest | None = None,
     st = registry.get(_norm_instrument(req.instrument if req else None))
     if st.is_live:
         live_control.require_live_auth(x_qt_live_token)
-    result = st.sell((req.confirm if req else False))
+    result = st.sell((req.confirm if req else False), check_broker=True)
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
 
 
@@ -3427,6 +3427,7 @@ async def quantum_signal_scan() -> dict:
     from app.market.instruments import UNIVERSE
 
     active = set(UNIVERSE)
+    held = {s._instrument for s in registry.active() if s.position.option_symbol}
     rows: list[dict] = []
     for inst, snap in list(hub.latest.items()):
         if inst not in active:
@@ -3443,6 +3444,7 @@ async def quantum_signal_scan() -> dict:
                 "regime": v["regime"],
                 "spot": v["spot"],
                 "change_pct": v["change_pct"],
+                "in_position": inst in held,
             }
         )
     # Rank: actionable BUYs first, then by confidence.

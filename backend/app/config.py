@@ -145,7 +145,12 @@ class Settings(BaseSettings):
     # How long a live order may stay acknowledged-but-unfilled before the entry
     # is treated as pending (no position opened, no duplicate order).
     order_fill_timeout_sec: float = 5.0
-    live_position_check_sec: float = 60.0  # read-only Angel position check while a live position is open
+    live_position_check_sec: float = 20.0  # read-only Angel position check while a live position is open
+    # A live position Angel shows closed (netqty 0 with a sell average) is booked
+    # in the journal at Angel's sell average; no order is sent.
+    live_auto_sync_angel_close: bool = True
+    # After a live SELL that never reached Angel, wait this long before retrying.
+    live_exit_retry_sec: float = 5.0
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
     # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
     # change the engine's actual quantity (see app/journal/sizing.py).

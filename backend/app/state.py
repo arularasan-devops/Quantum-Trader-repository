@@ -320,6 +320,7 @@ class AppState:
         self._persist_error: str | None = None
         self._last_order_poll = 0.0
         self._last_broker_pos_check = 0.0
+        self._exit_retry_at = 0.0
         self._broker_flat_seen = 0
         self._restore_live_ledger()
         self._paper_pos_saved_at = 0.0
@@ -999,6 +1000,11 @@ class AppState:
         self._broker_flat_seen += 1
         if self._broker_flat_seen < 2:
             return
+        px = row.get("sell_avg")
+        if (settings.live_auto_sync_angel_close and px and px > 0
+                and self._order_recovery is None):
+            self._sync_angel_close(sym, float(px), "closed in Angel")
+            return
         p = self.position
         if self._ledger_position is None:
             self._ledger_position = {"symbol": sym, "lots": p.quantity_lots,
@@ -1011,6 +1017,36 @@ class AppState:
         self._order_recovery["broker_flat"] = {"symbol": sym, "sell_avg": row.get("sell_avg"),
                                                "buy_avg": row.get("buy_avg")}
         self._enter_recovery(reason)
+
+    def _angel_closed_row(self, sym: str) -> dict | None:
+        """Read-only: Angel's row for ``sym`` if it shows the position closed
+        (netqty 0 with a sell average). None = open or unknown."""
+        fetch = getattr(self.provider, "broker_position", None)
+        if fetch is None:
+            return None
+        try:
+            row = fetch(sym)
+        except Exception:
+            return None
+        if row and row.get("net_qty") == 0 and (row.get("sell_avg") or 0) > 0:
+            return row
+        return None
+
+    def _sync_angel_close(self, sym: str, px: float, why: str) -> OrderResult:
+        """The position was closed in the Angel app: book it at Angel's sell
+        average so the journal matches Angel. Nothing is sent to the broker."""
+        self._event("ANGEL_CLOSE_SYNCED", note=f"{why}: Angel netqty 0, sell avg {px}",
+                    saved_position=self._ledger_position)
+        self._pending_exit_reason = "MANUAL EXIT (ANGEL)"
+        res = self._book_exit(self.position.quantity_lots, None, px)
+        self._ledger_position = None
+        self._broker_flat_seen = 0
+        self._reset_auto_trade_marks()
+        self._persist_state()
+        self._add_alert("ANGEL_CLOSE_SYNCED", f"{sym} closed in Angel @ {px:.2f}: booked in "
+                        "the journal, no order sent", "info")
+        return res.model_copy(update={"message": f"{sym} already closed in Angel @ {px:.2f}: "
+                                      "booked from Angel, no SELL sent."})
 
     def _broker_closed(self) -> bool:
         rec = self._order_recovery
@@ -1311,7 +1347,7 @@ class AppState:
         return self.recovery_status()
 
     def sell(self, confirm: bool = False, lots: int | None = None,
-             fill_px: float | None = None) -> OrderResult:
+             fill_px: float | None = None, check_broker: bool = False) -> OrderResult:
         """Close the position. ``lots`` sells only part of it (scale-out), leaving
         the remainder open to ride; ``None`` (default) closes everything."""
         if not self.position.option_symbol:
@@ -1338,8 +1374,19 @@ class AppState:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Angel shows this position already "
                                    "closed — no SELL sent. Confirm flat via /api/order-recovery.")
+            if check_broker and not partial:
+                row = self._angel_closed_row(sym)
+                if row:
+                    return self._sync_angel_close(sym, float(row["sell_avg"]), "Exit now")
+            now = time.time()
+            if now < self._exit_retry_at:
+                return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                   lots=lots, status="NOT_SENT",
+                                   message="Last SELL never reached Angel; retrying shortly.")
             res = self._submit_live("_pending_exit", sym, "SELL", lots)
             if not res.ok:
+                if res.status == "NOT_SENT" and not self._pending_exit:
+                    self._exit_retry_at = now + settings.live_exit_retry_sec
                 return res
             order_id = res.order_id
             lots = int(res.filled_lots or lots)
@@ -3666,9 +3713,13 @@ class AppState:
                 else settings.auto_trade_reentry_cooldown_sec)
         return max(0.0, wait - (now - ex))
 
-    def _reset_auto_trade_marks(self) -> None:
+    def _reset_auto_trade_marks(self, force: bool = False) -> None:
         """Clear the per-trade exit marks after an auto-exit so the next entry
         starts clean (targets, stop and the ratcheting target floor)."""
+        if not force and self.is_live and self.position.option_symbol:
+            # The live SELL did not complete: keep the stop/targets so the next
+            # tick tries the exit again instead of leaving the trade unmanaged.
+            return
         self._auto_target1 = None
         self._auto_target2 = None
         self._auto_target3 = None
@@ -4087,7 +4138,7 @@ class AppState:
                     self._z2h_is_sleeve = True
                     # ride it: no targets / no hard stop (lottery ticket), let it run
                     # to a spike or day-end. Budget already caps the downside.
-                    self._reset_auto_trade_marks()
+                    self._reset_auto_trade_marks(force=True)
                     tag = "LIVE HERO" if live else "HERO PUNT"
                     self._auto_last_action = (
                         f"{tag} {z.option_symbol} x{z.lots} @ "
