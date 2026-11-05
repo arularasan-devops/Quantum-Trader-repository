@@ -428,6 +428,9 @@ class Settings(BaseSettings):
     # simply being absent. Written by observation points only; read by the
     # reconciliation API and the reports, never by anything that trades.
     signal_lifecycle_log: bool = True
+    # Sessions kept in the live signal ledgers; older rows move to
+    # data/archive/*.gz at boot (nothing deleted). 0 = never archive.
+    ledger_keep_days: int = 3
 
     # --- Signal churn control (publication only, Phase 12 §1) -----------------
     # One live setup published thousands of raw events on 25 Aug: a single SILVER

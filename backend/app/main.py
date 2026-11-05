@@ -865,6 +865,12 @@ async def _startup() -> None:
         _log.info("trade mode: %s (auto-trade %s)", settings.trade_mode.strip().lower(),
                   "enabled" if settings.auto_trade_enabled else "disabled")
 
+    # Before any tick appends to the ledgers: move old sessions to the archive so
+    # the readers' in-memory caches hold days, not months.
+    from app.analysis import ledger_archive
+
+    await asyncio.get_running_loop().run_in_executor(None, ledger_archive.run)
+
     if settings.risk_rebuild_from_journal:
         try:
             from app.engine import account_risk
