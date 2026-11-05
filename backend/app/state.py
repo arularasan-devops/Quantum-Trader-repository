@@ -1123,6 +1123,30 @@ class AppState:
         "_auto_entry_conf", "_auto_entry_lots", "_z2h_is_sleeve", "_jr_trade_id",
     )
 
+    # A live bot trade's exit state, saved with the order ledger so an adopted
+    # position resumes the same stop / T1-T3 / locked floor / peak after a restart.
+    _LIVE_MGMT_FIELDS = (
+        "_auto_target1", "_auto_target2", "_auto_target3", "_auto_stop", "_auto_tgt_floor",
+        "_auto_scaled_out", "_auto_pre_t1_halved", "_auto_peak", "_auto_entry_prem",
+        "_auto_entry_strike", "_auto_entry_conf", "_auto_entry_lots",
+    )
+
+    def _save_live_mgmt(self, force: bool = False) -> None:
+        c = self._ledger_position
+        if not (self.is_live and self._auto_entry_active and c and self.position.option_symbol
+                and c.get("symbol") == self.position.option_symbol):
+            return
+        m = {f: getattr(self, f, None) for f in self._LIVE_MGMT_FIELDS}
+        old = c.get("mgmt") or {}
+        peak, opeak = m.get("_auto_peak"), old.get("_auto_peak")
+        same = all(m[f] == old.get(f) for f in m if f != "_auto_peak")
+        peak_moved = peak is not None and (opeak is None or peak > opeak * 1.01)
+        if not force and same and not peak_moved:
+            return
+        c["mgmt"] = m
+        c.update(t1=m["_auto_target1"], t2=m["_auto_target2"])
+        self._persist_state()
+
     def _save_paper_position(self, now: float) -> None:
         """Keep the open PAPER position in the database so a restart resumes it
         (exits keep running) instead of silently dropping the trade."""
@@ -1327,10 +1351,22 @@ class AppState:
             self._entry_factors = []
             self._entry_context = {"recovered": True, "entry_time": opened,
                                    "order_ids": list(c.get("order_ids") or [])}
-            if c.get("t1") or c.get("t2"):
-                self._auto_target1, self._auto_target2 = c.get("t1"), c.get("t2")
-                self._auto_entry_prem = entry
+            mg = c.get("mgmt") or {}
+            if mg:
+                for f in self._LIVE_MGMT_FIELDS:
+                    if f in mg:
+                        setattr(self, f, mg[f])
                 self._auto_entry_active = True
+            elif c.get("t1") or c.get("t2"):
+                self._auto_target1, self._auto_target2 = c.get("t1"), c.get("t2")
+                self._auto_entry_active = True
+            if self._auto_entry_active:
+                # The bot keeps managing the exit: a hard stop is always set.
+                self._auto_entry_prem = self._auto_entry_prem or entry
+                self._auto_entry_lots = self._auto_entry_lots or int(c["lots"])
+                self._auto_peak = max(self._auto_peak or entry, entry)
+                if not self._auto_stop:
+                    self._auto_stop = round(entry * 0.9, 1)
             c["verified"] = True
             self._order_recovery.pop("conflicts", None)
             self._event("OPERATOR_ADOPTED_POSITION", note=note, saved_position=c)
@@ -1936,6 +1972,7 @@ class AppState:
         # one definition and one report instead of two that can disagree.
         with signal_visibility.execution_context(self._instrument, decision):
             self._auto_trade(decision, in_pos, now)
+        self._save_live_mgmt()
         in_pos = bool(self.position.option_symbol)
         if in_pos and not was_in_pos:
             signal_visibility.mark_filled(
@@ -3675,8 +3712,7 @@ class AppState:
         self._auto_stop = round(stop, 2)
         self._auto_target1, self._auto_target2, self._auto_target3 = t1, t2, t3
         if self.is_live and self._ledger_position is not None:
-            self._ledger_position.update(t1=t1, t2=t2)
-            self._persist_state()
+            self._save_live_mgmt(force=True)
         else:
             with contextlib.suppress(Exception):
                 self._save_paper_position(time.time())
