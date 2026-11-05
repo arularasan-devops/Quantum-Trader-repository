@@ -836,6 +836,10 @@ class Settings(BaseSettings):
     auto_trade_stock_hold_carry_forward: bool = False
     auto_trade_stock_hold_exit_days_before_expiry: int = 3
     angel_product_carry: str = "CARRYFORWARD"
+    # v3.5.47: exchanges whose auto trades have NO stop-loss exit (the stop below
+    # entry). Break-even stop, profit lock, peak trail, T1-T3 locks and the
+    # square-off still apply. Default = stock + index options; MCX keeps its stop.
+    auto_trade_no_stop_loss_exchanges: list[str] = ["NFO", "BFO"]
     auto_trade_live_exit_on_bid: bool = True
     # LIVE intraday square-off (IST): flatten and stop new live entries after
     # this time. Set a few minutes before the broker's own intraday cut-off.

@@ -2618,7 +2618,9 @@ class AppState:
                     self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · TARGET 1"
                     self._auto_last_action_ts = now
                     self._reset_auto_trade_marks()
-                elif stop > 0 and prem <= stop:
+                elif stop > 0 and prem <= stop and not (
+                        stop == (self._auto_stop or 0.0) and self._no_stop_loss_exit()
+                        and stop < (self._auto_entry_prem or p.entry_premium or 0.0)):
                     reason = "TRAIL STOP" if (p.trailing_stop and stop == p.trailing_stop) else "STOP LOSS"
                     self._pending_exit_reason = reason
                     self.sell(confirm=live)
@@ -2897,6 +2899,8 @@ class AppState:
                 ent = self._auto_entry_prem or p.entry_premium or 0.0
                 why = ("BREAK-EVEN STOP" if getattr(self, "_auto_pre_t1_halved", False)
                        or (ent > 0 and self._auto_stop >= ent) else "STOP LOSS")
+                if why == "STOP LOSS" and self._no_stop_loss_exit():
+                    return
                 self._pending_exit_reason = why
                 self.sell(confirm=live)
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why}"
@@ -3578,6 +3582,14 @@ class AppState:
                 f"· conf {decision.confidence:.0f}%"
             )
             self._auto_last_action_ts = now
+
+    def _no_stop_loss_exit(self) -> bool:
+        """v3.5.47: this instrument's exchange has no stop-loss exit."""
+        try:
+            exch = get_spec(self._instrument).exchange.upper()
+        except Exception:
+            return False
+        return exch in {e.upper() for e in settings.auto_trade_no_stop_loss_exchanges}
 
     def _stock_hold_active(self, live: bool) -> bool:
         """v3.5.32: LIVE single-stock option under the hold-to-T2 rule."""
