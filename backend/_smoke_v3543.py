@@ -83,5 +83,6 @@ check("after the wait the SELL is retried", len(SENT) == 2)
 SENT.clear()
 
 check("MAZDOCK in the instrument list", "MAZDOCK" in REGISTRY)
+check("MAZDOCK lot 225, strikes every 20 (Angel scrip master)", REGISTRY["MAZDOCK"].lot_size == 225 and REGISTRY["MAZDOCK"].strike_step == 20)
 print("ALL PASS" if not FAIL else f"{len(FAIL)} FAIL: {FAIL}")
 raise SystemExit(1 if FAIL else 0)

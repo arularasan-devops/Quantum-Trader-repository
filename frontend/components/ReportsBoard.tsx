@@ -280,7 +280,7 @@ export default function ReportsBoard() {
                             {s.trade_net_pnl != null ? ` · net ₹${Number(s.trade_net_pnl).toLocaleString()}` : ""}
                             {s.trade_exit_reason ? ` · ${s.trade_exit_reason}` : ""}</div>
                         )}
-                        <div><b>Auto-buy eligible setup:</b> {s.auto_eligible ? "yes (PULLBACK + TRENDING)" : "no"}</div>
+                        <div><b>Auto-buy eligible setup:</b> {s.auto_eligible ? `yes (${s.setup} + ${s.regime})` : "no"}</div>
                         <div className="text-white/40">event {s.event_id}</div>
                       </td>
                     </tr>
