@@ -272,6 +272,17 @@ _HIST_BLOCKING_PASSES = 3
 _HIST_YIELD_MAX_AGE = 600.0
 # A warming instrument retries this often instead of once a minute.
 _HIST_WARMUP_RETRY_SEC = 5.0
+# v3.5.46: one key serves ~17 history calls a minute, a 50-name watchlist asks
+# for 80+. First-come-first-served let the same instruments win every slot while
+# others kept days-old candles. Futures refreshes now queue round-robin: the
+# instrument whose last history call is oldest goes next. An instrument counts
+# as queued while it asked within _HIST_QUEUE_ACTIVE_SEC (a closed exchange
+# stops asking and drops out). A due instrument re-asks every
+# _HIST_QUEUE_RETRY_SEC; option charts wait while any futures cache is older
+# than _HIST_OPTION_YIELD_SEC.
+_HIST_QUEUE_ACTIVE_SEC = 60.0
+_HIST_QUEUE_RETRY_SEC = 5.0
+_HIST_OPTION_YIELD_SEC = 240.0
 
 
 class _HistLimiter:
@@ -295,6 +306,31 @@ class _HistLimiter:
         self._trips = 0
         self._successes = 0
         self._warming: set[int] = set()
+        self._fut_last_call: dict[int, float] = {}
+        self._fut_asked_at: dict[int, float] = {}
+
+    def fut_turn(self, key: int, now: float) -> bool:
+        """True when ``key`` has the oldest futures history call of the
+        instruments currently asking (ties all go)."""
+        with self._lock:
+            self._fut_asked_at[key] = now
+            mine = self._fut_last_call.get(key, 0.0)
+            for k, asked in self._fut_asked_at.items():
+                if (k != key and now - asked <= _HIST_QUEUE_ACTIVE_SEC
+                        and self._fut_last_call.get(k, 0.0) < mine):
+                    return False
+            return True
+
+    def fut_called(self, key: int, now: float) -> None:
+        with self._lock:
+            self._fut_last_call[key] = now
+
+    def fut_backlog(self, now: float, older_than: float) -> int:
+        """Queued instruments whose last futures history call is older than this."""
+        with self._lock:
+            return sum(1 for k, asked in self._fut_asked_at.items()
+                       if now - asked <= _HIST_QUEUE_ACTIVE_SEC
+                       and now - self._fut_last_call.get(k, 0.0) > older_than)
 
     def set_warming(self, key: int, warming: bool) -> None:
         with self._lock:
@@ -1627,8 +1663,13 @@ class AngelOneProvider(MarketDataProvider):
             and not self._fut_candles
             and self._fut_rest_attempts < _HIST_BLOCKING_PASSES
         )
+        now = time.time()
+        if self._fut_candles and not limiter.fut_turn(id(self), now):
+            return
         self._fut_rest_attempts += 1
         rows, diag = _historical_candles(self._shard, params, blocking=blocking)
+        if not diag.startswith("deferred"):
+            limiter.fut_called(id(self), time.time())
         candles = _to_candles(rows)
         if candles:
             self._fut_candles = candles
@@ -1696,6 +1737,8 @@ class AngelOneProvider(MarketDataProvider):
                                  daemon=True, name=f"qt-backfill-{self._root}").start()
         # Candles (for indicators) always come from the 1-minute historical API.
         interval = 60.0 if self._fut_candles else _HIST_WARMUP_RETRY_SEC
+        if self._fut_candles and now - self._fut_candles_cached_at > 60.0:
+            interval = _HIST_QUEUE_RETRY_SEC
         if now - self._last_fut_candles_at >= interval:
             self._refresh_futures_candles()
             self._last_fut_candles_at = now
@@ -1950,6 +1993,9 @@ class AngelOneProvider(MarketDataProvider):
             # An instrument still has no futures history: its first candles
             # outrank an option chart, or it can starve on the shared budget.
             return []
+        if self._shard.hist.fut_backlog(time.time(), _HIST_OPTION_YIELD_SEC):
+            # Futures candles drive the BUY decision; they get the budget first.
+            return cached[-limit:] if cached else []
         frm, to = _ist_window(96)
         # Non-blocking: option charts are secondary to the futures decision, so
         # they must never stall the tick. They share the same historical budget

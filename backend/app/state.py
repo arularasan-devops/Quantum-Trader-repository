@@ -1638,7 +1638,10 @@ class AppState:
         self._save_paper_position(time.time())
         _mark_stage(self._instrument, "cache")
         now = int(time.time())
-        candles = self.provider.futures_candles(300)
+        # v3.5.46: REST history extended with the 1-minute bars built from the
+        # live ticks, so the trend is read on current prices even when the
+        # key's history budget is behind. Same series the futures plan uses.
+        candles = self.provider.futures_candles_live(300) or self.provider.futures_candles(300)
         if not candles and not provider_note:
             # Instrument resolved and may be streaming a live price, but the
             # historical-candle feed returned nothing (rate-limit / no historical
