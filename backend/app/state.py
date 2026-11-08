@@ -2976,6 +2976,8 @@ class AppState:
             # highest-priority one (PULLBACK outranks MOMENTUM/RETEST), so check all.
             trig_ok = trig in allowed_t or any(
                 t.upper() in allowed_t for t in (decision.entry_triggers or []))
+            if live and trig in {t.upper() for t in settings.auto_trade_live_blocked_triggers}:
+                trig_ok = False
             if not trig_ok or regime not in allowed_r:
                 blocker = "STRATEGY_TRIGGER" if not trig_ok else "STRATEGY_REGIME"
                 self._auto_last_action = (

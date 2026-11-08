@@ -71,7 +71,6 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "MIDCPNIFTY": InstrumentSpec("MIDCPNIFTY", "Midcap Nifty", "NFO", "NSE:CNXMIDCAP", 12500.0, 0.16, 25, 120, 7),
     "FINNIFTY": InstrumentSpec("FINNIFTY", "Fin Nifty", "NFO", "NSE:CNXFINANCE", 23500.0, 0.14, 50, 65, 7),
     "BANKEX": InstrumentSpec("BANKEX", "Bankex", "BFO", "BSE:BANKEX", 58000.0, 0.14, 100, 30, 7),
-    "ZINC": InstrumentSpec("ZINC", "Zinc", "MCX", "MCX:ZINC", 270.0, 0.20, 5, 5000, 30),
     "BAJFINANCE": InstrumentSpec("BAJFINANCE", "Bajaj Finance", "NFO", "NSE:BAJFINANCE", 7200.0, 0.26, 100, 125, 30),
     "BAJAJFINSV": InstrumentSpec("BAJAJFINSV", "Bajaj Finserv", "NFO", "NSE:BAJAJFINSV", 1700.0, 0.26, 20, 500, 30),
     "INDUSINDBK": InstrumentSpec("INDUSINDBK", "IndusInd Bank", "NFO", "NSE:INDUSINDBK", 1000.0, 0.30, 10, 700, 30),
@@ -133,7 +132,7 @@ FNO_STOCKS: tuple[str, ...] = tuple(
 # than this comfortably, but each active instrument also warms 1-min candles
 # from Angel's historical API, which is strictly rate-limited (AB1021) — so the
 # cap bounds warm-up time, not feed capacity.
-MAX_ACTIVE = 50
+MAX_ACTIVE = 51  # v3.5.48: 51 so MAZDOCK fits beside the 50 already watched
 
 # Names the ``MAX_ACTIVE`` cap must never be the reason for dropping. Without
 # this the master's tail is silently truncated, so a specifically requested
