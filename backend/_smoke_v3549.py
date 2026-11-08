@@ -1,4 +1,4 @@
-"""v3.5.48: LIVE never auto-buys a PULLBACK setup; paper unchanged. No broker."""
+"""v3.5.49: LIVE never auto-buys PULLBACK alone; PULLBACK + MOMENTUM still buys. Paper unchanged. No broker."""
 import os
 import tempfile
 from types import SimpleNamespace
@@ -44,10 +44,16 @@ def gate(live, trig, trigs):
 
 
 check("default blocks PULLBACK in live", settings.auto_trade_live_blocked_triggers == ["PULLBACK"])
-check("live: PULLBACK (+MOMENTUM also true) is skipped", gate(True, "PULLBACK", ["PULLBACK", "MOMENTUM"]))
+check("live: PULLBACK + MOMENTUM passes the gate", not gate(True, "PULLBACK", ["PULLBACK", "MOMENTUM"]))
+check("live: PULLBACK alone is skipped", gate(True, "PULLBACK", ["PULLBACK"]))
+settings.auto_trade_allowed_triggers = ["PULLBACK", "MOMENTUM"]
+check("live: PULLBACK alone skipped even if listed as allowed", gate(True, "PULLBACK", ["PULLBACK"]))
+check("paper: PULLBACK alone allowed when listed", not gate(False, "PULLBACK", ["PULLBACK"]))
+settings.auto_trade_allowed_triggers = ["SUPERTREND", "IGNITION", "BREAKOUT_RETEST", "MOMENTUM"]
 check("live: MOMENTUM still passes the gate", not gate(True, "MOMENTUM", ["MOMENTUM"]))
 check("live: SUPERTREND (+PULLBACK) still passes", not gate(True, "SUPERTREND", ["SUPERTREND", "PULLBACK"]))
 check("paper: PULLBACK (+MOMENTUM) unchanged, passes", not gate(False, "PULLBACK", ["PULLBACK", "MOMENTUM"]))
 settings.auto_trade_live_blocked_triggers = []
-check("setting emptied -> live PULLBACK+MOMENTUM passes again", not gate(True, "PULLBACK", ["PULLBACK", "MOMENTUM"]))
+settings.auto_trade_allowed_triggers = ["PULLBACK"]
+check("setting emptied -> live PULLBACK alone passes when listed", not gate(True, "PULLBACK", ["PULLBACK"]))
 print("ALL PASS" if not FAIL else f"{len(FAIL)} FAIL: {FAIL}")

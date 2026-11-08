@@ -197,8 +197,8 @@ class Settings(BaseSettings):
     auto_trade_strategy_gate: bool = True
     auto_trade_allowed_triggers: list[str] = ["PULLBACK"]
     auto_trade_allowed_regimes: list[str] = ["TRENDING"]
-    # v3.5.48: LIVE never auto-buys a tick whose setup is one of these, even when
-    # another allowed trigger is also satisfied (paper is unchanged).
+    # v3.5.49: LIVE never auto-buys on these setups alone; a tick that also meets
+    # another allowed setup (e.g. PULLBACK + MOMENTUM) still buys. Paper unchanged.
     auto_trade_live_blocked_triggers: list[str] = ["PULLBACK"]
     # Auto-buy only these instruments (comma-separated registry keys, e.g.
     # CRUDEOIL,SILVER). Empty = every instrument. Same rule for paper and live.
