@@ -151,6 +151,18 @@ class Settings(BaseSettings):
     live_auto_sync_angel_close: bool = True
     # After a live SELL that never reached Angel, wait this long before retrying.
     live_exit_retry_sec: float = 5.0
+    # LIVE only, off by default. Once a target floor is locked (T1/T2/T3/ratchet,
+    # never below entry), rest a STOPLOSS_LIMIT SELL at Angel at that floor and
+    # raise it as the floor ratchets, so the exit fills at the exchange near the
+    # floor instead of a market sell sent after the bid has already fallen.
+    live_exchange_trail_stop: bool = False
+    # Limit = trigger minus this % of it: room to fill on a fast drop.
+    live_exchange_trail_stop_buffer_pct: float = 1.0
+    # Move the resting order only when the floor has risen this % (Angel caps modifies).
+    live_exchange_trail_stop_min_step_pct: float = 0.5
+    # Bid at/below the floor this long with no exchange fill (e.g. it gapped
+    # through the limit) -> cancel the resting order and send the market exit.
+    live_exchange_trail_stop_fallback_sec: float = 5.0
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
     # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
     # change the engine's actual quantity (see app/journal/sizing.py).

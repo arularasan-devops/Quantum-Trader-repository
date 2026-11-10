@@ -321,6 +321,10 @@ class AppState:
         self._last_order_poll = 0.0
         self._last_broker_pos_check = 0.0
         self._exit_retry_at = 0.0
+        # Resting exchange STOPLOSS_LIMIT SELL at the locked floor (live only).
+        self._exch_stop: dict | None = None
+        self._exch_stop_retry_at = 0.0
+        self._exch_stop_breach_at: float | None = None
         self._broker_flat_seen = 0
         self._restore_live_ledger()
         self._paper_pos_saved_at = 0.0
@@ -942,6 +946,12 @@ class AppState:
         """Throttled, read-only broker reconciliation from the tick loop. Applies
         confirmed fills only; never places, cancels or resubmits an order."""
         now = time.time()
+        if self._exch_stop:
+            try:
+                self._poll_exch_stop(now)
+            except Exception as exc:
+                self._add_alert("ORDER_RECONCILE_ERROR", f"Exchange stop check error: {exc}",
+                                "critical")
         busy = (self._pending_order or self._pending_exit or self._order_recovery
                 or self._persist_error)
         if now - self._last_order_poll < (5.0 if busy else 30.0):
@@ -969,9 +979,14 @@ class AppState:
                                         f"{inc.fill_premium:.2f} — review stop/target",
                                         "critical")
             if self._pending_exit and self.position.option_symbol:
+                why = self._pending_exit.get("reason")
                 inc = self._resolve_pending("_pending_exit")
                 if inc is not None and inc.ok:
+                    if why:
+                        self._pending_exit_reason = why
                     self._book_exit(int(inc.filled_lots or 0), inc.order_id, inc.fill_premium)
+                    if why and not self.position.option_symbol:
+                        self._reset_auto_trade_marks()
         except Exception as exc:
             self._add_alert("ORDER_RECONCILE_ERROR", f"Order reconciliation error: {exc}",
                             "critical")
@@ -1034,7 +1049,12 @@ class AppState:
 
     def _sync_angel_close(self, sym: str, px: float, why: str) -> OrderResult:
         """The position was closed in the Angel app: book it at Angel's sell
-        average so the journal matches Angel. Nothing is sent to the broker."""
+        average so the journal matches Angel. Only a resting exchange stop is
+        cancelled (it would otherwise open a short); no SELL is sent."""
+        if self._exch_stop:
+            held_up = self._release_exch_stop()
+            if held_up is not None and held_up.status == "FILLED":
+                return held_up  # it was our own exchange stop that closed it
         self._event("ANGEL_CLOSE_SYNCED", note=f"{why}: Angel netqty 0, sell avg {px}",
                     saved_position=self._ledger_position)
         self._pending_exit_reason = "MANUAL EXIT (ANGEL)"
@@ -1047,6 +1067,260 @@ class AppState:
                         "the journal, no order sent", "info")
         return res.model_copy(update={"message": f"{sym} already closed in Angel @ {px:.2f}: "
                                       "booked from Angel, no SELL sent."})
+
+    # ---------- resting exchange stop at the locked floor (live only) ----------
+    def _floor_level(self, floor: float) -> str:
+        t1, t2, t3 = self._auto_target1, self._auto_target2, self._auto_target3
+        if t3 is not None and floor > t3 + 1e-6:
+            return "T3+ RATCHET"
+        if t3 is not None and abs(floor - t3) < 1e-6:
+            return "TARGET 3"
+        if t2 is not None and floor > t2 + 1e-6:
+            return "T2 RATCHET"
+        if t2 is not None and abs(floor - t2) < 1e-6:
+            return "TARGET 2"
+        if t1 is not None and floor > t1 + 1e-6:
+            return "T1 RATCHET"
+        return "TARGET 1"
+
+    def _exch_tick(self, sym: str) -> float:
+        fn = getattr(self.provider, "tick_size", None)
+        try:
+            tick = float(fn(sym)) if fn else 0.05
+        except Exception:
+            tick = 0.05
+        return tick if tick > 0 else 0.05
+
+    def _safe_order_status(self, order_id: str | None) -> OrderResult | None:
+        if not order_id:
+            return None
+        try:
+            return self.provider.order_status(order_id)
+        except Exception:
+            return None
+
+    def _sync_exch_stop(self, bid: float) -> None:
+        """Rest (or raise) a STOPLOSS_LIMIT SELL at the locked floor. It only ever
+        moves up, is never placed at or below entry (stop losses stay bot market
+        exits), and never coexists with another working order."""
+        self._exch_stop_breach_at = None
+        p = self.position
+        floor = self._auto_tgt_floor
+        place = getattr(self.provider, "place_stop_order", None)
+        if (not settings.live_exchange_trail_stop or not self.is_live or floor is None
+                or place is None or not p.option_symbol or not self._auto_entry_active
+                or self._pending_order or self._pending_exit or self._order_recovery
+                or self._persist_error):
+            return
+        sym = p.option_symbol
+        tick = self._exch_tick(sym)
+        entry = self._auto_entry_prem or p.entry_premium or 0.0
+        trigger = round(int(floor / tick + 1e-9) * tick, 2)
+        if trigger <= entry or bid is None or bid < trigger + tick:
+            return  # Angel rejects a SELL trigger at/above the market
+        buf = max(0.0, settings.live_exchange_trail_stop_buffer_pct)
+        limit = round(max(tick, int(trigger * (1.0 - buf / 100.0) / tick + 1e-9) * tick), 2)
+        lots = int(p.quantity_lots)
+        reason = f"{self._floor_level(floor)} lock (exchange stop)"
+        now = time.time()
+        es = self._exch_stop
+        if es:
+            if es.get("symbol") != sym or not es.get("order_id"):
+                return
+            step = max(tick, float(es["trigger"]) * settings.live_exchange_trail_stop_min_step_pct
+                       / 100.0)
+            if int(es["lots"]) == lots and trigger < float(es["trigger"]) + step - 1e-9:
+                return
+            if now - float(es.get("moved") or 0.0) < 3.0:
+                return
+            es["moved"] = now
+            modify = getattr(self.provider, "modify_stop_order", None)
+            prod = (self._ledger_position or {}).get("product")
+            try:
+                res = (modify(es["order_id"], sym, lots, trigger, limit, product=prod)
+                       if modify else None)
+            except Exception as exc:
+                res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                  lots=lots, order_id=es["order_id"], message=str(exc))
+            if res is not None and res.ok:
+                es.update(trigger=trigger, limit=limit, lots=lots, reason=reason)
+                self._persist_state()
+                self._event("EXCH_STOP_MODIFIED", {"order_id": es["order_id"], "side": "SELL",
+                            "symbol": sym, "lots": lots}, res, trigger=trigger, limit=limit)
+            else:
+                # The older, lower order still protects; the bot floor exit backs it up.
+                self._event("EXCH_STOP_MODIFY_FAILED", {"order_id": es["order_id"],
+                            "side": "SELL", "symbol": sym, "lots": lots}, res,
+                            trigger=trigger, limit=limit)
+            return
+        if now < self._exch_stop_retry_at:
+            return
+        es = {"order_id": None, "symbol": sym, "lots": lots, "trigger": trigger,
+              "limit": limit, "variety": "STOPLOSS", "ts": now, "moved": now,
+              "reason": reason}
+        self._exch_stop = es
+        if not (self._persist_state() and self._event("EXCH_STOP_INTENT", {"side": "SELL",
+                "symbol": sym, "lots": lots}, trigger=trigger, limit=limit)):
+            self._exch_stop = None
+            self._persist_state()
+            return
+        from app.ai.safety import RealMoneyBlocked
+        prod = (self._ledger_position or {}).get("product")
+        try:
+            res = place(sym, lots, trigger, limit, product=prod)
+        except RealMoneyBlocked:
+            self._exch_stop = None
+            self._exch_stop_retry_at = now + 300.0
+            self._persist_state()
+            return
+        except Exception as exc:
+            res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym, lots=lots,
+                              status="UNKNOWN", message=str(exc))
+        if res.ok and res.order_id:
+            es["order_id"] = res.order_id
+            self._persist_state()
+            self._event("EXCH_STOP_PLACED", {"order_id": res.order_id, "side": "SELL",
+                        "symbol": sym, "lots": lots}, res, trigger=trigger, limit=limit)
+            return
+        if res.status == "UNKNOWN":
+            # It may be resting at Angel without an id we know: keep the record so
+            # no market SELL is sent on top of it, and ask the operator.
+            self._event("EXCH_STOP_UNKNOWN", {"side": "SELL", "symbol": sym, "lots": lots},
+                        res)
+            self._add_alert("EXCH_STOP_UNRESOLVED", f"Stop order for {sym} may be resting at "
+                            f"Angel ({res.message}). Check the Angel order book: cancel any "
+                            "open SL SELL, then POST /api/order-recovery clear_pending "
+                            "which=exch_stop. No bot SELL is sent until then.", "critical")
+            return
+        self._exch_stop = None
+        self._exch_stop_retry_at = now + 30.0
+        self._persist_state()
+        self._event("EXCH_STOP_REJECTED", {"side": "SELL", "symbol": sym, "lots": lots}, res)
+        self._add_alert("EXCH_STOP_REJECTED", f"Exchange stop for {sym} not placed: "
+                        f"{res.message} — the bot floor exit still applies", "warning")
+
+    def _exch_stop_to_pending_exit(self, st: OrderResult) -> OrderResult | None:
+        """The resting stop has (partly) filled: hand it to the normal pending-exit
+        reconciliation and book whatever the broker has confirmed."""
+        es = self._exch_stop or {}
+        self._pending_exit = {"order_id": es.get("order_id"), "state": "ACKNOWLEDGED",
+                              "symbol": es.get("symbol"), "side": "SELL",
+                              "lots": int(es.get("lots") or 0), "filled_lots": 0,
+                              "avg_price": None, "ts": es.get("ts") or time.time(),
+                              "reason": es.get("reason") or "TRAIL FLOOR (exchange stop)",
+                              "exchange_stop": True}
+        self._exch_stop = None
+        self._exch_stop_breach_at = None
+        self._persist_state()
+        self._event("EXCH_STOP_TRIGGERED", self._pending_exit, st)
+        why = self._pending_exit["reason"]
+        inc = self._consume_status("_pending_exit", st)
+        if inc is None or not inc.ok:
+            return inc
+        if self.position.option_symbol != inc.option_symbol:
+            self._enter_recovery(f"exchange stop {inc.order_id} filled on {inc.option_symbol} "
+                                 "while the app does not hold it — check Angel for a short")
+            return inc
+        self._pending_exit_reason = why
+        res = self._book_exit(int(inc.filled_lots or 0), inc.order_id, inc.fill_premium)
+        if not self.position.option_symbol:
+            self._reset_auto_trade_marks()
+        return res
+
+    def _poll_exch_stop(self, now: float, min_gap: float = 5.0) -> bool:
+        """Read-only check of the resting stop. True = it filled and was booked
+        (or handed to the pending exit)."""
+        es = self._exch_stop
+        if not es or not es.get("order_id"):
+            return False
+        if now - float(es.get("checked") or 0.0) < min_gap:
+            return False
+        es["checked"] = now
+        st = self._safe_order_status(es["order_id"])
+        if st is None:
+            return False
+        if st.status in ("FILLED", "PARTIAL") or (st.filled_lots or 0) > 0:
+            self._exch_stop_to_pending_exit(st)
+            return True
+        if st.status in ("REJECTED", "CANCELLED"):
+            self._event("EXCH_STOP_DROPPED", {"order_id": es["order_id"], "side": "SELL",
+                        "symbol": es.get("symbol"), "lots": es.get("lots")}, st)
+            self._exch_stop = None
+            self._exch_stop_retry_at = now + 30.0
+            self._persist_state()
+            self._add_alert("EXCH_STOP_DROPPED", f"Exchange stop {es['order_id']} "
+                            f"{st.status.lower()}: {st.message} — the bot floor exit still "
+                            "applies", "warning")
+            return False
+        if not self.position.option_symbol:
+            self._release_exch_stop()  # flat but still resting: it would open a short
+        return False
+
+    def _release_exch_stop(self) -> OrderResult | None:
+        """Before any other SELL: cancel the resting exchange stop and confirm it,
+        so two sells can never both fill. None = clear to sell. An OrderResult =
+        do NOT send: status FILLED means the stop already sold (booked from the
+        broker fill); otherwise the cancel is unconfirmed (retried next tick)."""
+        es = self._exch_stop
+        if not es:
+            return None
+        sym = es.get("symbol") or ""
+        oid = es.get("order_id")
+        if not oid:
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                               lots=int(es.get("lots") or 0), status="NOT_SENT",
+                               message="A stop order may be resting at Angel with no known id — "
+                               "no SELL sent. Check the Angel order book, then clear_pending "
+                               "which=exch_stop.")
+        held = OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                           lots=int(es.get("lots") or 0), order_id=oid, status="FILLED",
+                           message="The exchange stop at the floor already sold this "
+                           "position — booked from the broker fill; no second SELL sent.")
+
+        def settled(st: OrderResult | None) -> OrderResult | None | bool:
+            if st is None:
+                return False
+            if st.status in ("FILLED", "PARTIAL") or (st.filled_lots or 0) > 0:
+                self._exch_stop_to_pending_exit(st)
+                return held
+            if st.status in ("CANCELLED", "REJECTED"):
+                self._event("EXCH_STOP_CANCELLED", {"order_id": oid, "side": "SELL",
+                            "symbol": sym, "lots": es.get("lots")}, st)
+                self._exch_stop = None
+                self._exch_stop_breach_at = None
+                self._persist_state()
+                return None
+            return False
+
+        out = settled(self._safe_order_status(oid))
+        if out is not False:
+            return out
+        cancel = getattr(self.provider, "cancel_order", None)
+        from app.ai.safety import RealMoneyBlocked
+        try:
+            res = cancel(oid, es.get("variety") or "STOPLOSS") if cancel else None
+        except RealMoneyBlocked:
+            res = None
+        except Exception as exc:
+            res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym, lots=0,
+                              order_id=oid, status="UNKNOWN", message=str(exc))
+        self._event("EXCH_STOP_CANCEL_SENT", {"order_id": oid, "side": "SELL", "symbol": sym,
+                    "lots": es.get("lots")}, res)
+        deadline = time.time() + max(0.0, float(settings.order_fill_timeout_sec))
+        while True:
+            out = settled(self._safe_order_status(oid))
+            if out is not False:
+                return out
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+        self._add_alert("EXCH_STOP_UNRESOLVED", f"Cancel of exchange stop {oid} ({sym}) not "
+                        "confirmed — no market SELL sent to avoid a double sell; retrying.",
+                        "critical")
+        return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                           lots=int(es.get("lots") or 0), order_id=oid, status="NOT_SENT",
+                           message="Exchange stop cancel not confirmed yet — no SELL sent; "
+                           "retrying.")
 
     def _broker_closed(self) -> bool:
         rec = self._order_recovery
@@ -1065,6 +1339,7 @@ class AppState:
             order_ledger.save(self._instrument, {
                 "pending_entry": self._pending_order,
                 "pending_exit": self._pending_exit,
+                "exch_stop": self._exch_stop,
                 "position": self._ledger_position,
                 "recovery": dict(self._order_recovery) if self._order_recovery else None,
             })
@@ -1217,6 +1492,7 @@ class AppState:
             return
         self._pending_order = saved.get("pending_entry")
         self._pending_exit = saved.get("pending_exit")
+        self._exch_stop = saved.get("exch_stop")
         pos = saved.get("position")
         self._ledger_position = dict(pos) if pos else None
         prev = saved.get("recovery")
@@ -1274,7 +1550,8 @@ class AppState:
                 if inc is not None and inc.ok:
                     self._apply_to_candidate(sign, inc)
         if (rec and self._ledger_position is None and not self._pending_order
-                and not self._pending_exit and not rec.get("fills_seen")
+                and not self._pending_exit and not self._exch_stop
+                and not rec.get("fills_seen")
                 and not rec.get("manual_only") and not rec.get("conflicts")):
             self._recovery_cleared("restored orders ended unfilled; no saved position")
             self._persist_state()
@@ -1290,6 +1567,7 @@ class AppState:
             "conflicts": rec.get("conflicts") or [],
             "pending_entry": self._pending_order,
             "pending_exit": self._pending_exit,
+            "exchange_stop": self._exch_stop,
             "saved_position": self._ledger_position,
             "app_position": ({"symbol": p.option_symbol, "lots": p.quantity_lots,
                               "entry": p.entry_premium} if p.option_symbol else None),
@@ -1304,9 +1582,10 @@ class AppState:
         if len(note) < 3:
             raise ValueError("A note describing the broker-side check is required.")
         if action == "clear_pending":
-            attr = {"entry": "_pending_order", "exit": "_pending_exit"}.get((which or "").lower())
+            attr = {"entry": "_pending_order", "exit": "_pending_exit",
+                    "exch_stop": "_exch_stop"}.get((which or "").lower())
             if not attr:
-                raise ValueError("which must be 'entry' or 'exit'.")
+                raise ValueError("which must be 'entry', 'exit' or 'exch_stop'.")
             pend = getattr(self, attr)
             if not pend:
                 raise ValueError(f"No pending {which} order.")
@@ -1317,6 +1596,12 @@ class AppState:
                 raise ValueError("No recovery in progress.")
             if self._pending_exit:
                 raise ValueError("Resolve the pending exit order first.")
+            # A resting exchange SELL on a flat account would open a short if it
+            # triggered: cancel it (risk-reducing) before accepting "flat".
+            if self._exch_stop and self._release_exch_stop() is not None:
+                raise ValueError("The resting exchange stop order could not be confirmed "
+                                 "cancelled. Cancel it in Angel, then clear_pending "
+                                 "which=exch_stop.")
             self._event("OPERATOR_CONFIRMED_FLAT", note=note,
                         saved_position=self._ledger_position)
             if self._broker_closed():
@@ -1414,6 +1699,9 @@ class AppState:
                 row = self._angel_closed_row(sym)
                 if row:
                     return self._sync_angel_close(sym, float(row["sell_avg"]), "Exit now")
+            held_up = self._release_exch_stop()
+            if held_up is not None:
+                return held_up
             now = time.time()
             if now < self._exit_retry_at:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
@@ -2636,18 +2924,19 @@ class AppState:
             # the same tick, so the trade can keep riding up toward the next target.
             prev_floor = self._auto_tgt_floor
             if prev_floor is not None and prem <= prev_floor:
-                if t3 is not None and prev_floor > t3 + 1e-6:
-                    lvl = "T3+ RATCHET"
-                elif t3 is not None and abs(prev_floor - t3) < 1e-6:
-                    lvl = "TARGET 3"
-                elif t2 is not None and prev_floor > t2 + 1e-6:
-                    lvl = "T2 RATCHET"
-                elif t2 is not None and abs(prev_floor - t2) < 1e-6:
-                    lvl = "TARGET 2"
-                elif t1 is not None and prev_floor > t1 + 1e-6:
-                    lvl = "T1 RATCHET"
-                else:
-                    lvl = "TARGET 1"
+                lvl = self._floor_level(prev_floor)
+                if live and self._exch_stop and self._exch_stop.get("order_id"):
+                    if self._poll_exch_stop(time.time(), min_gap=1.0):
+                        self._auto_last_action = (f"AUTO EXIT {p.option_symbol} · {lvl} lock "
+                                                  "filled at the exchange stop")
+                        self._auto_last_action_ts = now
+                        self._reset_auto_trade_marks()
+                        return
+                    if self._exch_stop:
+                        since = self._exch_stop_breach_at or time.time()
+                        self._exch_stop_breach_at = since
+                        if time.time() - since < settings.live_exchange_trail_stop_fallback_sec:
+                            return  # the resting order is working at the exchange
                 self._pending_exit_reason = f"{lvl} lock"
                 # A floor is hit on the way DOWN: it is a stop, filled at the bid.
                 self.sell(confirm=live)
@@ -2733,6 +3022,8 @@ class AppState:
                             )
                             self._auto_last_action_ts = now
                         return
+            if live:
+                self._sync_exch_stop(prem)
             # --- per-instrument TARGET POINTS profit-lock (dashboard) ---
             # Below T1, if the premium has been up by your configured points and
             # then ticks down (struggling to reach T1), exit there and bank the
