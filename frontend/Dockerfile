@@ -9,6 +9,10 @@ FROM node:20.18.1-alpine3.20@sha256:9b5af1cc895fe7231c351cc1ea653322742091fb5d1e
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# Baked into the client at build time (a second stack sets its own backend port).
+ARG NEXT_PUBLIC_API_BASE=http://localhost:8000
+ARG NEXT_PUBLIC_WS_BASE=ws://localhost:8000
+ENV NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE NEXT_PUBLIC_WS_BASE=$NEXT_PUBLIC_WS_BASE
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

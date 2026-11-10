@@ -158,7 +158,7 @@ def main() -> None:
        "a quote carrying a book leaves the exit book recorded on the leg")
     st.sell(confirm=True)
     row = st.journal[-1] if st.journal else {}
-    ok(row.get("cost_model") == oc.COST_MODEL,
+    ok(row.get("cost_model") in (oc.COST_MODEL, oc.COST_MODEL_ANGEL),
        "the closed row names the per-order cost model")
     ok(row.get("brokerage") == 2.0 * settings.brokerage_per_lot,
        "the closed row carries two orders of brokerage, not two per lot")

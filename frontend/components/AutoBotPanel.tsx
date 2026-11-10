@@ -1,6 +1,6 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
-import { AccountRiskStatus, AutoBuyStatus, AutoTradeConfig, EntryGateSettings, engageKillSwitch, getKillSwitch, KillSwitchState, releaseKillSwitch, getEngineSettings, getEntryGates, getRiskGuard, setAutoBuy, setAutoTrade, setEntryGates, setPointExits } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { AccountRiskStatus, AutoBuyStatus, AutoTradeConfig, EntryGateSettings, getEngineSettings, getEntryGates, getKillSwitch, getRiskGuard, hasLiveToken, releaseKillSwitch, setAutoBuy, setLiveToken, setAutoTrade, setEntryGates, setPointExits } from "@/lib/api";
 import { InstrumentOption } from "@/lib/types";
 
 /**
@@ -15,6 +15,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
   const [saving, setSaving] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoBuy, setAutoBuyState] = useState<AutoBuyStatus | null>(null);
+  const [autoBuyErr, setAutoBuyErr] = useState<string | null>(null);
   const [gates, setGates] = useState<EntryGateSettings | null>(null);
   const [guard, setGuard] = useState<AccountRiskStatus | null>(null);
 
@@ -108,32 +109,57 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
   };
 
   const toggleAutoBuy = async (turnOn: boolean) => {
+    setAutoBuyErr(null);
     if (turnOn) {
       const ok = window.confirm(
-        "Turn ON LIVE Auto-Buy?\n\nThe bot will place REAL orders on your Angel account, sizing each trade from your available balance (bigger size on higher-confidence signals). Real money, real losses. One order can never exceed your available cash.\n\nRequires QT_TRADE_MODE=live + a connected Angel session."
+        "Turn ON LIVE Auto-Buy?\n\nThe bot will place REAL orders on your Angel account with the same strategy as paper. Lots are sized from QT_CAPITAL at the ask, then cut to the per-trade loss cap and the live order cap.\n\nRequires QT_TRADE_MODE=live and a connected Angel session."
       );
       if (!ok) return;
+      if (!hasLiveToken()) {
+        const t = window.prompt("Live-arm token (QT_LIVE_ARM_TOKEN from your .env). Kept in memory only:");
+        if (!t || !t.trim()) return;
+        setLiveToken(t);
+      }
     }
     setSaving(true);
     try {
+      if (turnOn) {
+        const ks = await getKillSwitch();
+        if (ks.engaged) {
+          if (!window.confirm(`Kill switch is engaged (${ks.reason || "no reason"}). Release it and arm live?`)) return;
+          const t = window.prompt("Confirm the live-arm token to release the kill switch:");
+          if (!t || !t.trim()) return;
+          setLiveToken(t);
+          await releaseKillSwitch(t.trim(), "released from Live Auto-Buy");
+        }
+      }
       const st = await setAutoBuy(turnOn);
       setAutoBuyState(st);
-      const s = await getEngineSettings();
-      setCfg(s.auto_trade);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("(401)")) setLiveToken(null);
+      setAutoBuyErr(msg);
     } finally {
+      try {
+        const s = await getEngineSettings();
+        setCfg(s.auto_trade);
+      } catch {
+        /* keep the last settings */
+      }
       setSaving(false);
     }
   };
 
-  if (!cfg) return <KillSwitchControl />;
+  if (!cfg) return null;
 
   const liveArmed = cfg.mode === "live";
   const liveFeed = cfg.trade_mode?.toLowerCase() === "live";
-  const oneClickOn = cfg.enabled && cfg.allow_live && !!cfg.use_live_balance;
+  const killOn = !!cfg.kill_switch;
+  const killBlocked = cfg.enabled && cfg.allow_live && killOn;
+  const oneClickOn = cfg.enabled && cfg.allow_live && !killOn;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4 mb-4">
-      <KillSwitchControl />
       {/* ── ONE-CLICK LIVE AUTO-BUY ─────────────────────────────────────── */}
       <div
         className="rounded-xl border p-4 mb-3"
@@ -146,23 +172,28 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
           <div className="min-w-0">
             <div className="text-sm font-bold text-white">Live Auto-Buy</div>
             <div className="text-[11px] text-white/45 leading-4 mt-0.5">
-              One switch. The signal picks the trade &amp; confidence; the bot sizes it from your
-              balance and buys automatically. You decide nothing else.
+              One switch arms LIVE with the same strategy as paper. Lots come from your capital at
+              the ask, cut to the per-trade loss cap and the live order cap.
             </div>
           </div>
           <button
-            onClick={() => toggleAutoBuy(!oneClickOn)}
+            onClick={() => toggleAutoBuy(killBlocked ? true : !oneClickOn)}
             disabled={saving}
             className="ml-auto shrink-0 px-5 py-2.5 rounded-xl text-sm font-extrabold border"
             style={{
-              borderColor: oneClickOn ? "#19e57f" : "rgba(255,255,255,0.2)",
-              color: oneClickOn ? "#04110a" : "#e6e9f0",
+              borderColor: oneClickOn ? "#19e57f" : killBlocked ? "#f59e0b" : "rgba(255,255,255,0.2)",
+              color: oneClickOn ? "#04110a" : killBlocked ? "#fbbf24" : "#e6e9f0",
               background: oneClickOn ? "#19e57f" : "rgba(255,255,255,0.04)",
             }}
           >
-            {oneClickOn ? "AUTO-BUY ON" : "AUTO-BUY OFF"}
+            {oneClickOn ? "AUTO-BUY ON" : killBlocked ? "KILL SWITCH ON · RELEASE" : "AUTO-BUY OFF"}
           </button>
         </div>
+        {killBlocked && (
+          <div className="mt-2 text-[11px] text-amber-300 font-semibold">
+            Kill switch engaged: no live orders until you release it (click the button, then paste your token).
+          </div>
+        )}
         {(oneClickOn || autoBuy) && (
           <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
             {autoBuy?.available_cash != null && (
@@ -170,7 +201,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
                 Balance <span className="font-bold text-white">₹{autoBuy.available_cash.toLocaleString("en-IN")}</span>
               </span>
             )}
-            <span className="text-white/45">Sizing: confidence-scaled · buys first signal ≥ {cfg.min_confidence}%</span>
+            <span className="text-white/45">Sizing: capital at the ask · loss-capped · buys signals ≥ {cfg.min_confidence}%</span>
             {oneClickOn && !liveArmed && (
               <span className="text-amber-300 font-semibold">Not live yet — set QT_TRADE_MODE=live (paper for now)</span>
             )}
@@ -180,6 +211,7 @@ export default function AutoBotPanel({ instruments = [] }: { instruments?: Instr
           </div>
         )}
         {autoBuy?.note && <div className="mt-1 text-[10px] text-white/35">{autoBuy.note}</div>}
+        {autoBuyErr && <div className="mt-1 text-[11px] text-rose-300 font-semibold">{autoBuyErr}</div>}
       </div>
 
       <button
@@ -1139,153 +1171,5 @@ function Toggle({ label, on, onClick }: { label: string; on: boolean; onClick: (
       </span>
       {label}
     </button>
-  );
-}
-
-/**
- * Kill switch. Engage needs no token and blocks all new entries at once.
- * Release needs the live-arm token, typed into a password field, sent once in
- * a request header and cleared — never stored, never in a URL. This control
- * cannot enable live trading.
- */
-function KillSwitchControl() {
-  const [ks, setKs] = useState<KillSwitchState | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [releasing, setReleasing] = useState(false);
-  const [token, setToken] = useState("");
-
-  const pull = useCallback(async () => {
-    try {
-      setKs(await getKillSwitch());
-      setErr(null);
-    } catch (e) {
-      setKs(null);
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  }, []);
-
-  useEffect(() => {
-    pull();
-    const t = setInterval(pull, 5000);
-    return () => clearInterval(t);
-  }, [pull]);
-
-  const engage = async () => {
-    const ok = window.confirm(
-      "ENGAGE the kill switch?\n\nAll new entries are blocked immediately and the auto-trader is switched off. Exits keep working. Releasing it later needs the live-arm token."
-    );
-    if (!ok) return;
-    setBusy(true);
-    try {
-      setKs(await engageKillSwitch("engaged from dashboard"));
-      setErr(null);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const release = async () => {
-    if (!token) {
-      setErr("Enter the live-arm token to release the kill switch.");
-      return;
-    }
-    setBusy(true);
-    try {
-      setKs(await releaseKillSwitch(token, "released from dashboard"));
-      setErr(null);
-      setReleasing(false);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setToken("");
-      setBusy(false);
-    }
-  };
-
-  const state = ks === null ? "UNKNOWN" : ks.engaged ? "ENGAGED" : "RELEASED";
-  const color = state === "ENGAGED" ? "#ff4d4d" : state === "RELEASED" ? "#19e57f" : "#f5b301";
-
-  return (
-    <div
-      className="rounded-xl border p-3 mb-3"
-      style={{ borderColor: `${color}55`, background: "rgba(255,255,255,0.02)" }}
-    >
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-bold text-white">
-            Kill switch <span style={{ color }}>● {state}</span>
-          </div>
-          <div className="text-[11px] text-white/45 leading-4 mt-0.5">
-            {state === "ENGAGED"
-              ? `New entries blocked${ks?.reason ? ` — ${ks.reason}` : ""}${ks?.ts ? ` (since ${new Date(ks.ts * 1000).toLocaleString()})` : ""}. Exits still work.`
-              : state === "RELEASED"
-                ? "New entries allowed (subject to the usual gates)."
-                : "Status unavailable — treat trading as unsafe until it loads."}
-          </div>
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          {state !== "ENGAGED" && (
-            <button
-              onClick={engage}
-              disabled={busy}
-              className="px-4 py-2 rounded-lg text-xs font-extrabold border"
-              style={{ borderColor: "#ff4d4d", color: "#ff4d4d", background: "rgba(255,77,77,0.08)" }}
-            >
-              ENGAGE KILL SWITCH
-            </button>
-          )}
-          {state === "ENGAGED" && !releasing && (
-            <button
-              onClick={() => {
-                setErr(null);
-                setReleasing(true);
-              }}
-              disabled={busy}
-              className="px-4 py-2 rounded-lg text-xs font-bold border border-white/20 text-white/80"
-            >
-              Release…
-            </button>
-          )}
-        </div>
-      </div>
-      {state === "ENGAGED" && releasing && (
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <input
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            aria-label="Live-arm token"
-            placeholder="Live-arm token"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") release();
-            }}
-            className="px-2 py-1.5 rounded-md bg-black/40 border border-white/15 text-xs text-white w-56"
-          />
-          <button
-            onClick={release}
-            disabled={busy || !token}
-            className="px-3 py-1.5 rounded-md text-xs font-bold border border-white/25 text-white"
-          >
-            Release
-          </button>
-          <button
-            onClick={() => {
-              setToken("");
-              setReleasing(false);
-            }}
-            disabled={busy}
-            className="px-3 py-1.5 rounded-md text-xs text-white/60"
-          >
-            Cancel
-          </button>
-        </div>
-      )}
-      {err && <div className="mt-2 text-[11px] font-semibold text-[#ff4d4d]">{err}</div>}
-    </div>
   );
 }

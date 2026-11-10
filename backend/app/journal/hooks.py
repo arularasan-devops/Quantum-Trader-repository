@@ -122,7 +122,16 @@ def _record_signal(st, d, chain, was_in_pos: bool, now: float, sid: str) -> None
         outcome = "FAILED_CONDITIONS"
         reason = "; ".join((d.reasons or [])[:3]) or sig
     status = getattr(st, "_last_status", None)
-    store().record_signal({
+    # Reports: one row per distinct BUY signal. The same option with the same
+    # outcome and reason firing again only bumps that row's repeat count.
+    key = (st.instrument, d.recommended_option, outcome, reason)
+    last = getattr(st, "_jr_sig_last", None)
+    if (sig == "BUY" and outcome != "EXECUTED" and last is not None
+            and last[0] == key and now - last[2] < 3600):
+        store().touch_signal(last[1], now)
+        st._jr_sig_last = (key, last[1], now)
+        return
+    eid = store().record_signal({
         "session_id": sid, "trade_id": trade_id, "instrument": st.instrument, "ts": now,
         "signal": sig, "outcome": outcome, "reason": (reason or "")[:500],
         "strategy": STRATEGY, "setup": d.entry_trigger,
@@ -136,12 +145,17 @@ def _record_signal(st, d, chain, was_in_pos: bool, now: float, sid: str) -> None
         "data_quality": f"feed_ready={bool(st._feed_ready())}",
         "explanation": "; ".join((d.reasons or [])[:5])[:1000] or None,
     })
+    st._jr_sig_last = (key, eid, now) if sig == "BUY" else None
 
 
 def _track_levels(st, now: float, sid: str) -> None:
     tid = getattr(st, "_jr_trade_id", None)
     if not tid or not st.position.option_symbol:
+        post = getattr(st, "_jr_post", None)
+        if post and now < post[2]:
+            _record_path(st, post[0], sid, now, sym=post[1], after=True)
         return
+    _record_path(st, tid, sid, now)
     stop = getattr(st, "_auto_stop", None)
     floor = getattr(st, "_auto_tgt_floor", None)
     prev = getattr(st, "_jr_levels", (None, None))
@@ -166,6 +180,28 @@ def _track_levels(st, now: float, sid: str) -> None:
     st._jr_levels = (stop if stop is not None else prev[0], floor)
 
 
+def _record_path(st, tid: str, sid: str, now: float, sym: str | None = None,
+                 after: bool = False) -> None:
+    """Sample the trade's bid/ask/LTP (and for a while after it closed) so exits
+    can be replayed and what an exit left on the table can be measured."""
+    every = settings.trade_path_record_sec
+    if every <= 0 or now - getattr(st, "_jr_path_ts", 0.0) < every:
+        return
+    sym = sym or st.position.option_symbol
+    try:
+        q = next((x for x in st.provider.option_chain() if x.symbol == sym), None)
+    except Exception:
+        q = None
+    if q is None:
+        return
+    st._jr_path_ts = now
+    store().record_trade_event({
+        "trade_id": tid, "session_id": sid, "instrument": st.instrument, "ts": now,
+        "kind": "PRICE", "option_symbol": sym, "price": q.premium,
+        "stop": getattr(st, "_auto_stop", None), "mode": _mode(st),
+        "detail": {"bid": q.bid, "ask": q.ask, **({"after_exit": True} if after else {})}})
+
+
 def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
     if not settings.journal_v2_enabled:
         return
@@ -174,6 +210,21 @@ def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
         sid = _session(st, now)
         mode = _mode(st)
         d = st._last_decision
+        existing = getattr(st, "_jr_trade_id", None)
+        if not existing:
+            # Reuse an OPEN row only when it is this same position (same fill and
+            # size); any other OPEN row for the contract lost its position (e.g. a
+            # restart before positions were saved) and is closed, not merged.
+            for row in store().open_trade_rows(st.instrument, q.symbol, mode, now - 86400):
+                same = (abs(float(row.get("entry_price") or 0) - float(entry)) < 0.01
+                        and int(row.get("lots") or 0) == int(lots))
+                if same and not existing:
+                    existing = row["trade_id"]
+                else:
+                    store().abandon_trade(row["trade_id"], now, "LOST ON RESTART")
+        if existing:
+            st._jr_trade_id = existing  # same position recorded again: no duplicate row
+            return
         tid = uuid.uuid4().hex
         st._jr_trade_id = tid
         lot_size, source, lot_ts = _lot_meta(st, q.symbol)
@@ -187,7 +238,8 @@ def on_entry(st, q, lots: int, entry: float, manual: bool) -> None:
             "initial_stop": stop, "target1": d.target1 if d else None,
             "target2": d.target2 if d else None, "target3": d.target3 if d else None,
             "entry_explanation": ("manual entry; " if manual else "auto entry; ") + (
-                "; ".join((d.reasons or [])[:4]) if d else ""),
+                (getattr(st, "_auto_entry_note", "") + "; ") if not manual and getattr(st, "_auto_entry_note", "") else ""
+            ) + ("; ".join((d.reasons or [])[:4]) if d else ""),
             "mfe_mae_status": "PREMIUM_PEAK_TROUGH_FROM_LIVE_MARKS",
             "strategy_version": STRATEGY_VERSION, "config_fingerprint": config_fingerprint(),
         })
@@ -216,7 +268,7 @@ def _record_sizing(st, tid, sid, symbol, entry, stop, lots, lot_size, source, lo
         p = other.position
         deployed += (p.entry_premium or 0.0) * get_spec(other.instrument).lot_size * p.quantity_lots
     available = equity - deployed
-    est_cost = option_costs.charges(entry, entry, lot_size).total
+    est_cost = option_costs.charges(entry, entry, lot_size, st.instrument).total
     inp = sz.SizingInputs(
         instrument=st.instrument, contract=symbol, vehicle="OPTION_BUY", entry_price=entry,
         stop_price=stop, lot_size=lot_size, lot_size_source=source, lot_size_ts=lot_ts,
@@ -250,7 +302,8 @@ def on_exit(st, trade_row: dict, partial: bool, lots: int) -> None:
         now = time.time()
         sid = _session(st, now)
         mode = trade_row.get("mode") or _mode(st)
-        tid = getattr(st, "_jr_trade_id", None)
+        tid = getattr(st, "_jr_trade_id", None) or store().find_open_trade(
+            st.instrument, trade_row.get("option"), mode, now - 86400)
         if tid is None:  # position opened before journal v2 (e.g. pre-upgrade)
             ctx = trade_row.get("context") or {}
             entry_ts = float(ctx.get("entry_time") or now)
@@ -275,6 +328,8 @@ def on_exit(st, trade_row: dict, partial: bool, lots: int) -> None:
                 "brokerage", "statutory", "cost_model", "holding_minutes", "capital_used",
                 "return_on_capital_pct", "cost_status")}})
         if not partial:
+            keep = settings.trade_path_after_exit_sec
+            st._jr_post = (tid, trade_row.get("option"), now + keep) if keep > 0 else None
             st._jr_trade_id = None
             st._jr_levels = (None, None)
     except Exception as exc:

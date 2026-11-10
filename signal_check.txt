@@ -1,0 +1,62 @@
+INSTR       LIVE (8000)                                                | PAPER (8001)
+CRUDEOIL    AVOID block=RANGING trig=PULLBACK conf=98.0        age=   1 | AVOID block=HTF_TREND trig=NONE conf=39.7
+NATURALGAS  AVOID block=HTF_TREND trig=NONE conf=36.9          age=   6 | AVOID block=HTF_TREND trig=NONE conf=50.0
+GOLD        WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=96.4 age=   4 | BUY block=- trig=MOMENTUM conf=92.5
+              paper refused: {'None=GOLD': 12}
+SILVER      AVOID block=HTF_TREND trig=NONE conf=50.0          age=   3 | WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf=68.6
+GOLDM       WAIT block=REWARD_RISK trig=PULLBACK conf=94.1     age=   3 | WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=95.3
+SILVERM     AVOID block=HTF_TREND trig=PULLBACK conf=46.2      age=   2 | AVOID block=HTF_TREND trig=NONE conf=44.7
+NIFTY       WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf age=   5 | AVOID block=HTF_TREND trig=NONE conf=43.6
+BANKNIFTY   WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=98.0 age=   5 | AVOID block=HTF_TREND trig=NONE conf=33.3
+SENSEX      AVOID block=HTF_TREND trig=NONE conf=50.0          age=   4 | WAIT block=DIRECTIONAL_STRENGTH trig=BREAKOUT_RETEST conf=65
+RELIANCE    AVOID block=HTF_TREND trig=BREAKOUT_RETEST conf=48 age=   2 | AVOID block=HTF_TREND trig=PULLBACK conf=38.7
+HDFCBANK    WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf age=   2 | WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf=72.9
+ICICIBANK   WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=85.4 age=   1 | WAIT block=REWARD_RISK trig=PULLBACK conf=92.5
+INFY        AVOID block=HTF_TREND trig=NONE conf=40.9          age=   2 | WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=95.0
+TCS         AVOID block=TRAP trig=BREAKOUT_RETEST conf=68.8    age=   1 | AVOID block=HTF_TREND trig=NONE conf=34.7
+SBIN        AVOID block=HTF_TREND trig=NONE conf=40.3          age=  21 | WAIT block=REWARD_RISK trig=PULLBACK conf=94.3
+AXISBANK    WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf age=  21 | AVOID block=HTF_TREND trig=NONE conf=44.3
+KOTAKBANK   AVOID block=HTF_TREND trig=NONE conf=44.1          age=  21 | BUY block=- trig=PULLBACK conf=86.2
+              paper refused: {'None=PULLBACK/LOW_VOLUME': 13}
+LT          WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf age=  21 | WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf=60.6
+TATASTEEL   AVOID block=HTF_TREND trig=BREAKOUT_RETEST conf=42 age=  20 | AVOID block=HTF_TREND trig=NONE conf=50.0
+ITC         WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=87.2 age=  20 | WAIT block=CONFIDENCE trig=PULLBACK conf=71.3
+BHARTIARTL  AVOID block=HTF_TREND trig=NONE conf=50.0          age=  20 | AVOID block=RANGING trig=WAIT_SETUP conf=57.5
+MARUTI      AVOID block=RANGING trig=WAIT_SETUP conf=62.5      age=  20 | AVOID block=HTF_TREND trig=NONE conf=34.5
+SUNPHARMA   WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=88.8 age=  19 | AVOID block=HTF_TREND trig=NONE conf=41.6
+ADANIENT    AVOID block=HTF_TREND trig=NONE conf=31.1          age=  19 | WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf=71.8
+BAJAJAUTO   AVOID block=RANGING trig=PULLBACK conf=92.5        age=  19 | WAIT block=DIRECTIONAL_STRENGTH trig=WAIT_SETUP conf=72.5
+MIDCPNIFTY  AVOID block=HTF_TREND trig=NONE conf=50.0          age=  18 | AVOID block=HTF_TREND trig=NONE conf=44.3
+FINNIFTY    AVOID block=RANGING trig=WAIT_SETUP conf=87.5      age=  17 | AVOID block=HTF_TREND trig=NONE conf=45.8
+BAJFINANCE  WAIT block=REWARD_RISK trig=MOMENTUM conf=92.5     age=  18 | WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=82.9
+              live refused: {'None=26.1': 1, 'None=22.0': 1}
+BAJAJFINSV  WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=94.7 age=  18 | AVOID block=RANGING trig=WAIT_SETUP conf=86.8
+WIPRO       AVOID block=HTF_TREND trig=NONE conf=43.8          age=  18 | AVOID block=HTF_TREND trig=NONE conf=35.1
+TECHM       AVOID block=HTF_TREND trig=NONE conf=50.0          age=  17 | BUY block=- trig=MOMENTUM conf=88.0
+              paper refused: {'None=None': 10, 'None=38.2': 2}
+ULTRACEMCO  AVOID block=HTF_TREND trig=NONE conf=34.0          age=  16 | AVOID block=HTF_TREND trig=PULLBACK conf=33.8
+TITAN       AVOID block=HTF_TREND trig=PULLBACK conf=32.7      age=  16 | WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=81.7
+ASIANPAINT  AVOID block=HTF_TREND trig=NONE conf=44.8          age=  15 | WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=80.6
+NTPC        AVOID block=HTF_TREND trig=NONE conf=40.8          age=  15 | AVOID block=HTF_TREND trig=NONE conf=50.0
+POWERGRID   AVOID block=HTF_TREND trig=NONE conf=41.6          age=  14 | WAIT block=REWARD_RISK trig=PULLBACK conf=82.9
+ONGC        AVOID block=HTF_TREND trig=NONE conf=37.1          age=  13 | NO DECISION (not ticked)
+COALINDIA   AVOID block=RANGING trig=PULLBACK conf=71.9        age=  13 | AVOID block=TRAP trig=WAIT_SETUP conf=58.8
+JSWSTEEL    AVOID block=HTF_TREND trig=NONE conf=46.5          age=  12 | BUY block=- trig=PULLBACK conf=78.5
+              paper refused: {'None=78.5': 13}
+ADANIPORTS  AVOID block=HTF_TREND trig=NONE conf=40.0          age=  11 | AVOID block=HTF_TREND trig=BREAKOUT_RETEST conf=35.9
+DLF         WAIT block=REWARD_RISK trig=BREAKOUT_RETEST conf=9 age=  11 | AVOID block=HTF_TREND trig=BREAKOUT_RETEST conf=33.1
+CIPLA       WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=95.9 age=  10 | WAIT block=DIRECTIONAL_STRENGTH trig=PULLBACK conf=66.7
+DRREDDY     AVOID block=HTF_TREND trig=PULLBACK conf=30.7      age=  10 | AVOID block=HTF_TREND trig=NONE conf=35.6
+GRASIM      AVOID block=HTF_TREND trig=PULLBACK conf=42.3      age=   9 | AVOID block=HTF_TREND trig=NONE conf=50.0
+EICHERMOT   AVOID block=TRAP trig=WAIT_SETUP conf=84.7         age=   9 | WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=82.8
+BANKBARODA  AVOID block=HTF_TREND trig=NONE conf=35.6          age=   8 | NO DECISION (not ticked)
+IOC         AVOID block=RANGING trig=PULLBACK conf=63.2        age=   8 | NO DECISION (not ticked)
+KALYANKJIL  AVOID block=HTF_TREND trig=NONE conf=41.8          age=   7 | AVOID block=TRAP trig=PULLBACK conf=71.5
+ABB         WAIT block=ENTRY_TRIGGER trig=WAIT_SETUP conf=87.6 age=   7 | WAIT block=DIRECTIONAL_STRENGTH trig=WAIT_SETUP conf=70.5
+SHRIRAMFIN  WAIT block=DIRECTIONAL_STRENGTH trig=WAIT_SETUP co age=   6 | WAIT block=REWARD_RISK trig=PULLBACK conf=80.8
+
+8000: decisions 50, signals {'AVOID': 34, 'WAIT': 16}
+  top blockers [('HTF_TREND', 26), ('ENTRY_TRIGGER', 8), ('RANGING', 6), ('DIRECTIONAL_STRENGTH', 5), ('REWARD_RISK', 3), ('TRAP', 2)]
+
+8001: decisions 49, signals {'AVOID': 26, 'WAIT': 19, 'BUY': 4}
+  top blockers [('HTF_TREND', 20), ('DIRECTIONAL_STRENGTH', 8), ('ENTRY_TRIGGER', 6), ('REWARD_RISK', 4), ('RANGING', 3), ('TRAP', 3), ('CONFIDENCE', 1)]

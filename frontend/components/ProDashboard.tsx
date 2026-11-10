@@ -381,7 +381,7 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
   const liveP = d.current_premium ?? null;
   // today's high/low of the option premium — prefer the broker's OFFICIAL day
   // H/L (matches the broker app); fall back to candles+live price otherwise.
-  const premFallback = premiumHiLoToday(snap.selected_option_candles, liveP);
+  const premFallback = premiumHiLoToday(snap.selected_option_candles, liveP ?? snap.display_option_premium ?? null);
   const premHi = snap.option_day_high ?? premFallback.high;
   const premLo = snap.option_day_low ?? premFallback.low;
   // No-live-data guard (display-only): a BUY with no valid live option premium
@@ -584,7 +584,13 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
                 <span style={{ color: feed.color }}>{feed.label}</span>
               </span>
               <span className="text-[11px] uppercase tracking-wide text-white/40">Option LTP</span>
-              <span className="text-2xl font-black tabular-nums" style={{ color: AMBER }}>{inr(d.current_premium, 2)}</span>
+              <span
+                className="text-2xl font-black tabular-nums"
+                style={{ color: AMBER }}
+                title={d.current_premium == null ? `${snap.display_option_symbol ?? ""} (ATM, no recommendation)` : d.recommended_option ?? ""}
+              >
+                {inr(d.current_premium ?? snap.display_option_premium, 2)}
+              </span>
               <span className="flex items-center gap-2 pl-3 ml-1 border-l border-white/10">
                 <span className="text-[10px] uppercase tracking-wide text-white/40">Day</span>
                 <span className="text-sm font-black tabular-nums" style={{ color: GREEN }} title="Today's premium high">
@@ -640,10 +646,11 @@ export default function ProDashboard({ snap, onCalculate }: { snap: Snapshot; on
                 <button
                   disabled={autoBusy}
                   onClick={() => pushAuto({ enabled: !auto?.enabled })}
-                  className="px-3 py-1 rounded-md text-[11px] font-black leading-none"
-                  style={auto?.enabled ? { background: GREEN, color: "#07120c" } : { background: "rgba(255,255,255,0.10)", color: "#c4ccd6" }}
+                  title={auto?.enabled ? "Stop paper auto-buy (open trades keep their exits)" : "Start paper auto-buy"}
+                  className="px-3 py-1.5 rounded-md text-[11px] font-black leading-none"
+                  style={auto?.enabled ? { background: RED, color: "#fff" } : { background: GREEN, color: "#07120c" }}
                 >
-                  {auto?.enabled ? "ON" : "OFF"}
+                  {autoBusy ? "…" : auto?.enabled ? "■ STOP AUTO-BUY" : "▶ START AUTO-BUY"}
                 </button>
               </div>
               <div className="flex items-center justify-between gap-2 mt-2">
@@ -948,7 +955,7 @@ function Row({ l, v, vc }: { l: string; v: string; vc?: string }) {
  * never SIMULATED by default.
  */
 export function feedView(h: FeedHealth | null | undefined): {
-  label: "LIVE" | "DELAYED" | "SIMULATED" | "DISCONNECTED" | "UNAVAILABLE" | "UNKNOWN";
+  label: "LIVE" | "STALE" | "RECONNECTING" | "SIMULATED" | "DISCONNECTED" | "UNAVAILABLE" | "UNKNOWN";
   color: string;
   age: number | null;
 } {
@@ -960,12 +967,13 @@ export function feedView(h: FeedHealth | null | undefined): {
   const age = Math.max(h.underlying_age_sec ?? 0, h.option_age_sec ?? 0);
   if (src === "UNAVAILABLE") return { label: "UNAVAILABLE", color: RED, age: null };
   if (st === "DISCONNECTED") return { label: "DISCONNECTED", color: RED, age: null };
+  if (st === "RECONNECTING") return { label: "RECONNECTING", color: AMBER, age };
   if (src === "SIMULATED" && st === "SIMULATED") return { label: "SIMULATED", color: MUTED, age: null };
   if (src === "LIVE" && st === "CONNECTED") {
     const stale = h.stale_after_sec != null && age > h.stale_after_sec;
-    return stale ? { label: "DELAYED", color: AMBER, age } : { label: "LIVE", color: GREEN, age };
+    return stale ? { label: "STALE", color: AMBER, age } : { label: "LIVE", color: GREEN, age };
   }
-  if (src === "LIVE" && st === "DEGRADED") return { label: "DELAYED", color: AMBER, age };
+  if (src === "LIVE" && st === "DEGRADED") return { label: "STALE", color: AMBER, age };
   return { label: "UNKNOWN", color: AMBER, age: null };
 }
 

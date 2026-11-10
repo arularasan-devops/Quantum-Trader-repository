@@ -95,3 +95,6 @@ backend/data/
 # Local historical market datasets
 backend/CRUDEOIL_ONE_MINUTE.jsonl
 backend/*_ONE_MINUTE.jsonl
+backups/*.dump
+backups-paper/
+backups/*.tmp

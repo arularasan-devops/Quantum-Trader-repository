@@ -14,6 +14,10 @@ export function setLiveToken(token: string | null) {
   liveToken = token && token.trim() ? token.trim() : null;
 }
 
+export function hasLiveToken(): boolean {
+  return !!liveToken;
+}
+
 if (typeof window !== "undefined") {
   // Remove the token an earlier build kept in persistent browser storage.
   try {
@@ -96,6 +100,15 @@ export interface OrderResult {
   filled_lots?: number | null;
 }
 
+// A rejected order call (401 no live token, 409 kill switch...) has no ``result``;
+// turn it into a failed OrderResult so the UI shows why instead of failing silently.
+async function orderReply(res: Response, side: "BUY" | "SELL", option_symbol: string) {
+  if (res.ok) return res.json() as Promise<{ result: OrderResult; position: unknown }>;
+  let msg = await errorDetail(res);
+  if (res.status === 401) msg = `Live token missing or wrong — enter it in the Live panel, then retry. (${msg})`;
+  return { result: { ok: false, side, option_symbol, message: msg } as unknown as OrderResult, position: null };
+}
+
 export async function buyOption(
   option_symbol: string,
   lots = 1,
@@ -107,7 +120,7 @@ export async function buyOption(
     headers: liveHeaders(),
     body: JSON.stringify({ option_symbol, lots, confirm, instrument }),
   });
-  return res.json() as Promise<{ result: OrderResult; position: unknown }>;
+  return orderReply(res, "BUY", option_symbol);
 }
 
 export async function fetchSignal(instrument?: string) {
@@ -169,7 +182,22 @@ export async function sellPosition(confirm = false, instrument?: string) {
     headers: liveHeaders(),
     body: JSON.stringify({ confirm, instrument }),
   });
-  return res.json() as Promise<{ result: OrderResult; position: unknown }>;
+  return orderReply(res, "SELL", "");
+}
+
+export async function setAutoLevels(
+  instrument: string,
+  levels: { volatility?: boolean; stop?: number; target1?: number; target2?: number; target3?: number },
+): Promise<{ ok: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/api/auto-trade/levels`, {
+    method: "POST",
+    headers: liveHeaders(),
+    body: JSON.stringify({ instrument, ...levels }),
+  });
+  if (res.ok) return res.json();
+  let msg = await errorDetail(res);
+  if (res.status === 401) msg = `Live token missing or wrong — enter it in the Live panel, then retry. (${msg})`;
+  return { ok: false, message: msg };
 }
 
 export interface AutoTradeConfig {
@@ -229,6 +257,7 @@ export interface AutoTradeConfig {
   balanced_max_lots?: number;
   trade_mode: string;
   mode: string;
+  kill_switch?: boolean;
 }
 
 // Set per-instrument fixed point stops / profit targets for Auto-Buy. Send
@@ -277,6 +306,7 @@ export async function setAutoBuy(on: boolean) {
     headers: liveHeaders(),
     body: JSON.stringify({ on }),
   });
+  if (!res.ok) throw new Error(`Auto-buy ${on ? "on" : "off"} failed (${res.status}): ${await errorDetail(res)}`);
   return res.json() as Promise<AutoBuyStatus>;
 }
 
@@ -622,6 +652,14 @@ export interface JournalTrade {
   lot_size?: number | null;
   risk_rupees?: number | null;
   cost_rupees?: number | null;
+  total_costs?: number | null;
+  brokerage?: number | null;
+  stt?: number | null;
+  exchange_txn?: number | null;
+  sebi?: number | null;
+  stamp?: number | null;
+  gst?: number | null;
+  exchange?: string | null;
   return_on_capital_pct?: number | null;
   holding_minutes: number | null;
   mode: string | null;
@@ -644,21 +682,41 @@ export interface TriggerStats {
 
 /** Which book to score: everything, the option engine, or the futures paper tool. */
 export type JournalBook = "all" | "options" | "futures";
+export type JournalMode = "all" | "paper" | "live";
 
-export async function getTradeJournal(limit = 500, book: JournalBook = "all") {
-  const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}`);
+export interface JournalOpenPosition {
+  instrument: string;
+  option: string;
+  lots: number;
+  entry: number | null;
+  current: number | null;
+  unrealized_pnl: number;
+  stop: number | null;
+}
+
+export async function getTradeJournal(limit = 500, book: JournalBook = "all",
+                                      since: number | null = null, until: number | null = null,
+                                      mode: JournalMode = "all") {
+  const range = `${since !== null ? `&since=${since}` : ""}${until !== null ? `&until=${until}` : ""}`;
+  const res = await fetch(`${API_BASE}/api/trade-journal?limit=${limit}&book=${book}&mode=${mode}${range}`);
   return res.json() as Promise<{
     count: number;
     wins: number;
     losses: number;
     net_pnl: number;
+    gross_pnl?: number;
+    charges?: number;
+    win_rate?: number;
+    profit_factor?: number | null;
+    unrealized_pnl?: number;
+    open_positions?: JournalOpenPosition[];
     trades: JournalTrade[];
     by_trigger: Record<string, TriggerStats>;
   }>;
 }
 
-export function tradeJournalCsvUrl(limit = 5000, book: JournalBook = "all") {
-  return `${API_BASE}/api/trade-journal.csv?limit=${limit}&book=${book}`;
+export function tradeJournalCsvUrl(limit = 5000, book: JournalBook = "all", mode: JournalMode = "all") {
+  return `${API_BASE}/api/trade-journal.csv?limit=${limit}&book=${book}&mode=${mode}`;
 }
 
 export interface FlowSettings {

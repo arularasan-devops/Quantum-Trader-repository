@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import math
 import logging
 import os
 import threading
@@ -22,7 +23,7 @@ from collections.abc import Callable
 
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 
 from app.analysis import signal_visibility
@@ -160,6 +161,37 @@ def _mark_feed_stage(instrument: str, stage: str) -> None:
         pass
 
 
+_WS_SEND_TIMEOUT = 1.5  # seconds a single client may hold a broadcast
+_nan_logged: set[str] = set()
+
+
+def _finite(obj, path: str, bad: list[str]):
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        bad.append(path)
+        return None
+    if isinstance(obj, dict):
+        return {k: _finite(v, f"{path}.{k}", bad) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_finite(v, f"{path}[]", bad) for v in obj]
+    return obj
+
+
+def _json_text(payload: dict, inst: str = "") -> str:
+    """Strict JSON for the browser. NaN/Infinity are not JSON: the browser's
+    JSON.parse rejected the whole frame and that instrument's LTP stayed blank.
+    Non-finite numbers are sent as null (logged once per instrument)."""
+    try:
+        return json.dumps(payload, allow_nan=False, separators=(",", ":"))
+    except ValueError:
+        bad: list[str] = []
+        clean = _finite(payload, inst or "snapshot", bad)
+        if inst not in _nan_logged:
+            _nan_logged.add(inst)
+            _log.warning("non-finite numbers sent as null for %s: %s", inst, ", ".join(bad[:10]))
+        return json.dumps(clean, allow_nan=False, separators=(",", ":"))
+
 class Hub:
     # How many screener-only (unwatched) instruments to refresh per background
     # turn. Small, so the instrument you're viewing always ticks first and fast.
@@ -248,6 +280,7 @@ class Hub:
         return round(n_scanned / per_cycle * cycle_sec, 1)
 
     def __init__(self) -> None:
+        self.ws_send_drops = 0
         # ws -> instrument it subscribed to
         self.clients: dict[WebSocket, str] = {}
         # instrument -> latest snapshot
@@ -273,6 +306,10 @@ class Hub:
         # abandoning the wait keeps every other instrument ticking, it does not
         # make the wedged instrument's minute appear.
         self._ticks_abandoned: int = 0
+        self.tick_errors: int = 0
+        self.cycle_errors: int = 0
+        self._tick_err_logged: dict[str, float] = {}
+        self._p45_fut = None
         self._tick_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._TICK_WORKERS, thread_name_prefix="tick")
         self._wedged: set[concurrent.futures.Future] = set()
@@ -337,6 +374,14 @@ class Hub:
             # and a late quote presented as current is worse than a gap the
             # coverage report can see.
             return
+        except Exception:
+            # A raising tick costs this instrument its tick, never the loop:
+            # uncaught, it ended Hub.run and froze every LTP with no error shown.
+            self.tick_errors += 1
+            if time.monotonic() - self._tick_err_logged.get(inst, 0.0) > 60.0:
+                self._tick_err_logged[inst] = time.monotonic()
+                _log.exception("tick failed for %s", inst)
+            return
         finally:
             with contextlib.suppress(Exception):
                 p17store.note_tick_end()
@@ -345,20 +390,27 @@ class Hub:
         self._ticked_at[inst] = time.monotonic()
         self.latest[inst] = snapshot
         payload = snapshot.model_dump(mode="json")
+        text = _json_text(payload, inst)
         dead = []
         for ws, sub in list(self.clients.items()):
             if sub != inst:
                 continue
+            # One stalled browser tab must not hold every other client's LTP
+            # back: a send that cannot complete promptly drops that client,
+            # whose own watchdog then reconnects it.
             try:
-                await ws.send_json(payload)
+                await asyncio.wait_for(ws.send_text(text), timeout=_WS_SEND_TIMEOUT)
             except Exception:
                 dead.append(ws)
+                self.ws_send_drops += 1
                 continue
             # This signal reached a client. Recorded once per signal, so a
             # missing dashboard signal can be told from one nobody was watching.
             signal_visibility.mark_user_visible(inst, snapshot.decision, "ws")
         for ws in dead:
             self.clients.pop(ws, None)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ws.close(), timeout=0.5)
         # Close the timestamp chain: this is the moment the price the engine used
         # actually left the server. Observability only.
         _mark_feed_stage(inst, "render")
@@ -413,18 +465,37 @@ class Hub:
             return
         from app.research.phase45 import service as p45
 
-        try:
-            await loop.run_in_executor(None, p45.resolve_due)
-        except Exception:  # pragma: no cover - research must not break the loop
-            _log.exception("phase45 paper resolution failed")
+        # Not awaited: a pass held on the shadow store's write lock must not
+        # hold the tick loop (and every on-screen LTP) with it. One at a time.
+        if self._p45_fut is not None and not self._p45_fut.done():
+            return
+
+        def _done(f) -> None:
+            if not f.cancelled() and f.exception() is not None:
+                _log.error("phase45 paper resolution failed: %r", f.exception())
+
+        self._p45_fut = loop.run_in_executor(None, p45.resolve_due)
+        self._p45_fut.add_done_callback(_done)
 
     async def run(self) -> None:
+        """Tick loop that outlives any error: if it ends, every LTP and every
+        auto-exit check stops while the API still answers."""
+        while True:
+            try:
+                await self._run_loop()
+            except Exception:
+                self.cycle_errors += 1
+                _log.exception("hub loop failed; restarting it")
+                await asyncio.sleep(0.5)
+
+    async def _run_loop(self) -> None:
         loop = asyncio.get_event_loop()
         rr = 0  # round-robin cursor over background (screener-only) instruments
         cycle = 0
         next_movers = 0.0  # monotonic time of the next auto day-movers check
         while True:
             cycle += 1
+            cycle_began = time.monotonic()
             # Re-run the daily auto-pick when the IST day rolls over on a
             # long-running server, then warm any newly-picked instruments.
             if settings.auto_pick_enabled and cycle % 120 == 1:
@@ -480,7 +551,10 @@ class Hub:
             # Watched instruments and anything holding a position are NOT skipped:
             # the dashboard must still say "CLOSED" for the name you opened, and a
             # position must stay monitored right up to its own close.
-            closed_now = [st for st in background if not _exchange_open(st.instrument)]
+            # A closed name is still ticked ONCE (until it has a snapshot) so the
+            # board shows its last/closing price from start-up instead of blank.
+            closed_now = [st for st in background
+                          if not _exchange_open(st.instrument) and st.instrument in self.latest]
             if closed_now:
                 background = [st for st in background if st not in closed_now]
             self._closed_skipped = len(closed_now)
@@ -547,7 +621,8 @@ class Hub:
             self._scan_rate = self._scan_rate * 0.8 + scanned * 0.2
             # Fast cadence for the watched instrument. Never slower than the
             # configured tick interval; capped fast so the LTP tracks the broker.
-            await asyncio.sleep(min(settings.tick_interval_seconds, self._WATCHED_INTERVAL))
+            cadence = min(settings.tick_interval_seconds, self._WATCHED_INTERVAL)
+            await asyncio.sleep(max(0.05, cadence - (time.monotonic() - cycle_began)))
 
 
 hub = Hub()
@@ -731,6 +806,35 @@ async def _startup() -> None:
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
 
+    mode_error = live_control.verify_trade_mode()
+    if mode_error:
+        _log.error("trade mode check failed: %s", mode_error)
+    else:
+        _log.info("trade mode: %s (auto-trade %s)", settings.trade_mode.strip().lower(),
+                  "enabled" if settings.auto_trade_enabled else "disabled")
+
+    # Before any tick appends to the ledgers: move old sessions to the archive so
+    # the readers' in-memory caches hold days, not months.
+    from app.analysis import ledger_archive
+
+    await asyncio.get_running_loop().run_in_executor(None, ledger_archive.run)
+
+    if settings.risk_rebuild_from_journal:
+        try:
+            from app.engine import account_risk
+            from app.journal.store import store as _jr_store
+
+            now = time.time()
+            day_start = (int(now) + 19800) // 86400 * 86400 - 19800
+            row = _jr_store().db.query_one(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(net_pnl), 0) AS pnl FROM jr_trades "
+                "WHERE mode = 'paper' AND status = 'CLOSED' AND exit_ts >= ?", [day_start])
+            if row and int(row["n"] or 0) > 0:
+                account_risk.account.restore_day(now, float(row["pnl"] or 0), int(row["n"]))
+        except Exception:
+            _log.warning("could not rebuild today's risk counters from the journal",
+                         exc_info=True)
+
     loop = asyncio.get_event_loop()
     # Re-apply a user-saved manual watchlist first (survives restarts). If one is
     # active it governs the universe (auto-pick becomes a no-op below).
@@ -841,7 +945,9 @@ def _refresh_universe(force: bool = False) -> dict | None:
 # read off the screen instead of guessed at. Angel rate-limits the historical
 # candle API, so this is genuinely slow on a big universe and a cold instrument
 # is indistinguishable from a dead one until it lands.
-_warm_state: dict[str, int] = {"total": 0, "done": 0}
+_warm_state: dict = {"total": 0, "done": 0, "failed": {}, "retries": 0}
+_WARM_RETRY_SEC = 60.0
+_WARM_RETRY_MAX = 15
 
 
 async def _warm_all() -> None:
@@ -857,8 +963,17 @@ async def _warm_all() -> None:
         async with sem:
             try:
                 await loop.run_in_executor(None, registry.get, sym)
-            except Exception:
-                pass
+                _warm_state["failed"].pop(sym, None)
+            except Exception as exc:
+                # A failed warm-up used to be dropped silently, leaving the
+                # instrument with no LTP until the next restart. Remember why
+                # and retry it below.
+                why = str(exc)[:200]
+                with contextlib.suppress(Exception):
+                    from app.market.angelone import _redact_secrets
+                    why = _redact_secrets(why)
+                _warm_state["failed"][sym] = why
+                _log.warning("warm-up failed for %s (will retry): %s", sym, why)
             finally:
                 _warm_state["done"] += 1
 
@@ -884,6 +999,14 @@ async def _warm_all() -> None:
     await asyncio.gather(*[_one(sym) for sym in ordered], return_exceptions=True)
     _warm_state["done"] = _warm_state["total"]
     _log.info("warm-up finished: %d instrument(s) in %.0fs", len(ordered), time.monotonic() - began)
+    for attempt in range(1, _WARM_RETRY_MAX + 1):
+        failed = [s for s in list(_warm_state["failed"]) if s in UNIVERSE]
+        if not failed:
+            break
+        await asyncio.sleep(_WARM_RETRY_SEC)
+        _warm_state["retries"] = attempt
+        _log.info("warm-up retry %d for %d instrument(s): %s", attempt, len(failed), ", ".join(failed))
+        await asyncio.gather(*[_one(sym) for sym in failed], return_exceptions=True)
 
 
 async def _refresh_intelligence() -> None:
@@ -966,6 +1089,7 @@ async def health() -> dict:
         "data_source": "SIMULATED" if (settings.data_provider or "").lower() == "simulated"
         else "LIVE_PROVIDER",
         "trade_mode": "live" if registry.get(DEFAULT_INSTRUMENT).is_live else "paper",
+        "mode_error": live_control.trade_mode_error() or None,
     }
 
 
@@ -1046,7 +1170,7 @@ async def db_status() -> dict:
 
 
 @app.get("/api/snapshot")
-async def snapshot(instrument: str | None = None) -> dict:
+async def snapshot(instrument: str | None = None) -> Response:
     # Prefer the snapshot the background loop already produced for THIS
     # instrument. Only build one on demand when none exists yet, and do it OFF
     # the event loop — state.tick makes blocking broker calls, so running it
@@ -1066,7 +1190,8 @@ async def snapshot(instrument: str | None = None) -> dict:
     # point at which a signal actually reaches a client. Recorded once per
     # signal, and it cannot affect the response.
     signal_visibility.mark_user_visible(st.instrument, snap.decision)
-    return snap.model_dump(mode="json")
+    return Response(_json_text(snap.model_dump(mode="json"), st.instrument),
+                    media_type="application/json")
 
 
 @app.post("/api/buy")
@@ -1085,8 +1210,29 @@ async def sell(req: SellRequest | None = None,
     st = registry.get(_norm_instrument(req.instrument if req else None))
     if st.is_live:
         live_control.require_live_auth(x_qt_live_token)
-    result = st.sell((req.confirm if req else False))
+    result = st.sell((req.confirm if req else False), check_broker=True)
     return {"result": result.model_dump(mode="json"), "position": st.position.model_dump(mode="json")}
+
+
+@app.post("/api/auto-trade/levels")
+async def auto_trade_levels(req: dict,
+                            x_qt_live_token: str | None = Header(default=None)) -> dict:
+    """Re-set the open bot trade's stop/T1/T2/T3 (pre-T1). ``{"instrument": ..,
+    "volatility": true}`` recomputes them from the option's 1-min ATR, or pass
+    stop/target1/target2/target3. Never sends an order."""
+    st = registry.get(_norm_instrument(req.get("instrument")))
+    if st.is_live:
+        live_control.require_live_auth(x_qt_live_token)
+
+    def _num(k):
+        v = req.get(k)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    res = st.relevel_auto(use_vol=bool(req.get("volatility")), stop=_num("stop"),
+                          t1=_num("target1"), t2=_num("target2"), t3=_num("target3"))
+    if not res.get("ok"):
+        raise HTTPException(409, res.get("message"))
+    return res
 
 
 @app.post("/api/auto-trade")
@@ -1100,12 +1246,15 @@ async def auto_trade(req: AutoTradeRequest,
     if (req.allow_live or req.live_max_order_value is not None
             or req.live_max_lots is not None):
         live_control.require_live_auth(x_qt_live_token)
-    if req.enabled and live_control.kill_switch_engaged():
+    # The kill switch guards LIVE orders only; it must not block starting PAPER auto-buy.
+    if req.enabled and live_control.kill_switch_engaged() and str(settings.trade_mode).lower() == "live":
         raise HTTPException(409, "Kill switch is engaged; release it before enabling the bot.")
+    if req.enabled and live_control.trade_mode_error():
+        raise HTTPException(409, live_control.trade_mode_error())
     if req.enabled is not None:
         settings.auto_trade_enabled = bool(req.enabled)
     if req.min_confidence is not None:
-        settings.auto_trade_min_confidence = max(75.0, min(99.0, float(req.min_confidence)))
+        settings.auto_trade_min_confidence = max(80.0, min(99.0, float(req.min_confidence)))
     if req.max_lots is not None:
         settings.auto_trade_max_lots = max(1, min(50, int(req.max_lots)))
     if req.safe_sizing is not None:
@@ -1209,6 +1358,8 @@ async def auto_buy(req: AutoBuyRequest,
         live_control.require_live_auth(x_qt_live_token)
         if live_control.kill_switch_engaged():
             raise HTTPException(409, "Kill switch is engaged; release it before arming.")
+        if live_control.trade_mode_error():
+            raise HTTPException(409, live_control.trade_mode_error())
     balance: float | None = None
     try:
         balance = angelone.available_cash(ttl=5.0)
@@ -1216,42 +1367,19 @@ async def auto_buy(req: AutoBuyRequest,
         balance = None
 
     if req.on:
+        # Arms LIVE only. The strategy, exits and sizing stay exactly as in PAPER
+        # (pullback engine, lots from QT_CAPITAL at the ask, per-trade loss cap);
+        # the broker balance can only shrink the per-order ceiling.
         settings.auto_trade_enabled = True
         settings.auto_trade_allow_live = True
-        settings.auto_trade_use_live_balance = True
-        settings.auto_trade_safe_sizing = True
-        settings.auto_trade_momentum_entry = False
-        # --- V4 management (validated on 5y of 1-min data): keep the WIDE ATR stop
-        # and RIDE winners on a ratcheting lock instead of booking T1. The 5-year
-        # dry run showed tight stops / break-even / quick-scalp all cut the win rate
-        # so hard they turned the edge NEGATIVE (PF < 0.6); the wide-stop + ride
-        # variant was the only clear net winner (NIFTY PF 1.12 vs 1.05). Loss size
-        # is controlled by LOT COUNT + the order-value cap, NOT by a tight stop.
-        settings.auto_trade_ride_trail = True
-        # LOCK-ANY-PROFIT exit (user-requested): do NOT wait for T1. As soon as the
-        # premium is a little above entry and then stalls / ticks down from its peak,
-        # exit and bank whatever profit is showing (e.g. entry 12 → stuck at 15 → exit;
-        # or reaches 17 and rolls over → exit). Arm early (small profit) and use a
-        # tight give-back so it exits near the stall instead of holding for the target.
-        settings.auto_trade_pre_t1_trail = True
-        settings.auto_trade_pre_t1_trail_arm_profit_pct = 4.0
-        settings.auto_trade_pre_t1_trail_giveback_pct = 20.0
-        settings.auto_trade_pre_t1_trail_min_giveback = 1.0
-        settings.auto_trade_pre_t1_trail_min_giveback_pct = 0.5
-        # Once green, never let it fall back below entry — protect the profit.
-        settings.auto_trade_breakeven_after_arm = True
-        settings.auto_trade_quick_scalp_lots = 0
-        # Use the engine's regime ATR stop as-is (wide). 0 = no extra tightening.
-        settings.auto_trade_max_stop_pct = 0.0
-        # Balance can only SHRINK the per-order ceiling; it never raises it above
-        # the configured live cap or the strategy capital, and live lots stay at
-        # the configured cap (no silent expansion).
+        settings.auto_trade_use_live_balance = False
         ceiling = min(settings.auto_trade_live_max_order_value, settings.capital)
         if balance and balance > 0:
             ceiling = min(ceiling, round(balance, 2))
         settings.auto_trade_live_max_order_value = ceiling
     else:
-        settings.auto_trade_enabled = False
+        # Disarm live only: no new live entries; an open live position keeps its
+        # exits, and the PAPER bot is left as it was.
         settings.auto_trade_allow_live = False
 
     live_active = settings.trade_mode.lower() == "live" and balance is not None
@@ -1265,13 +1393,13 @@ async def auto_buy(req: AutoBuyRequest,
         "live_max_order_value": settings.auto_trade_live_max_order_value,
         "min_confidence": settings.auto_trade_min_confidence,
         "note": (
-            "Live auto-buy armed — sizing from your balance by signal confidence."
+            "Live auto-buy armed: same strategy as paper, lots from capital at the ask."
             if (req.on and live_active)
             else (
                 "Enabled, but NOT live: set QT_TRADE_MODE=live and ensure your Angel "
                 "session is connected, or it will paper-trade only."
                 if req.on
-                else "Auto-buy off."
+                else "Live disarmed: no new live buys (open positions keep their exits)."
             )
         ),
     }
@@ -1288,6 +1416,17 @@ async def get_settings() -> dict:
         "min_reward_risk": settings.min_reward_risk,
         "target_scale": settings.decision_target_scale,
         "min_stop_pct_of_premium": settings.min_stop_pct_of_premium,
+        "vol_levels": {
+            "enabled": settings.vol_levels_enabled,
+            "stop_atr_mult": settings.vol_stop_atr_mult,
+            "target_atr_mults": settings.vol_target_atr_mults,
+            "stop_min_pct": settings.vol_stop_min_pct,
+            "stop_max_pct": settings.vol_stop_max_pct,
+            "mcx_t1_min_points": settings.vol_mcx_t1_min_points,
+            "mcx_hold_arm_points": settings.mcx_hold_arm_points,
+            "mcx_hold_floor_points": settings.mcx_hold_floor_points,
+            "mcx_hold_min_giveback_points": settings.mcx_hold_min_giveback_points,
+        },
         "pre_t1_arm_profit_pct": settings.auto_trade_pre_t1_trail_arm_profit_pct,
         "pre_t1_giveback_min_pct": settings.auto_trade_pre_t1_trail_min_giveback_pct,
         "blocked_entry_hours": settings.blocked_entry_hours,
@@ -1307,6 +1446,7 @@ async def get_settings() -> dict:
         "beyond_t3_min_step": settings.auto_trade_beyond_t3_min_step,
         "auto_trade": {
             "enabled": settings.auto_trade_enabled,
+            "mode_error": live_control.trade_mode_error() or None,
             "min_confidence": settings.auto_trade_min_confidence,
             "max_lots": settings.auto_trade_max_lots,
             "safe_sizing": settings.auto_trade_safe_sizing,
@@ -1358,6 +1498,7 @@ async def get_settings() -> dict:
                 if (settings.trade_mode.lower() == "live" and settings.auto_trade_enabled and settings.auto_trade_allow_live)
                 else "paper"
             ),
+            "kill_switch": live_control.kill_switch_engaged(),
         },
         # Premium-SELLING engine — PAPER ONLY; no live order path exists for it.
         "credit_spread": {
@@ -1437,6 +1578,26 @@ async def set_settings(req: dict) -> dict:
     mrr = req.get("min_reward_risk")
     if isinstance(mrr, (int, float)) and not isinstance(mrr, bool) and 0 <= mrr <= 10:
         settings.min_reward_risk = float(mrr)
+    vl = req.get("vol_levels")
+    if isinstance(vl, dict):
+        if isinstance(vl.get("enabled"), bool):
+            settings.vol_levels_enabled = vl["enabled"]
+        for k, attr, lo, hi in (
+            ("stop_atr_mult", "vol_stop_atr_mult", 0.5, 10),
+            ("stop_min_pct", "vol_stop_min_pct", 0, 50),
+            ("stop_max_pct", "vol_stop_max_pct", 0, 50),
+            ("mcx_t1_min_points", "vol_mcx_t1_min_points", 0, 500),
+            ("mcx_hold_arm_points", "mcx_hold_arm_points", 0, 500),
+            ("mcx_hold_floor_points", "mcx_hold_floor_points", 0, 500),
+            ("mcx_hold_min_giveback_points", "mcx_hold_min_giveback_points", 0, 500),
+        ):
+            v = vl.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi:
+                setattr(settings, attr, float(v))
+        tm = vl.get("target_atr_mults")
+        if (isinstance(tm, list) and len(tm) == 3
+                and all(isinstance(x, (int, float)) and 0 < x <= 50 for x in tm)):
+            settings.vol_target_atr_mults = [float(x) for x in tm]
     msp = req.get("min_stop_pct_of_premium")
     if isinstance(msp, (int, float)) and not isinstance(msp, bool) and 0 <= msp <= 50:
         settings.min_stop_pct_of_premium = float(msp)
@@ -1842,10 +2003,10 @@ async def journal_v2_trades(instrument: str | None = None, mode: str | None = No
                             regime: str | None = None, status: str | None = None,
                             result: str | None = None, since: float | None = None,
                             until: float | None = None, page: int = Query(1, ge=1),
-                            page_size: int = Query(50, ge=1, le=500)) -> dict:
+                            page_size: int = Query(50, ge=1, le=500), auto: bool = False) -> dict:
     from app.journal.store import store as jr_store
 
-    return jr_store().list_trades(_jr_filters(
+    return jr_store().list_trades(_jr_filters(auto="1" if auto else None, 
         instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
         status=status, result=result, since=since, until=until), page, page_size)
 
@@ -1855,10 +2016,10 @@ async def journal_v2_trades_csv(instrument: str | None = None, mode: str | None 
                                 strategy: str | None = None, setup: str | None = None,
                                 regime: str | None = None, status: str | None = None,
                                 result: str | None = None, since: float | None = None,
-                                until: float | None = None) -> PlainTextResponse:
+                                until: float | None = None, auto: bool = False) -> PlainTextResponse:
     from app.journal.store import store as jr_store
 
-    body = jr_store().trades_csv(_jr_filters(
+    body = jr_store().trades_csv(_jr_filters(auto="1" if auto else None, 
         instrument=instrument, mode=mode, strategy=strategy, setup=setup, regime=regime,
         status=status, result=result, since=since, until=until))
     return PlainTextResponse(body, media_type="text/csv", headers={
@@ -1875,6 +2036,43 @@ async def journal_v2_trade(trade_id: str) -> dict:
     return detail
 
 
+@app.get("/api/paper-books")
+async def paper_books_summary() -> dict:
+    from app.engine import paper_books
+
+    return paper_books.books().summary()
+
+
+@app.get("/api/paper-books/trades.csv")
+async def paper_books_trades_csv(book: str | None = None, status: str | None = None,
+                                 since: float | None = None,
+                                 until: float | None = None) -> PlainTextResponse:
+    import csv
+    import io
+
+    from app.engine import paper_books
+    rows = paper_books.books().trades(book, status, 1, 0, since, until)["rows"]
+    buf = io.StringIO()
+    cols = list(rows[0].keys()) if rows else ["trade_id", "book", "instrument"]
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="paper_books_trades.csv"'})
+
+
+@app.get("/api/paper-books/trades")
+async def paper_books_trades(book: str | None = None, status: str | None = None,
+                             page: int = Query(1, ge=1),
+                             page_size: int = Query(50, ge=1, le=500),
+                             since: float | None = None,
+                             until: float | None = None) -> dict:
+    from app.engine import paper_books
+
+    return paper_books.books().trades(book, status, page, page_size, since, until)
+
+
 @app.get("/api/journal/v2/sessions")
 async def journal_v2_sessions(instrument: str | None = None, mode: str | None = None,
                               since: float | None = None, until: float | None = None,
@@ -1884,6 +2082,35 @@ async def journal_v2_sessions(instrument: str | None = None, mode: str | None = 
 
     return jr_store().list_sessions(_jr_filters(
         instrument=instrument, mode=mode, since=since, until=until), page, page_size)
+
+
+@app.get("/api/journal/v2/signals.csv")
+async def journal_v2_signals_csv(instrument: str | None = None, mode: str | None = None,
+                                 outcome: str | None = None, signal: str | None = None,
+                                 setup: str | None = None, regime: str | None = None,
+                                 session_id: str | None = None, since: float | None = None,
+                                 until: float | None = None) -> PlainTextResponse:
+    from app.journal.store import store as jr_store
+
+    body = jr_store().signals_csv(_jr_filters(
+        instrument=instrument, mode=mode, outcome=outcome, signal=signal, setup=setup,
+        regime=regime, session_id=session_id, since=since, until=until))
+    return PlainTextResponse(body, media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="journal_signals.csv"'})
+
+
+@app.get("/api/journal/v2/signals/summary")
+async def journal_v2_signals_summary(instrument: str | None = None, mode: str | None = None,
+                                     outcome: str | None = None, signal: str | None = None,
+                                     setup: str | None = None, regime: str | None = None,
+                                     session_id: str | None = None,
+                                     since: float | None = None,
+                                     until: float | None = None) -> dict:
+    from app.journal.store import store as jr_store
+
+    return jr_store().signal_summary(_jr_filters(
+        instrument=instrument, mode=mode, outcome=outcome, signal=signal, setup=setup,
+        regime=regime, session_id=session_id, since=since, until=until))
 
 
 @app.get("/api/journal/v2/signals")
@@ -2511,6 +2738,93 @@ async def vehicle_comparison(instrument: str | None = None) -> dict:
     }
 
 
+@app.get("/api/options-board")
+async def options_board(instrument: str | None = None) -> dict:
+    """OPTIONS board: the current chain with its executable book, liquidity, OI
+    and model Greeks, beside the engine's call and the paper position. Read-only;
+    there is no order path here."""
+    import time as _time
+
+    from app.analysis import intelligence, options_analytics
+    from app.market.instruments import get_spec
+    from app.models import OptionType
+
+    loop = asyncio.get_event_loop()
+    st = await loop.run_in_executor(None, registry.get, _norm_instrument(instrument))
+    snap = hub.latest.get(st.instrument)
+    if snap is None:
+        snap = await loop.run_in_executor(None, st.tick)
+        hub.latest[st.instrument] = snap
+    chain = await loop.run_in_executor(None, st.provider.option_chain)
+    spec = get_spec(st.instrument)
+    lot = int(getattr(spec, "lot_size", 0) or 0) or None
+    days = float(getattr(spec, "days_to_expiry", 0) or 0) or None
+    spot = snap.futures_price
+    now = _time.time()
+    rows = []
+    for q in sorted(chain, key=lambda x: (x.strike, x.option_type.value)):
+        two_sided = bool(q.bid and q.ask and 0 < q.bid <= q.ask)
+        spread = round(q.ask - q.bid, 2) if two_sided else None
+        mid = (q.bid + q.ask) / 2 if two_sided else None
+        rows.append({
+            "symbol": q.symbol, "strike": q.strike, "type": q.option_type.value,
+            "ltp": q.premium, "bid": q.bid, "ask": q.ask,
+            "bid_size": q.bid_size, "ask_size": q.ask_size,
+            "spread": spread,
+            "spread_pct": round(spread / mid * 100, 2) if spread is not None and mid else None,
+            "book_age_sec": round(now - q.book_ts, 1) if q.book_ts else None,
+            "executable": two_sided,
+            "cost_per_lot_at_ask": round(q.ask * lot, 2) if two_sided and lot else None,
+            "iv": q.iv, "delta": q.delta, "gamma": q.gamma, "theta": q.theta, "vega": q.vega,
+            "oi": q.oi, "oi_change": q.oi_change, "volume": q.volume,
+        })
+    calls = [q for q in chain if q.option_type == OptionType.CALL]
+    puts = [q for q in chain if q.option_type == OptionType.PUT]
+    try:
+        em = options_analytics.expected_move(spot, chain, days) if days else None
+    except Exception:
+        em = None
+    d = snap.decision
+    sig = getattr(d.signal, "value", d.signal)
+    return {
+        "instrument": st.instrument,
+        "exchange": getattr(spec, "exchange", None),
+        "spot": spot,
+        "lot_size": lot,
+        "days_to_expiry": days,
+        "is_real_feed": settings.data_provider.lower() == "angelone",
+        "trade_mode": "live" if st.is_live else "paper",
+        "feed_mode": snap.feed_mode,
+        "feed": snap.feed_health.model_dump() if snap.feed_health else None,
+        "greeks_source": (
+            "Model-computed: IV is solved from each option's LTP with Black-Scholes, "
+            "then delta/gamma/theta/vega are computed from that IV "
+            "(app/market/options.py). Not exchange-published values."
+        ),
+        "pcr": intelligence.pcr_reading(chain).model_dump(),
+        "max_pain": intelligence.max_pain(chain, spot).model_dump(),
+        "max_oi_call_strike": max(calls, key=lambda q: q.oi).strike if calls else None,
+        "max_oi_put_strike": max(puts, key=lambda q: q.oi).strike if puts else None,
+        "expected_move": round(em, 2) if em else None,
+        "signal": {
+            "signal": sig, "confidence": d.confidence,
+            "recommended_option": d.recommended_option,
+            "entry_trigger": d.entry_trigger, "regime": getattr(st, "_last_market_status", None),
+            "current_premium": d.current_premium, "stop_loss": d.stop_loss,
+            "target1": d.target1, "target2": d.target2, "target3": d.target3,
+        },
+        "auto_entry_rule": (
+            f"PAPER auto-entry only on {'/'.join(settings.auto_trade_allowed_triggers)} in "
+            f"{'/'.join(settings.auto_trade_allowed_regimes)} at confidence >= "
+            f"{settings.auto_trade_min_confidence:g}%, with a fresh feed and a two-sided quote; "
+            "paper buys fill at the ask and sell at the bid."
+        ),
+        "position": snap.position.model_dump(),
+        "executable_count": sum(1 for r in rows if r["executable"]),
+        "rows": rows,
+    }
+
+
 @app.get("/api/instruments")
 async def instruments() -> dict:
     from app.market.instruments import universe_specs
@@ -3061,6 +3375,7 @@ async def quantum_signal_scan() -> dict:
     from app.market.instruments import UNIVERSE
 
     active = set(UNIVERSE)
+    held = {s._instrument for s in registry.active() if s.position.option_symbol}
     rows: list[dict] = []
     for inst, snap in list(hub.latest.items()):
         if inst not in active:
@@ -3077,6 +3392,7 @@ async def quantum_signal_scan() -> dict:
                 "regime": v["regime"],
                 "spot": v["spot"],
                 "change_pct": v["change_pct"],
+                "in_position": inst in held,
             }
         )
     # Rank: actionable BUYs first, then by confidence.
@@ -3330,8 +3646,70 @@ def _filter_book(rows: list[dict], book: str) -> list[dict]:
     return rows
 
 
+def _paper_book_rows(since: float | None = None, until: float | None = None) -> list[dict]:
+    """Closed Paper Book trades as Journal rows (mode=paper).
+
+    Only while this stack trades LIVE: the Paper Books then run on the same
+    feed, ledger-only, and are the paper side of the one Journal. A paper-mode
+    stack already journals its own paper trades, so nothing is added there.
+    """
+    if (settings.trade_mode or "").lower() != "live" or not settings.paper_books_enabled:
+        return []
+    from app.analysis import option_costs
+    from app.engine import paper_books
+
+    out: list[dict] = []
+    for bid in [b.strip() for b in (settings.journal_paper_books or "").split(",") if b.strip()]:
+        try:
+            rows = paper_books.books().trades(book=bid, status="CLOSED", page_size=0,
+                                              since=since, until=until)["rows"]
+        except Exception:
+            _log.debug("paper book rows unavailable for %s", bid, exc_info=True)
+            continue
+        for r in rows:
+            sym = str(r.get("option_symbol") or "")
+            net = float(r.get("net_pnl") or 0.0)
+            ent, ext = r.get("entry_ts"), r.get("exit_ts") or r.get("entry_ts")
+            out.append({
+                "instrument": r.get("instrument"), "ts": int(ext or 0), "option": sym,
+                "option_type": "CE" if sym.endswith("CE") else "PE" if sym.endswith("PE") else None,
+                "entry": r.get("entry_price"), "exit": r.get("exit_price"),
+                "lots": r.get("lots"), "net_pnl": round(net, 2), "win": net > 0,
+                "holding_minutes": round((float(ext) - float(ent)) / 60.0, 1) if ent and ext else None,
+                "mode": "paper", "auto": True, "exit_reason": r.get("exit_reason"),
+                "confidence": r.get("confidence"), "note": f"Paper Book {bid}",
+                "entry_trigger": (str(r.get("setup") or "").upper() or None),
+                "capital_used": r.get("capital_used"), "risk_rupees": r.get("risk_rupees"),
+                "cost_rupees": r.get("costs"), "total_costs": r.get("costs"),
+                "lot_size": r.get("lot_size"), "book": f"PAPER {bid}",
+                "cost_model": getattr(option_costs, "COST_MODEL", None),
+            })
+    return out
+
+
+def _with_paper_books(rows: list[dict], flow_only: bool, since=None, until=None,
+                      limit: int | None = None) -> list[dict]:
+    if flow_only:
+        return rows
+    extra = _paper_book_rows(since, until)
+    if not extra:
+        return rows
+    merged = sorted(rows + extra, key=lambda r: _row_epoch(r.get("ts")) or 0.0, reverse=True)
+    return merged[:limit] if limit else merged
+
+
+def _filter_mode(rows: list[dict], mode: str) -> list[dict]:
+    """Paper / live tabs of the journal; "all" keeps both."""
+    m = (mode or "all").lower()
+    if m not in ("paper", "live"):
+        return rows
+    return [r for r in rows if (r.get("mode") or "paper").lower() == m]
+
+
 @app.get("/api/trade-journal")
-async def trade_journal(limit: int = 500, book: str = "all") -> dict:
+async def trade_journal(limit: int = 500, book: str = "all",
+                        since: float | None = None, until: float | None = None,
+                        mode: str = "all") -> dict:
     """Complete trade journal — the FULL persisted record of every closed trade
     (paper AND live) with entry/exit, ₹ P&L, whether the bot opened it, the exit
     reason, entry confidence and a plain-English analyst note. Read-only. Survives
@@ -3348,13 +3726,15 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
     # "flow" is the Flow book on its own; every other view holds it out. Pooled,
     # its 4,647 one-minute legs decide each aggregate by weight of numbers.
     flow_only = book.lower() == "flow"
-    all_rows = _filter_book(
+    all_rows = _filter_mode(_filter_book(_with_paper_books(
         storage.store.journal(
+            since=int(since) if since is not None else None,
+            until=int(until) if until is not None else None,
             limit=max(1, min(5000, limit)),
             exclude_flow=not flow_only, only_flow=flow_only,
-        ),
+        ), flow_only, since, until, max(1, min(5000, limit))),
         book,
-    )
+    ), mode)
     # Seeded demonstration rows are held out of every figure below. Averaged in,
     # they reported ₹1,94,034 at an 83.5% win rate off 82 copies of one leg.
     provenance = prov.provenance(all_rows)
@@ -3388,11 +3768,34 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
             round(b["gross_win"] / b["gross_loss"], 3) if b["gross_loss"] > 0 else None
         )
 
+    gross_win = sum(float(r["net_pnl"] or 0.0) for r in rows if float(r["net_pnl"] or 0.0) > 0)
+    gross_loss = -sum(float(r["net_pnl"] or 0.0) for r in rows if float(r["net_pnl"] or 0.0) < 0)
+    charges = round(sum(float(r.get("cost_rupees") or r.get("total_costs") or 0.0)
+                        for r in rows), 1)
+    # Open positions are MTM only and never mixed into the realized totals.
+    open_pos: list[dict] = []
+    if book.lower() in ("all", "options"):
+        for st in registry.active():
+            p = st.position
+            if not p.option_symbol:
+                continue
+            open_pos.append({
+                "instrument": st.instrument, "option": p.option_symbol,
+                "lots": p.quantity_lots, "entry": p.entry_premium,
+                "current": p.current_premium, "unrealized_pnl": round(float(p.net_pnl or 0.0), 1),
+                "stop": getattr(p, "stop_loss", None),
+            })
     return {
         "count": len(rows),
         "wins": wins,
         "losses": len(rows) - wins,
         "net_pnl": net,
+        "gross_pnl": round(net + charges, 1),
+        "charges": charges,
+        "win_rate": round(wins / len(rows) * 100, 1) if rows else 0.0,
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+        "open_positions": open_pos,
+        "unrealized_pnl": round(sum(o["unrealized_pnl"] for o in open_pos), 1),
         "by_trigger": by_trigger,
         "provenance": provenance,
         # Which book these figures are drawn from, so a number can never be
@@ -3403,8 +3806,30 @@ async def trade_journal(limit: int = 500, book: str = "all") -> dict:
     }
 
 
+def _row_epoch(ts) -> float | None:
+    """A journal row's time as epoch seconds (stored as a number or ISO text)."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        import datetime as _dt
+        d = _dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
+        return d.timestamp()
+    except Exception:
+        return None
+
+
+def _in_range(t: float | None, since: float | None, until: float | None) -> bool:
+    if t is None:
+        return False
+    return (since is None or t >= since) and (until is None or t < until)
+
+
 @app.get("/api/trade-journal.csv")
-async def trade_journal_csv(limit: int = 5000, book: str = "all"):
+async def trade_journal_csv(limit: int = 5000, book: str = "all",
+                            since: float | None = None, until: float | None = None,
+                            mode: str = "all"):
     """Download the complete trade journal as CSV (spreadsheet-friendly).
     Read-only; same data as /api/journal."""
     import csv
@@ -3422,14 +3847,14 @@ async def trade_journal_csv(limit: int = 5000, book: str = "all"):
     from app.analysis import trade_provenance as prov
 
     flow_only = book.lower() == "flow"
-    rows, _seeded = prov.split(
+    rows, _seeded = prov.split(_filter_mode(
         _filter_book(
-            storage.store.journal(
+            _with_paper_books(storage.store.journal(
                 limit=max(1, min(20000, limit)),
                 exclude_flow=not flow_only, only_flow=flow_only,
-            ),
+            ), flow_only, since, until, max(1, min(20000, limit))),
             book,
-        )
+        ), mode)
     )
     # entry_trigger lets you compare PULLBACK vs REVERSAL vs IGNITION entries
     # against each other on real fills; FUT marks the futures paper book.
@@ -3447,8 +3872,11 @@ async def trade_journal_csv(limit: int = 5000, book: str = "all"):
             # tell a measured spread from an absent one. Rows written before the
             # correction carry cost_model COST_MODEL_OLD, unaltered.
             "book", "cost_model", "brokerage", "brokerage_per_order", "statutory",
+            "total_costs", "exchange", "stt", "exchange_txn", "sebi", "stamp", "gst",
             "cost_status", "entry_bid", "entry_ask", "exit_bid", "exit_ask",
             "spread_cost_rupees"]
+    if since is not None or until is not None:
+        rows = [r for r in rows if _in_range(_row_epoch(r.get("ts")), since, until)]
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     w.writeheader()
@@ -3532,7 +3960,48 @@ async def feed_health() -> dict:
         )
     except Exception as exc:
         return {"provider": provider_name, "angel_active": False, "error": str(exc)[:200]}
-    return {"provider": provider_name, "angel_active": True, **health}
+    return {"provider": provider_name, "angel_active": True, **health, "hub": _hub_counters(),
+            "warm_up": _warm_report(), "frozen_options": _frozen_options()}
+
+
+def _frozen_options(limit_sec: float = 30.0) -> list[dict]:
+    """Active instruments whose freshest ATM option price is older than limit."""
+    out = []
+    for st in registry.active():
+        try:
+            h = st.provider.feed_health()
+        except Exception:
+            continue
+        if "option_tokens_wanted" not in h:  # not the live Angel provider
+            continue
+        age = h.get("option_age_sec")
+        if age is None or age > limit_sec:
+            out.append({"instrument": st.instrument, "option_age_sec": age,
+                        "on_socket": h.get("option_tokens_on_socket"),
+                        "wanted": h.get("option_tokens_wanted")})
+    return sorted(out, key=lambda r: -(r["option_age_sec"] or 1e9))
+
+
+def _warm_report() -> dict:
+    """Which active instruments have no price yet, and why (start-up warm-up)."""
+    from app.market.instruments import UNIVERSE
+
+    return {
+        "total": _warm_state["total"], "done": _warm_state["done"],
+        "retries": _warm_state["retries"],
+        "failed": dict(_warm_state["failed"]),
+        "no_price_yet": sorted(s for s in UNIVERSE if s not in hub.latest),
+    }
+
+
+def _hub_counters() -> dict:
+    return {
+        "ws_clients": len(hub.clients),
+        "ws_send_drops": hub.ws_send_drops,
+        "ticks_abandoned": hub._ticks_abandoned,
+        "tick_errors": hub.tick_errors,
+        "cycle_errors": hub.cycle_errors,
+    }
 
 
 @app.get("/api/feed-quality")
@@ -3872,7 +4341,7 @@ async def ws(websocket: WebSocket, instrument: str | None = None) -> None:
     hub.clients[websocket] = st.instrument
     seed = hub.latest.get(st.instrument)
     if seed is not None:
-        await websocket.send_json(seed.model_dump(mode="json"))
+        await websocket.send_text(_json_text(seed.model_dump(mode="json"), st.instrument))
     try:
         while True:
             await websocket.receive_text()

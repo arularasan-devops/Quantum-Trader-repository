@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.config import settings
 from app.research.db import Database
 
 SCHEMA_VERSION = 1
@@ -177,6 +178,15 @@ ROLLBACK_SQL = [
     "DROP TABLE IF EXISTS jr_schema_migrations",
 ]
 
+SIGNAL_CSV_COLUMNS = [
+    "event_id", "ts_iso", "session_id", "instrument", "mode", "signal", "outcome",
+    "reason", "strategy", "setup", "regime", "htf_trend", "confidence", "option_symbol",
+    "quote_ltp", "bid", "ask", "expected_entry", "stop", "target1", "target2", "target3",
+    "trade_id", "data_quality", "explanation", "strategy_version", "config_fingerprint",
+    "repeat_count", "last_seen_iso",
+]
+SIGNAL_FILTERS = ("instrument", "mode", "outcome", "signal", "setup", "regime", "session_id")
+
 TRADE_CSV_COLUMNS = [
     "trade_id", "session_id", "instrument", "mode", "strategy", "setup", "regime",
     "option_symbol", "lot_size", "entry_ts_iso", "entry_price", "lots", "capital_used",
@@ -188,7 +198,11 @@ TRADE_CSV_COLUMNS = [
 
 SIGNAL_OUTCOMES = ("EXECUTED", "SKIPPED", "REJECTED", "NOT_EXECUTABLE", "FAILED_CONDITIONS")
 EVENT_KINDS = ("ENTRY", "EXIT", "PARTIAL_EXIT", "STOP_CHANGE", "TARGET_LEVEL",
-               "EXECUTION_FAILURE")
+               "EXECUTION_FAILURE", "PRICE")
+# Additive columns (v3.5): a repeated identical BUY signal updates its first row.
+_ADD_COLUMNS = (("jr_signals", "repeat_count", "INTEGER"),
+                ("jr_signals", "last_seen_ts", "DOUBLE PRECISION"),
+                ("jr_signals", "last_seen_iso", "TEXT"))
 
 
 def stable_id(*parts: Any) -> str:
@@ -223,6 +237,14 @@ class JournalStore:
             "ON CONFLICT (version) DO NOTHING",
             (1, int(time.time()), "jr_sessions/signals/trades/trade_events/sizing_decisions"),
         )
+        for table, col, typ in _ADD_COLUMNS:
+            try:
+                if self.db.is_postgres:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
+                else:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            except Exception:  # sqlite: column already exists
+                pass
 
     @property
     def backend(self) -> str:
@@ -271,8 +293,18 @@ class JournalStore:
                 "config_fingerprint", "data_quality", "explanation"]
         data = {"event_id": eid, "ts": float(row["ts"]), "ts_iso": iso(row["ts"])}
         data.update({c: row.get(c) for c in cols})
+        data["repeat_count"] = 1
+        data["last_seen_ts"] = data["ts"]
+        data["last_seen_iso"] = data["ts_iso"]
         self._insert("jr_signals", "event_id", data)
         return eid
+
+    def touch_signal(self, event_id: str, ts: float) -> None:
+        """The same BUY signal fired again with the same outcome and reason."""
+        self.db.execute(
+            "UPDATE jr_signals SET repeat_count = COALESCE(repeat_count, 1) + 1, "
+            "last_seen_ts = ?, last_seen_iso = ? WHERE event_id = ?",
+            (float(ts), iso(ts), event_id))
 
     def open_trade(self, row: dict) -> str:
         _require(row, "trade_id", "instrument", "mode", "entry_ts")
@@ -285,6 +317,33 @@ class JournalStore:
         data["status"] = "OPEN"
         self._insert("jr_trades", "trade_id", data)
         return row["trade_id"]
+
+    def find_open_trade(self, instrument: str, option_symbol: str | None,
+                        mode: str, since_ts: float) -> str | None:
+        """The OPEN trade row for this contract, so a re-recorded entry (restart,
+        pending-order resolution) reuses it instead of adding a duplicate."""
+        row = self.db.query_one(
+            "SELECT trade_id FROM jr_trades WHERE instrument = ? AND option_symbol = ? "
+            "AND mode = ? AND status = 'OPEN' AND entry_ts >= ? "
+            "ORDER BY entry_ts DESC LIMIT 1",
+            (instrument, option_symbol, mode, since_ts))
+        return row["trade_id"] if row else None
+
+    def open_trade_rows(self, instrument: str, option_symbol: str | None,
+                        mode: str, since_ts: float) -> list[dict]:
+        return self.db.query(
+            "SELECT trade_id, entry_price, lots FROM jr_trades WHERE instrument = ? "
+            "AND option_symbol = ? AND mode = ? AND status = 'OPEN' AND entry_ts >= ? "
+            "ORDER BY entry_ts DESC",
+            (instrument, option_symbol, mode, since_ts))
+
+    def abandon_trade(self, trade_id: str, ts: float, reason: str) -> None:
+        """Close an OPEN row whose position no longer exists. No P&L is booked:
+        the exit price was never observed."""
+        self.db.execute(
+            "UPDATE jr_trades SET status = 'CLOSED', exit_ts = ?, exit_ts_iso = ?, "
+            "exit_reason = ? WHERE trade_id = ? AND status = 'OPEN'",
+            (float(ts), iso(ts), reason, trade_id))
 
     def record_trade_event(self, row: dict) -> str:
         _require(row, "trade_id", "instrument", "ts", "kind")
@@ -382,6 +441,8 @@ class JournalStore:
         filters = dict(filters or {})
         where, params = self._where(filters, "entry_ts", (
             "instrument", "mode", "strategy", "setup", "regime", "status"))
+        if str(filters.get("auto") or "").lower() in ("1", "true", "yes"):
+            where += (" AND " if where else " WHERE ") + "substr(entry_explanation, 1, 11) = 'auto entry;'"
         result = (filters.get("result") or "").upper()
         if result in ("WIN", "LOSS"):
             where += (" AND " if where else " WHERE ") + "status = 'CLOSED' AND net_pnl " + (
@@ -425,7 +486,13 @@ class JournalStore:
             (trade_id,))
         signals = self.db.query(
             "SELECT * FROM jr_signals WHERE trade_id = ? ORDER BY ts ASC", (trade_id,))
-        return {"trade": trade, "events": events, "sizing": sizing, "signals": signals}
+        path = [{"ts": e["ts"], "ltp": e["price"],
+                 "bid": (e.get("detail") or {}).get("bid") if isinstance(e.get("detail"), dict) else None,
+                 "ask": (e.get("detail") or {}).get("ask") if isinstance(e.get("detail"), dict) else None}
+                for e in events if e["kind"] == "PRICE"]
+        events = [e for e in events if e["kind"] != "PRICE"]
+        return {"trade": trade, "events": events, "sizing": sizing, "signals": signals,
+                "path": path}
 
     def list_sessions(self, filters: dict | None = None, page: int = 1,
                       page_size: int = 50) -> dict:
@@ -443,14 +510,69 @@ class JournalStore:
     def list_signals(self, filters: dict | None = None, page: int = 1,
                      page_size: int = 50) -> dict:
         filters = dict(filters or {})
-        where, params = self._where(filters, "ts", (
-            "instrument", "mode", "outcome", "signal", "setup", "regime", "session_id"))
+        where, params = self._where(filters, "ts", SIGNAL_FILTERS)
         page, page_size = self._page(page, page_size)
         total = self.db.query_one(f"SELECT COUNT(*) AS n FROM jr_signals{where}", params)["n"]
+        # The signal row is the original snapshot; the linked paper trade's
+        # current status / realized P&L are joined in, never written back.
         rows = self.db.query(
-            f"SELECT * FROM jr_signals{where} ORDER BY ts DESC, event_id ASC LIMIT ? OFFSET ?",
+            "SELECT jr_signals.*, "
+            "(SELECT t.status FROM jr_trades t WHERE t.trade_id = jr_signals.trade_id) "
+            "AS trade_status, "
+            "(SELECT t.net_pnl FROM jr_trades t WHERE t.trade_id = jr_signals.trade_id "
+            "AND t.status = 'CLOSED') AS trade_net_pnl, "
+            "(SELECT t.exit_reason FROM jr_trades t WHERE t.trade_id = jr_signals.trade_id) "
+            f"AS trade_exit_reason FROM jr_signals{where} "
+            "ORDER BY ts DESC, event_id ASC LIMIT ? OFFSET ?",
             [*params, page_size, (page - 1) * page_size])
+        for r in rows:
+            r["auto_eligible"] = (
+                (r.get("setup") or "").upper() in {t.upper() for t in settings.auto_trade_allowed_triggers}
+                and (r.get("regime") or "").upper() in {g.upper() for g in settings.auto_trade_allowed_regimes}
+            )
         return {"items": rows, "total": int(total), "page": page, "page_size": page_size}
+
+    def signals_csv(self, filters: dict | None = None) -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(SIGNAL_CSV_COLUMNS)
+        page = 1
+        while True:
+            chunk = self.list_signals(filters, page=page, page_size=MAX_PAGE_SIZE)
+            for r in chunk["items"]:
+                writer.writerow(["" if r.get(c) is None else r.get(c) for c in SIGNAL_CSV_COLUMNS])
+            if page * MAX_PAGE_SIZE >= chunk["total"]:
+                break
+            page += 1
+        return buf.getvalue()
+
+    def signal_summary(self, filters: dict | None = None, top_reasons: int = 10) -> dict:
+        """Counts of recorded signals by outcome / setup / regime, plus the most
+        frequent skip reasons, over the same filters as list_signals."""
+        where, params = self._where(dict(filters or {}), "ts", SIGNAL_FILTERS)
+
+        def group(col: str) -> dict:
+            rows = self.db.query(
+                f"SELECT COALESCE({col}, '') AS k, COUNT(*) AS n FROM jr_signals{where} "
+                f"GROUP BY COALESCE({col}, '') ORDER BY n DESC", params)
+            return {(r["k"] or "—"): int(r["n"]) for r in rows}
+
+        reason_where = (where + " AND " if where else " WHERE ") + "outcome <> ?"
+        reasons = self.db.query(
+            f"SELECT COALESCE(reason, '') AS reason, COUNT(*) AS n FROM jr_signals{reason_where} "
+            "GROUP BY COALESCE(reason, '') ORDER BY n DESC LIMIT ?",
+            [*params, "EXECUTED", int(top_reasons)])
+        span = self.db.query_one(
+            f"SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM jr_signals{where}",
+            params)
+        return {
+            "total": int(span["n"]),
+            "first_ts_iso": iso(span["first_ts"]), "last_ts_iso": iso(span["last_ts"]),
+            "by_outcome": group("outcome"), "by_setup": group("setup"),
+            "by_regime": group("regime"),
+            "top_skip_reasons": [{"reason": r["reason"] or "—", "count": int(r["n"])}
+                                 for r in reasons],
+        }
 
     def counts(self) -> dict:
         out = {}

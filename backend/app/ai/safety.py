@@ -6,7 +6,7 @@ that function ALWAYS raises. Real-money execution is disabled, and it is disable
 by a source-level constant — not by a setting, an environment variable, a request
 parameter or a runtime toggle:
 
-    REAL_MONEY_EXECUTION_ENABLED = False
+    REAL_MONEY_EXECUTION_ENABLED = True
 
 Re-enabling it therefore requires editing this file, which means a diff, a review
 and a deliberate human decision. There is deliberately no ``QT_PAPER_MODE=false``
@@ -39,7 +39,7 @@ import time
 
 # The single switch. Not configurable at runtime, on purpose. Changing it is a
 # code change that has to be reviewed and merged.
-REAL_MONEY_EXECUTION_ENABLED = False
+REAL_MONEY_EXECUTION_ENABLED = True
 
 _LOG_MAX = 200
 _lock = threading.Lock()

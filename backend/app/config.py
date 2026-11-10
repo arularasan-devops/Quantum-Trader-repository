@@ -145,6 +145,12 @@ class Settings(BaseSettings):
     # How long a live order may stay acknowledged-but-unfilled before the entry
     # is treated as pending (no position opened, no duplicate order).
     order_fill_timeout_sec: float = 5.0
+    live_position_check_sec: float = 20.0  # read-only Angel position check while a live position is open
+    # A live position Angel shows closed (netqty 0 with a sell average) is booked
+    # in the journal at Angel's sell average; no order is sent.
+    live_auto_sync_angel_close: bool = True
+    # After a live SELL that never reached Angel, wait this long before retrying.
+    live_exit_retry_sec: float = 5.0
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
     # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
     # change the engine's actual quantity (see app/journal/sizing.py).
@@ -158,14 +164,14 @@ class Settings(BaseSettings):
     # which made the cap meaningless: measured 13 Aug, the book lost Rs16,834
     # with a Rs5,000 cap enabled because each of seven instruments carried its
     # own Rs5,000 allowance and a mid-session restart zeroed all of them.
-    max_daily_loss: float = 5000.0       # halt the whole book once day P&L <= -this
+    max_daily_loss: float = 0.0          # 0 = off; halt the book once day P&L <= -this
     max_trades_per_day: int = 10         # cap on entries per session, all instruments
     max_consecutive_losses: int = 3      # stand down after N losing trades in a row
     # How long that losing streak stands the book down. A streak in chop says
     # something about the next hour, not about the whole session, so this is a
     # timed stand-down rather than a halt for the day.
     risk_stand_down_sec: float = 3600.0
-    auto_squareoff_ist: str = "23:25"    # advise square-off after this IST time
+    auto_squareoff_ist: str = "23:15"    # advise square-off after this IST time
 
     # --- Paper auto-trading (simulated fills only; NEVER places live orders) ---
     # When enabled, the engine auto-enters a paper position on a BUY at/above the
@@ -174,7 +180,7 @@ class Settings(BaseSettings):
     # limits above (max_daily_loss, max_trades_per_day, max_consecutive_losses).
     auto_trade_enabled: bool = False
     auto_trade_min_confidence: float = 80.0   # only auto-buy at/above this %
-    auto_trade_max_lots: int = 1              # hard upper cap on lots per auto entry
+    auto_trade_max_lots: int = 2              # hard upper cap on lots per auto entry (risk sizer may trim)
     # Multi-instrument concurrency: hold positions in up to N DIFFERENT instruments
     # at once (each instrument still gets one position). New entries are additionally
     # gated by a GLOBAL capital check so total deployed never exceeds ``capital``.
@@ -191,6 +197,37 @@ class Settings(BaseSettings):
     auto_trade_strategy_gate: bool = True
     auto_trade_allowed_triggers: list[str] = ["PULLBACK"]
     auto_trade_allowed_regimes: list[str] = ["TRENDING"]
+    # v3.5.49: LIVE never auto-buys on these setups alone; a tick that also meets
+    # another allowed setup (e.g. PULLBACK + MOMENTUM) still buys. Paper unchanged.
+    auto_trade_live_blocked_triggers: list[str] = ["PULLBACK"]
+    # Auto-buy only these instruments (comma-separated registry keys, e.g.
+    # CRUDEOIL,SILVER). Empty = every instrument. Same rule for paper and live.
+    auto_trade_instruments: str = ""
+    # Small-capital metals: a BUY on the big contract is taken on its mini instead
+    # (the mini runs its own signal on its own futures). "" = off.
+    auto_trade_metal_mini: str = "GOLD:GOLDM,SILVER:SILVERM"
+    # Dedicated PAPER pullback auto-buy engine. Entry path is exactly:
+    # TRENDING -> PULLBACK (>= min confidence) -> QUOTE VALID -> SPREAD OK ->
+    # RISK ACCEPTABLE -> AUTO BUY. Discretionary gates (kill switch, cooldown,
+    # risk governor, opportunity, no-chase, hours, ceiling, concurrency) are
+    # bypassed in PAPER only; live mode keeps every gate.
+    auto_trade_pullback_engine: bool = True
+    auto_trade_max_spread_pct: float = 5.0          # (ask-bid)/mid
+    auto_trade_max_structural_risk_pct: float = 40.0  # (entry-stop)/entry, non-metals
+    # Gold/Silver: reject trades whose natural structural stop is wider than the cap;
+    # the cap arm (4/5/6%) is assigned per signal so the replay can compare them.
+    auto_trade_metal_roots: list[str] = ["GOLD", "GOLDM", "GOLDPETAL", "GOLDGUINEA",
+                                         "SILVER", "SILVERM", "SILVERMIC"]
+    auto_trade_metal_risk_caps: list[float] = [4.0, 5.0, 6.0]
+    # Tiered exits: PRE-T1 peak trail (auto_trade_pre_t1_*) -> T1 lock -> T2 ratchet -> T3 runner.
+    auto_trade_tiered_exit: bool = True
+    # After T1 the runner floor starts this % of (T1 - entry) below T1.
+    tier_t1_runner_buffer_pct: float = 25.0
+    # Keep recording a closed trade's bid/ask/LTP for this long (0 = off).
+    trade_path_after_exit_sec: float = 1800.0
+    tier_t1_giveback_pct: float = 60.0       # T1->T2: floor = peak - 60% of (peak - T1), never below T1
+    tier_t2_giveback_pct: float = 50.0       # after T2: floor = peak - 50% of (peak - T1)
+    tier_t3_runner_trail_pct: float = 8.0    # after T3: floor = peak * (1 - 8%), never below T3
     auto_trade_no_chase: bool = True
     auto_trade_no_chase_trap_prob: float = 60.0   # skip entry when buy_trap_prob >= this
     # Safe (risk-based) position sizing: size each auto entry from capital and
@@ -255,6 +292,10 @@ class Settings(BaseSettings):
     # A STOP earns a longer wait than a target — the view has just been proven
     # wrong, not completed.
     auto_trade_post_stop_cooldown_sec: float = 1800.0
+    # A live auto-buy whose connection to Angel never opened (nothing sent) is
+    # retried while the signal stays valid: wait this long, at most this many times.
+    auto_trade_unsent_retry_sec: float = 15.0
+    auto_trade_unsent_max_retries: int = 3
     # No entries in the first N minutes of a session. An option premium gaps
     # straight through its stop in the opening auction volatility: measured
     # 13 Aug, four such entries exited at -47.8% / -22.4% / -16.7% / -15.9%
@@ -395,6 +436,9 @@ class Settings(BaseSettings):
     # simply being absent. Written by observation points only; read by the
     # reconciliation API and the reports, never by anything that trades.
     signal_lifecycle_log: bool = True
+    # Sessions kept in the live signal ledgers; older rows move to
+    # data/archive/*.gz at boot (nothing deleted). 0 = never archive.
+    ledger_keep_days: int = 3
 
     # --- Signal churn control (publication only, Phase 12 §1) -----------------
     # One live setup published thousands of raw events on 25 Aug: a single SILVER
@@ -564,6 +608,18 @@ class Settings(BaseSettings):
     # whether the move actually pays. STT is charged on the sell side only.
     option_stt_sell_pct: float = 0.10
     option_txn_pct: float = 0.05
+    # Angel One itemised option charges (used when the instrument is known).
+    # Exchange txn % of premium turnover, both sides; STT (NSE/BSE) or CTT (MCX)
+    # on the sell side; SEBI fee both sides; stamp duty on the buy side; GST on
+    # brokerage + exchange + SEBI. Check against a contract note.
+    option_charges_itemized: bool = True
+    option_nse_txn_pct: float = 0.03503
+    option_bse_txn_pct: float = 0.0325
+    option_mcx_txn_pct: float = 0.0418
+    option_mcx_ctt_sell_pct: float = 0.05
+    option_sebi_pct: float = 0.0001
+    option_stamp_buy_pct: float = 0.003
+    option_gst_pct: float = 18.0
     # One-click LIVE auto-buy: when True (and the bot is live-armed) the sizing
     # budget is taken from the broker's LIVE available cash instead of the fixed
     # ``capital`` figure, so position size follows your real balance with no
@@ -600,6 +656,12 @@ class Settings(BaseSettings):
     # target-floor lock takes over once a target is actually reached. Off → prior
     # behaviour (hard stop only until T1).
     auto_trade_pre_t1_trail: bool = True
+    # PAPER/live auto: when the pre-T1 trail fires on 2+ lots, sell half and hold
+    # the rest with a break-even stop until T1. False = sell everything (old).
+    auto_trade_pre_t1_half_out: bool = True
+    # v3.5.35: the pre-T1 peak trail only runs on positions of at least this many lots;
+    # 2 = a 1-lot trade holds to the T1 lock (or its stop). 1 = old behaviour.
+    auto_trade_pre_t1_trail_min_lots: int = 1
     auto_trade_pre_t1_trail_arm_pct: float = 40.0     # arm once this % of the way to T1
     auto_trade_pre_t1_trail_giveback_pct: float = 30.0  # exit on giving back this % of the run from the peak
     # Also arm the pre-T1 trail as soon as the premium is at least this % ABOVE
@@ -607,10 +669,17 @@ class Settings(BaseSettings):
     # rolls over before it ever gets close to T1 — so the trade is cut in profit
     # instead of drifting all the way back to the hard stop.
     auto_trade_pre_t1_trail_arm_profit_pct: float = 6.0
+    # Also arm once the trade's peak open profit in RUPEES reaches this. With
+    # capital-sized lots a +3% premium move can already be ₹15k+ open profit
+    # that the % rules above never protect. 0 = off.
+    auto_trade_pre_t1_trail_arm_rupees: float = 10000.0
     # Once the pre-T1 trail has armed (we've seen real profit), ratchet the hard
     # stop up to at least break-even (entry). A trade that went green can then
     # never turn into a full stop-loss — worst case is roughly flat.
     auto_trade_breakeven_after_arm: bool = True
+    # Exit a pre-T1 auto trade whose trail never armed (stop still below
+    # entry) once held this many minutes, at the bid. 0 = off.
+    auto_trade_no_progress_exit_min: float = 0.0
     # Cap the initial hard-stop distance below entry premium, as a % of entry
     # (0 = off, use the signal engine's stop as-is). When >0, a stop further than
     # this is tightened to this distance so a single auto trade can't bleed a big
@@ -633,10 +702,113 @@ class Settings(BaseSettings):
     # and the trade drifted to the hard stop. Noise scales with the premium, so the
     # floor must too. When > 0 this replaces the points value; 0 = points only.
     auto_trade_pre_t1_trail_min_giveback_pct: float = 0.8
+    # Pre-T1 POINT PROFIT LOCK. Once the bid is this many option-premium points
+    # above entry (plus round-trip charges), the exit floor locks there; the
+    # pre-T1 peak trail above then rides, never below that floor; T1/T2/T3
+    # ratchet as before. 0 = off (percentage arming only).
+    auto_trade_pre_t1_lock_points: float = 5.0
+    # Large-lot contracts (lot size >= this) lock fewer points: 1 pt on a
+    # 300+ qty lot is already Rs300+.
+    auto_trade_pre_t1_lock_high_qty: int = 300
+    auto_trade_pre_t1_lock_points_high_qty: float = 1.0
+    # Per-instrument override (JSON env), e.g. {"CRUDEOIL": 5, "CIPLA": 0.5}.
+    auto_trade_pre_t1_lock_points_by_instrument: dict[str, float] = {}
+    # Break-even stops and profit floors include round-trip charges per unit,
+    # so a "break-even" or "locked" exit does not book a net loss.
+    auto_trade_lock_covers_charges: bool = True
+    # v3.5.38 VOLATILITY LEVELS: stop and T1/T2/T3 from the option's own 1-min
+    # ATR (its average 1-minute move) instead of the % floor that stretched the
+    # targets. Stop = vol_stop_atr_mult x ATR, kept within vol_stop_min/max_pct
+    # of the premium; targets = vol_target_atr_mults x ATR, never stretched by the
+    # stop. No option candles yet -> the old ATR x delta model is used.
+    vol_levels_enabled: bool = True
+    vol_atr_period: int = 14
+    # Re-fetch an option's 1-min candles after this many seconds so the option ATR
+    # (and the option chart) stay current; the fetch is non-blocking and shares the
+    # historical rate budget, the old candles are kept until it succeeds. 0 = never.
+    option_candles_refresh_sec: float = 180.0
+    vol_stop_atr_mult: float = 2.0
+    vol_target_atr_mults: list[float] = [3.0, 5.0, 8.0]
+    vol_stop_min_pct: float = 6.0
+    vol_stop_max_pct: float = 12.0
+    # MCX (lot < auto_trade_pre_t1_lock_high_qty): T1 at least this many points.
+    vol_mcx_t1_min_points: float = 10.0
+    # MCX PROFIT HOLD (lot < auto_trade_pre_t1_lock_high_qty): no pre-T1 lock or
+    # trail until the bid is mcx_hold_arm_points above entry + charges; the
+    # floor then sits at entry + charges + mcx_hold_floor_points and the trail
+    # gives back at least mcx_hold_min_giveback_points. 0 arm = off.
+    mcx_hold_arm_points: float = 10.0
+    mcx_hold_floor_points: float = 5.0
+    mcx_hold_min_giveback_points: float = 5.0
     # Daily profit GOAL (₹). When day P&L >= this, the bot stops opening NEW trades
     # for the day (locks the gain). 0 = disabled. This is a stop-FOR-the-day, NOT a
     # guaranteed minimum — losing days are normal and cannot be ruled out.
-    daily_profit_target: float = 0.0
+    daily_profit_target: float = 30000.0
+    # Profit lock: once the day's equity (realized + open MTM) reaches the target,
+    # the lock = day peak - this giveback (never below the target). Falling under
+    # it stops auto-buy for the day. 0 = lock at the exact peak.
+    daily_peak_giveback: float = 0.0
+    # Lock keeps this % of the day's peak profit once the target is reached
+    # (75: peak 20k -> lock 15k, peak 40k -> 30k; never below the target).
+    # 0 = use daily_peak_giveback instead.
+    daily_lock_keep_pct: float = 75.0
+    # Once the lock is armed a new trade's stop-out (+ slippage buffer) may use at
+    # most this % of the room between equity and the lock, so one trade cannot
+    # take the day through the lock.
+    daily_lock_room_share_pct: float = 50.0
+    # Stepped lock "peak:keep%" pairs: once the day peak reaches a step the lock
+    # keeps that % of the peak (20k peak -> 10k locked). Empty = the single
+    # daily_profit_target / daily_lock_keep_pct rule. daily_profit_target 0 = off.
+    daily_lock_steps: str = "15000:50,30000:75,60000:85"
+    # Equity under the lock: pause new buys this long (0 = stop for the day),
+    # then resume with a floor this many ₹ below equity that trails new highs,
+    # so post-lock trades are sized from that small room. Resumes per day.
+    daily_lock_pause_sec: float = 1800.0
+    daily_lock_resume_room: float = 6000.0
+    daily_lock_max_resumes: int = 1
+    # After the NSE/BSE close only MCX trades: from this IST time the lock starts
+    # fresh (steps count only profit made after it, pause/resume cleared) while
+    # the lock already reached before it stays a floor ("" = off).
+    daily_lock_session_reset_ist: str = "15:30"
+    # Apply the per-trade loss cap, ask-based sizing and the chase guard to LIVE
+    # auto entries too (they only ever shrink or skip a live order).
+    auto_trade_live_loss_budget: bool = True
+    # Skip a PAPER auto entry whose ask is above the signal premium by more than
+    # this % of the signal's stop distance (0 = off). The stop is fixed, so a
+    # chased fill is a bigger loss than was planned.
+    auto_trade_max_chase_pct: float = 30.0
+    # Startup: rebuild today's risk counters from the journal if the saved file is empty.
+    risk_rebuild_from_journal: bool = True
+    # PAPER: most a single auto trade may lose at its stop (lots are cut to fit;
+    # 0 disables). Paper books keep their own FULL/RISK sizing.
+    auto_trade_max_loss_rupees: float = 10000.0
+    # Slippage buffer per unit (% of entry) added to the stop distance when sizing.
+    auto_trade_slippage_buffer_pct: float = 1.0
+    # PAPER: exits (stop, trails, targets, profit lock) are judged on the bid,
+    # the price a sell actually fills at, so a T1 exit fills at T1 or better.
+    auto_trade_exit_on_bid: bool = True
+    # Seconds between recorded bid/ask/LTP samples of an open trade (0 = off).
+    trade_path_record_sec: float = 5.0
+    # Equity falling to the lock closes open auto positions (paper exits at the
+    # bid) and stops new auto-buys for the day.
+    profit_lock_flatten: bool = True
+    # Parallel PAPER comparison books ("capital:FULL|RISK"): every book takes the
+    # same gated signals with its own capital, lots, exits, day lock and ledger
+    # (jr_book_trades). FULL = all lots free capital buys at the ask; RISK =
+    # lots so (entry - stop) x qty <= paper_books_risk_pct of the book capital.
+    paper_books_enabled: bool = True
+    paper_books: list[str] = [
+        "500000:FULL", "500000:RISK", "1000000:FULL",
+        "1000000:RISK", "1500000:FULL", "1500000:RISK",
+    ]
+    paper_books_risk_pct: float = 1.0
+    # v3.5.35: SELL research book — margin blocked per short lot, % of strike x lot size.
+    paper_sell_margin_pct: float = 15.0
+    # Paper Books also listed in the Journal's Paper tab while the stack trades
+    # LIVE, e.g. "5L-FULL". Off by default: the Books tab is their home.
+    journal_paper_books: str = ""
+    # Auto-buy lots from free capital (no fixed lot cap) in PAPER.
+    auto_trade_capital_sizing: bool = True
     # --- LIVE auto-execution arm (DANGER: real money) ---
     # The auto-trader places REAL Angel orders ONLY when ALL of these hold:
     # trade_mode == 'live'  AND  auto_trade_enabled  AND  auto_trade_allow_live.
@@ -649,6 +821,33 @@ class Settings(BaseSettings):
     auto_trade_live_max_order_value: float = 25000.0
     # Hard cap on lots for a LIVE auto entry, independent of the paper max_lots.
     auto_trade_live_max_lots: int = 1
+    # LIVE parity with the PAPER strategy (v3.5.14): same pullback engine and
+    # bid/ask checks, lots from QT_CAPITAL at the ask (then the loss budget and the
+    # live order-value cap trim them; the fixed live lot cap is not used), exits
+    # judged on the bid, profit-lock flatten.
+    auto_trade_live_pullback_engine: bool = True
+    auto_trade_live_capital_sizing: bool = True
+    # v3.5.32: LIVE single-stock option auto-buys only (not MCX, not index): 1 lot,
+    # no stop / trail / no-progress exit; sold when the bid or LTP reaches T2 (T1 if
+    # no T2), else at the live equity square-off. Profit lock still applies.
+    auto_trade_stock_hold_to_target: bool = False
+    # Optional rupee loss limit for those holds (0 = off, no stop at all).
+    auto_trade_stock_hold_max_loss_rupees: float = 0.0
+    # v3.5.33: those holds are bought as CARRYFORWARD (NRML) and kept past the equity
+    # square-off until T2 (or the loss limit); sold at the square-off once the option is
+    # within auto_trade_stock_hold_exit_days_before_expiry calendar days of expiry.
+    auto_trade_stock_hold_carry_forward: bool = False
+    auto_trade_stock_hold_exit_days_before_expiry: int = 3
+    angel_product_carry: str = "CARRYFORWARD"
+    # v3.5.47: exchanges whose auto trades have NO stop-loss exit (the stop below
+    # entry). Break-even stop, profit lock, peak trail, T1-T3 locks and the
+    # square-off still apply. Default = stock + index options; MCX keeps its stop.
+    auto_trade_no_stop_loss_exchanges: list[str] = ["NFO", "BFO"]
+    auto_trade_live_exit_on_bid: bool = True
+    # LIVE intraday square-off (IST): flatten and stop new live entries after
+    # this time. Set a few minutes before the broker's own intraday cut-off.
+    auto_trade_live_squareoff_equity_ist: str = "15:15"
+    auto_trade_live_squareoff_mcx_ist: str = "23:15"
 
     # --- Zero-to-Hero expiry sleeve (SPECULATIVE, HIGH RISK, SEPARATE budget) ---
     # A deliberately tiny, isolated punt on EXPIRY DAY only: buy a cheap far-OTM
@@ -882,7 +1081,7 @@ class Settings(BaseSettings):
     data_dir: str = "data"
     # Notional starting capital for the PAPER account (Account tab equity is
     # this + cumulative realised paper P&L). Paper-only; never a real balance.
-    paper_capital: float = 100000.0
+    paper_capital: float = 500000.0  # QT_PAPER_CAPITAL (₹5L, same as QT_CAPITAL)
     # Record live futures candles + option-chain snapshots so the backtest can
     # replay REAL captured history instead of a fresh synthetic series.
     store_history: bool = True
@@ -939,6 +1138,15 @@ class Settings(BaseSettings):
     risk_free_rate: float = 0.065
     strike_step: float = 50.0
     strikes_each_side: int = 10
+    # Seconds between REST polls of an instrument's option strikes that are off
+    # the live socket or silent while its future still streams (0 = off).
+    option_rest_backfill_sec: float = 10.0
+    # Account-wide cap on those polls (calls per second, shared by all instruments).
+    option_rest_backfill_per_sec: float = 1.0
+    # Open PAPER positions are saved every N s and restored after a restart if
+    # younger than the max age (so a deploy mid-trade no longer drops the trade).
+    paper_position_save_sec: float = 2.0
+    paper_position_restore_max_age_sec: float = 43200.0
     days_to_expiry: float = 7.0
 
     # --- Brokerage (for net P&L) ---

@@ -617,6 +617,7 @@ export interface SignalScanRow {
   regime: { label: string; color: string; raw: string };
   spot: number;
   change_pct: number;
+  in_position?: boolean;
 }
 
 export interface SignalScan {
@@ -703,6 +704,7 @@ export interface AutoTradeHistoryRow {
 export interface AutoTradeState {
   enabled: boolean;
   mode: string;
+  kill_switch?: boolean;
   min_confidence: number;
   max_lots: number;
   in_position: boolean;
@@ -823,6 +825,12 @@ export interface Snapshot {
   futures_prev_close: number | null;
   option_day_high: number | null;
   option_day_low: number | null;
+  atm_ce_symbol?: string | null;
+  atm_ce_premium?: number | null;
+  atm_pe_symbol?: string | null;
+  atm_pe_premium?: number | null;
+  display_option_symbol?: string | null;
+  display_option_premium?: number | null;
   market_open: boolean;
   session_note: string | null;
   data_source: string;

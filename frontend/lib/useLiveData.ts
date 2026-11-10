@@ -25,18 +25,47 @@ export function useLiveData(instrument?: string) {
       .then((d) => !closed && setSnap(d))
       .catch(() => {});
 
+    // A socket can stay "open" while no frames arrive (sleeping laptop, proxy,
+    // half-dead TCP). Without a watchdog the UI then keeps showing a frozen LTP
+    // as LIVE, so a silent socket is closed and re-opened with backoff.
+    let attempt = 0;
+    let lastMsgAt = Date.now();
+    const STALL_MS = 6000;
+    const watchdog = setInterval(() => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN && Date.now() - lastMsgAt > STALL_MS) {
+        ws.close();
+      }
+    }, 2000);
+
     const connect = () => {
+      if (closed) return;
       const ws = new WebSocket(`${WS_BASE}/ws${qs}`);
       wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        attempt = 0;
+        lastMsgAt = Date.now();
+        setConnected(true);
+      };
       ws.onmessage = (e) => {
+        lastMsgAt = Date.now();
         try {
-          setSnap(JSON.parse(e.data));
+          const d = JSON.parse(e.data);
+          setSnap((prev) =>
+            prev && typeof prev.time === "number" && typeof d.time === "number"
+              && d.instrument === prev.instrument && d.time < prev.time
+              ? prev
+              : d,
+          );
         } catch {}
       };
       ws.onclose = () => {
+        if (wsRef.current !== ws) return;
         setConnected(false);
-        if (!closed) retry = setTimeout(connect, 1500);
+        if (closed) return;
+        const base = Math.min(15000, 1000 * 2 ** attempt);
+        attempt = Math.min(attempt + 1, 4);
+        retry = setTimeout(connect, base / 2 + Math.random() * (base / 2));
       };
       ws.onerror = () => ws.close();
     };
@@ -45,7 +74,10 @@ export function useLiveData(instrument?: string) {
     return () => {
       closed = true;
       clearTimeout(retry);
-      wsRef.current?.close();
+      clearInterval(watchdog);
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close();
     };
   }, [instrument]);
 

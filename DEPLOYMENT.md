@@ -102,6 +102,38 @@ Schema: the research store applies additive migrations on startup and records
 them in `schema_migrations` (see `/api/db/status`). Inside Compose the backend
 always uses `postgres:5432` (never `localhost`).
 
+## Windows (Docker Desktop) — PowerShell
+
+Run from the repository root (the folder containing `docker-compose.yml`),
+with Docker Desktop running (`docker info` must succeed).
+
+```powershell
+cd C:\path\to\Quantum-Trader-repository
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }   # then edit .env: POSTGRES_PASSWORD
+docker compose config -q                       # validates; errors if POSTGRES_PASSWORD is unset
+docker compose up -d --build                   # first boot ~1-4 min (health start_period 240s)
+docker compose ps                              # backend/frontend/postgres/redis -> (healthy)
+Invoke-RestMethod http://localhost:8000/health           # trade_mode: paper, mode_error: null
+Invoke-RestMethod http://localhost:8000/api/db/status    # backend: postgresql
+(Invoke-RestMethod http://localhost:8000/api/settings).auto_trade | Select-Object enabled,mode,min_confidence,capital,mode_error
+Start-Process http://localhost:3000                      # dashboard; Journal tab = persisted trades
+docker compose logs -f backend                 # Ctrl+C stops following, not the app
+docker compose restart backend                 # paper account + journal persist (volumes)
+docker compose stop                            # stop, keep containers and data
+docker compose up -d                           # start again
+docker compose down                            # remove containers, KEEP volumes/data
+# never `docker compose down -v` unless you mean to delete the PostgreSQL data
+```
+
+Paper auto-trading: `.env.example` ships `QT_TRADE_MODE=paper`,
+`QT_AUTO_TRADE_ENABLED=true`, `QT_AUTO_TRADE_MIN_CONFIDENCE=80`, `QT_CAPITAL=500000`.
+Entries are backend-gated to `PULLBACK` in a `TRENDING` regime; every skipped
+BUY is journaled with its reason. An unrecognised `QT_TRADE_MODE` disables the
+auto-trader at startup and `/health` shows `mode_error` with the fix.
+
+If `localhost:8000` answers but `/health` lacks `mode_error`, another backend
+(e.g. a host `uvicorn`) owns the port: `Get-NetTCPConnection -LocalPort 8000`.
+
 ## Live feed / live trading (operator only)
 1. Put Angel One credentials in `.env` yourself (`SMARTAPI_*`), set
    `QT_DATA_PROVIDER=angelone`. Never share them with an AI agent.

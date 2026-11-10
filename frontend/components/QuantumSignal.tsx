@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { QuantumSignalView, SignalScan } from "@/lib/types";
-import { fetchSignal, fetchSignalScan } from "@/lib/api";
+import { fetchSignal, fetchSignalScan, hasLiveToken, sellPosition, setAutoLevels, setLiveToken } from "@/lib/api";
 import FuturesChart from "@/components/FuturesChart";
 import AutoBotPanel from "@/components/AutoBotPanel";
 import { playBuySound, playExitSound } from "@/lib/sound";
@@ -47,9 +47,21 @@ export default function QuantumSignal({
   const [scan, setScan] = useState<SignalScan | null>(null);
   const [auto, setAuto] = useState(true);
   const [stale, setStale] = useState(false);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoRef = useRef(auto);
   autoRef.current = auto;
+  // An instrument picked anywhere else (top bar, position chip) must stick:
+  // only a jump made by the auto-scan itself keeps Auto on.
+  const autoPick = useRef<string | null>(null);
+  const firstInstrument = useRef(true);
+  useEffect(() => {
+    if (firstInstrument.current) {
+      firstInstrument.current = false;
+      return;
+    }
+    if (instrument !== autoPick.current) setAuto(false);
+  }, [instrument]);
   // Sound on bot entry/exit: fire a chime whenever the bot posts a NEW action
   // whose text is a BUY (entry) or EXIT. Tracks the last-action timestamp so we
   // only play once per event and never on the first render.
@@ -84,7 +96,9 @@ export default function QuantumSignal({
         .then((s) => {
           if (!alive) return;
           setScan(s);
-          if (autoRef.current && s.best_actionable && s.best_actionable !== instrument) {
+          const holding = s.rows.some((r) => r.instrument === instrument && r.in_position);
+          if (autoRef.current && !holding && s.best_actionable && s.best_actionable !== instrument) {
+            autoPick.current = s.best_actionable;
             onInstrument(s.best_actionable);
           }
         })
@@ -129,6 +143,30 @@ export default function QuantumSignal({
   const p = view.plan;
   const at = view.auto_trade;
   const ent = at?.entry ?? null;
+  const ensureToken = () => {
+    if (at?.mode !== "live" || hasLiveToken()) return true;
+    const t = window.prompt("Live token (QT_LIVE_ARM_TOKEN) — kept in memory only:");
+    if (!t) return false;
+    setLiveToken(t);
+    return true;
+  };
+  const onExitNow = async () => {
+    const sym = pos?.option_symbol || "this position";
+    const live = at?.mode === "live";
+    const warn = live
+      ? `EXIT ${sym}: the app first checks Angel. If you already closed it in the Angel app, it books Angel's price in the journal and sends nothing. If Angel still shows it open, a REAL SELL is sent.`
+      : `EXIT ${sym} (paper)?`;
+    if (!window.confirm(warn) || !ensureToken()) return;
+    setActionMsg("Exiting…");
+    const r = await sellPosition(true, view.instrument);
+    setActionMsg(r.result?.ok ? `Exit sent: ${r.result?.message ?? "ok"}` : `Exit failed: ${r.result?.message ?? "error"}`);
+  };
+  const onRelevel = async () => {
+    if (!window.confirm("Re-set this trade's stop and T1/T2/T3 from the option's volatility (1-min ATR)? No order is sent.")
+      || !ensureToken()) return;
+    const r = await setAutoLevels(view.instrument, { volatility: true });
+    setActionMsg(r.message);
+  };
   const history = at?.history ?? [];
 
   return (
@@ -185,6 +223,30 @@ export default function QuantumSignal({
             {auto ? "Live scan — auto-showing the best trade" : "Live scan — click to open"}
             {scan.best_actionable ? "" : " · nothing clean right now"}
           </div>
+          {scan.rows.some((r) => r.in_position) ? (
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              <span className="text-[10px] uppercase tracking-wide text-white/35">Open positions</span>
+              {scan.rows
+                .filter((r) => r.in_position)
+                .map((r) => (
+                  <button
+                    key={`pos-${r.instrument}`}
+                    onClick={() => {
+                      setAuto(false);
+                      onInstrument(r.instrument);
+                    }}
+                    className="px-2.5 py-1 rounded-lg text-xs font-bold border"
+                    style={{
+                      borderColor: r.instrument === view.instrument ? "#ffb020" : "rgba(255,176,32,0.4)",
+                      background: "rgba(255,176,32,0.10)",
+                      color: "#ffd27a",
+                    }}
+                  >
+                    {r.instrument_name || r.instrument}
+                  </button>
+                ))}
+            </div>
+          ) : null}
           <div className="flex gap-2 overflow-x-auto pb-1">
             {scan.rows.map((r) => {
               const active = r.instrument === view.instrument;
@@ -375,12 +437,32 @@ export default function QuantumSignal({
                   Ratchet exit: hard stop until T1, then the floor steps up to each target reached. Above T3 it keeps
                   riding for higher highs and exits only if it falls back to T3 — a hit target is never given back.
                 </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={onExitNow}
+                    className="px-3 py-1.5 rounded-lg text-xs font-bold bg-red-500/20 text-red-200 border border-red-500/40 hover:bg-red-500/30"
+                    title="Sell this bot position now (only if it is still open at the broker)"
+                  >
+                    Exit now
+                  </button>
+                  <button
+                    onClick={onRelevel}
+                    disabled={ent.locked_floor != null}
+                    className="px-3 py-1.5 rounded-lg text-xs font-bold bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 disabled:opacity-40"
+                    title="Recompute stop and T1/T2/T3 from the option's 1-min volatility (pre-T1 only, no order sent)"
+                  >
+                    Tighten to volatility
+                  </button>
+                  {actionMsg ? <span className="text-[11px] text-white/60">{actionMsg}</span> : null}
+                </div>
               </div>
             ) : null}
           </>
         ) : (
           <div className="text-sm text-white/40">
-            {at?.mode === "live"
+            {at?.mode === "live" && at?.kill_switch
+              ? "Flat — no open position. Kill switch ENGAGED: no live orders until you release it."
+              : at?.mode === "live"
               ? "Flat — no open position. Bot is LIVE-armed and will place a REAL order on the next qualified signal."
               : at?.enabled
                 ? "Flat — no open position. Bot is ON (paper); it will simulate a buy on the next qualified signal."

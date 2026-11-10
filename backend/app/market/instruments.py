@@ -29,6 +29,10 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "NATURALGAS": InstrumentSpec("NATURALGAS", "Natural Gas", "MCX", "MCX:NATURALGAS", 250.0, 0.55, 5, 1250, 7),
     "GOLD": InstrumentSpec("GOLD", "Gold", "MCX", "MCX:GOLD", 71000.0, 0.14, 100, 100, 30),
     "SILVER": InstrumentSpec("SILVER", "Silver", "MCX", "MCX:SILVER", 85000.0, 0.24, 100, 30, 30),
+    # Mini metals for small capital. GOLDM: 100 g quoted per 10 g = Rs 10 per point
+    # per lot (Angel's lotsize 100 is grams, the order quantity). SILVERM: 5 kg.
+    "GOLDM": InstrumentSpec("GOLDM", "Gold Mini", "MCX", "MCX:GOLDM", 71000.0, 0.14, 100, 10, 30),
+    "SILVERM": InstrumentSpec("SILVERM", "Silver Mini", "MCX", "MCX:SILVERM", 85000.0, 0.24, 100, 5, 30),
     "COPPER": InstrumentSpec("COPPER", "Copper", "MCX", "MCX:COPPER", 800.0, 0.20, 5, 2500, 30),
     # NSE / BSE index options. Live Angel One uses NFO (Nifty) and BFO (Sensex).
     "NIFTY": InstrumentSpec("NIFTY", "Nifty", "NFO", "NSE:NIFTY", 24000.0, 0.12, 50, 65, 7),
@@ -50,7 +54,6 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "AXISBANK": InstrumentSpec("AXISBANK", "Axis Bank", "NFO", "NSE:AXISBANK", 1150.0, 0.24, 10, 625, 30),
     "KOTAKBANK": InstrumentSpec("KOTAKBANK", "Kotak Bank", "NFO", "NSE:KOTAKBANK", 1800.0, 0.22, 20, 400, 30),
     "LT": InstrumentSpec("LT", "L&T", "NFO", "NSE:LT", 3600.0, 0.22, 20, 175, 30),
-    "TATAMOTORS": InstrumentSpec("TATAMOTORS", "Tata Motors", "NFO", "NSE:TATAMOTORS", 700.0, 0.30, 10, 550, 30),
     "TATASTEEL": InstrumentSpec("TATASTEEL", "Tata Steel", "NFO", "NSE:TATASTEEL", 150.0, 0.30, 1, 5500, 30),
     "ITC": InstrumentSpec("ITC", "ITC", "NFO", "NSE:ITC", 450.0, 0.20, 5, 1600, 30),
     "BHARTIARTL": InstrumentSpec("BHARTIARTL", "Bharti Airtel", "NFO", "NSE:BHARTIARTL", 1650.0, 0.24, 20, 475, 30),
@@ -68,8 +71,6 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "MIDCPNIFTY": InstrumentSpec("MIDCPNIFTY", "Midcap Nifty", "NFO", "NSE:CNXMIDCAP", 12500.0, 0.16, 25, 120, 7),
     "FINNIFTY": InstrumentSpec("FINNIFTY", "Fin Nifty", "NFO", "NSE:CNXFINANCE", 23500.0, 0.14, 50, 65, 7),
     "BANKEX": InstrumentSpec("BANKEX", "Bankex", "BFO", "BSE:BANKEX", 58000.0, 0.14, 100, 30, 7),
-    "ZINC": InstrumentSpec("ZINC", "Zinc", "MCX", "MCX:ZINC", 270.0, 0.20, 5, 5000, 30),
-    "ALUMINIUM": InstrumentSpec("ALUMINIUM", "Aluminium", "MCX", "MCX:ALUMINIUM", 240.0, 0.20, 5, 5000, 30),
     "BAJFINANCE": InstrumentSpec("BAJFINANCE", "Bajaj Finance", "NFO", "NSE:BAJFINANCE", 7200.0, 0.26, 100, 125, 30),
     "BAJAJFINSV": InstrumentSpec("BAJAJFINSV", "Bajaj Finserv", "NFO", "NSE:BAJAJFINSV", 1700.0, 0.26, 20, 500, 30),
     "INDUSINDBK": InstrumentSpec("INDUSINDBK", "IndusInd Bank", "NFO", "NSE:INDUSINDBK", 1000.0, 0.30, 10, 700, 30),
@@ -102,15 +103,22 @@ REGISTRY: dict[str, InstrumentSpec] = {
     "VEDL": InstrumentSpec("VEDL", "Vedanta", "NFO", "NSE:VEDL", 450.0, 0.32, 5, 2300, 30),
     "TATACONSUM": InstrumentSpec("TATACONSUM", "Tata Consumer", "NFO", "NSE:TATACONSUM", 1100.0, 0.24, 10, 550, 30),
     "TRENT": InstrumentSpec("TRENT", "Trent", "NFO", "NSE:TRENT", 5500.0, 0.32, 50, 100, 30),
-    "IRCTC": InstrumentSpec("IRCTC", "IRCTC", "NFO", "NSE:IRCTC", 780.0, 0.30, 10, 875, 30),
     "LICI": InstrumentSpec("LICI", "LIC of India", "NFO", "NSE:LICI", 900.0, 0.24, 10, 800, 30),
     # Mid-cap: real F&O name, but its option premiums are thinner than the index
     # contracts — expect the premium floor and the opportunity score to skip it
     # often. That is the gate working, not the instrument missing.
     "KALYANKJIL": InstrumentSpec("KALYANKJIL", "Kalyan Jewellers", "NFO", "NSE:KALYANKJIL", 500.0, 0.40, 10, 1175, 30),
+    # Seeds only — live Angel One reads the real lot size from the scrip master.
+    "ABB": InstrumentSpec("ABB", "ABB India", "NFO", "NSE:ABB", 5400.0, 0.30, 50, 125, 30),
+    "MAZDOCK": InstrumentSpec("MAZDOCK", "Mazagon Dock", "NFO", "NSE:MAZDOCK", 1900.0, 0.40, 20, 225, 30),
+    "SHRIRAMFIN": InstrumentSpec("SHRIRAMFIN", "Shriram Finance", "NFO", "NSE:SHRIRAMFIN", 620.0, 0.32, 10, 825, 30),
 }
 
 DEFAULT_INSTRUMENT = "CRUDEOIL"
+
+# Roots whose broker lotsize is a gram count while the premium is quoted per
+# 10 g: the registry lot_size (rupees per point per lot) is authoritative.
+PNL_LOT_FIXED: frozenset[str] = frozenset({"GOLD", "GOLDM"})
 
 # ``REGISTRY`` above is the FULL master (all specs — get_spec always resolves).
 # ``UNIVERSE`` is the ACTIVE subset the app actually warms / streams / scans and
@@ -124,7 +132,7 @@ FNO_STOCKS: tuple[str, ...] = tuple(
 # than this comfortably, but each active instrument also warms 1-min candles
 # from Angel's historical API, which is strictly rate-limited (AB1021) — so the
 # cap bounds warm-up time, not feed capacity.
-MAX_ACTIVE = 50
+MAX_ACTIVE = 51  # v3.5.48: 51 so MAZDOCK fits beside the 50 already watched
 
 # Names the ``MAX_ACTIVE`` cap must never be the reason for dropping. Without
 # this the master's tail is silently truncated, so a specifically requested
@@ -137,10 +145,14 @@ PINNED: tuple[str, ...] = (
     "NATURALGAS",
     "GOLD",
     "SILVER",
+    "GOLDM",
+    "SILVERM",
     "NIFTY",
     "BANKNIFTY",
     "SENSEX",
     "KALYANKJIL",
+    "ABB",
+    "SHRIRAMFIN",
 )
 
 
@@ -157,12 +169,21 @@ def _apply_cap(names: list[str]) -> list[str]:
 UNIVERSE: list[str] = _apply_cap(list(REGISTRY.keys()))
 
 
+def resolve_key(name: str | None) -> str:
+    """Registry key for a key or an exchange symbol ("BAJAJ-AUTO" -> "BAJAJAUTO",
+    "M&M" -> "MM"); unknown names come back upper-cased and unresolved."""
+    n = (name or "").strip().upper()
+    if n in REGISTRY:
+        return n
+    return next((k for k, v in REGISTRY.items() if v.symbol.upper() == n), n)
+
+
 def set_universe(symbols: list[str]) -> list[str]:
     """Set the active instrument universe (the auto-pick uses this daily). Only
     names present in the full master are kept, order preserved; if nothing valid
     is given the full master is restored. Returns the resulting universe."""
     global UNIVERSE, DEFAULT_INSTRUMENT
-    kept = [s.upper() for s in symbols if s.upper() in REGISTRY]
+    kept = [resolve_key(s) for s in symbols if resolve_key(s) in REGISTRY]
     UNIVERSE = _apply_cap(kept or list(REGISTRY.keys()))
     if DEFAULT_INSTRUMENT not in UNIVERSE:
         DEFAULT_INSTRUMENT = UNIVERSE[0]
@@ -182,4 +203,4 @@ if _only:
 
 
 def get_spec(symbol: str) -> InstrumentSpec:
-    return REGISTRY.get((symbol or "").upper(), REGISTRY[DEFAULT_INSTRUMENT])
+    return REGISTRY.get(resolve_key(symbol), REGISTRY[DEFAULT_INSTRUMENT])

@@ -37,12 +37,11 @@ import TradeMeterCard from "@/components/TradeMeterCard";
 import NewsFeed from "@/components/NewsFeed";
 import MarketContext from "@/components/MarketContext";
 import ProDashboard from "@/components/ProDashboard";
-import MomentumBoard from "@/components/MomentumBoard";
-import FlowBoard from "@/components/FlowBoard";
-import SpreadBoard from "@/components/SpreadBoard";
 import FuturesBoard from "@/components/FuturesBoard";
+import OptionsBoard from "@/components/OptionsBoard";
 import JournalBoard from "@/components/JournalBoard";
-import BuySignalsPanel from "@/components/BuySignalsPanel";
+import ReportsBoard from "@/components/ReportsBoard";
+import PaperBooksBoard from "@/components/PaperBooksBoard";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
 import TopMovers from "@/components/TopMovers";
@@ -61,6 +60,10 @@ type PendingOrder = {
   warnings?: string[];
 };
 
+// Server registry key: older builds saved the scrip name ("BAJAJ-AUTO", "M&M"),
+// which matched no dropdown option, so the select fell back to Crude Oil.
+const instrumentKey = (s: string) => s.toUpperCase().replace(/[^A-Z0-9]/g, "");
+
 export default function Page() {
   // Per-tab instrument selection. Kept in this tab's own React state (not on the
   // server), so duplicating the tab and switching to a different instrument
@@ -77,7 +80,7 @@ export default function Page() {
   const [showPerformance, setShowPerformance] = useState(false);
   const [showSizing, setShowSizing] = useState(false);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [view, setView] = useState<"signal" | "command" | "decision" | "momentum" | "flow" | "spreads" | "futures" | "journal" | "movers" | "analysis" | "research" | "account">("signal");
+  const [view, setView] = useState<"signal" | "command" | "decision" | "futures" | "options" | "journal" | "books" | "reports" | "movers" | "analysis" | "research" | "account">("signal");
 
   // Restore this tab's instrument on load/refresh: prefer the ?instrument= URL
   // param (so each tab keeps its own selection and survives a refresh), then the
@@ -86,7 +89,9 @@ export default function Page() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const fromUrl = new URLSearchParams(window.location.search).get("instrument");
-    const saved = (fromUrl || window.localStorage.getItem("qt_instrument") || "").toUpperCase();
+    // Older builds saved the scrip name ("BAJAJ-AUTO", "M&M"); the server keys
+    // those as BAJAJAUTO / MM.
+    const saved = instrumentKey(fromUrl || window.localStorage.getItem("qt_instrument") || "");
     if (saved && saved !== instrument) {
       setInstrument(saved);
       selectInstrument(saved).catch(() => {});
@@ -248,7 +253,8 @@ export default function Page() {
     req.then((d) => showResult(d.result));
   };
 
-  const onSelectInstrument = (sym: string) => {
+  const onSelectInstrument = (picked: string) => {
+    const sym = instrumentKey(picked);
     // Switch only THIS tab. Warm the instrument on the server, then point this
     // tab's stream at it — other tabs are untouched.
     setInstrument(sym);
@@ -265,7 +271,7 @@ export default function Page() {
 
   return (
     <div
-      className="h-screen w-screen p-3 flex flex-col gap-3 overflow-hidden"
+      className="h-screen w-full p-3 flex flex-col gap-3 overflow-hidden"
       style={{ "--accent": t.accent, "--accent-dim": t.accentDim } as React.CSSProperties}
     >
       {view !== "decision" && <Alerts alerts={snap.alerts} />}
@@ -338,13 +344,13 @@ export default function Page() {
       )}
 
       {/* Top bar */}
-      <div className="card flex flex-wrap items-center justify-between gap-y-2 px-4 py-2">
+      <div className="card shrink-0 flex flex-wrap items-center justify-between gap-y-2 px-4 py-2">
         <div className="flex items-center gap-4">
           <div className="text-lg font-black tracking-tight">
             QUANTUM<span style={{ color: t.accent }}>TRADER</span>
           </div>
           <select
-            value={instrument}
+            value={instrumentKey(instrument)}
             onChange={(e) => onSelectInstrument(e.target.value)}
             title="Choose what to analyse (this tab only — other tabs are independent)"
             className="bg-white/5 border border-white/15 rounded-lg text-xs font-semibold px-2 py-1 outline-none disabled:opacity-40"
@@ -386,63 +392,6 @@ export default function Page() {
           >
             {live ? "● LIVE ORDERS" : "○ PAPER"}
           </span>
-          <div className="flex rounded-lg border border-white/15 overflow-hidden text-xs font-semibold">
-            <button
-              onClick={() => setView("signal")}
-              className={view === "signal" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-              title="Quantum Signal — the single-page decision tool (regime/volatility-gated BUY/WAIT/HOLD/EXIT)"
-            >
-              Signal
-            </button>
-            <button
-              onClick={() => setView("decision")}
-              className={view === "decision" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Decision
-            </button>
-            <button
-              onClick={() => setView("momentum")}
-              className={view === "momentum" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Momentum
-            </button>
-            <button
-              onClick={() => setView("flow")}
-              className={view === "flow" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Flow
-            </button>
-            <button
-              onClick={() => setView("spreads")}
-              className={view === "spreads" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Spreads <span className="text-[9px] text-amber-300/80">RESEARCH</span>
-            </button>
-            <button
-              onClick={() => setView("futures")}
-              className={view === "futures" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Futures <span className="text-[9px] text-amber-300/80">PAPER</span>
-            </button>
-            <button
-              onClick={() => setView("journal")}
-              className={view === "journal" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Journal
-            </button>
-            <button
-              onClick={() => setView("research")}
-              className={view === "research" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Research
-            </button>
-            <button
-              onClick={() => setView("account")}
-              className={view === "account" ? "px-3 py-1.5 bg-white/10 text-white" : "px-3 py-1.5 text-white/60 hover:bg-white/5"}
-            >
-              Account
-            </button>
-          </div>
           {/* Sound controls, and sound itself, belong to the Signal dashboard —
               the screen you trade from. Hidden elsewhere, so the switches are not
               offered on screens that deliberately stay silent. */}
@@ -457,6 +406,7 @@ export default function Page() {
           <button
             disabled={!snap.decision.recommended_option || inPosition}
             onClick={onBuy}
+            title={inPosition ? "Already in a position on this instrument" : !snap.decision.recommended_option ? "No BUY recommendation on this instrument right now" : "Paper BUY the recommended option"}
             className="text-sm font-bold px-4 py-1.5 rounded-lg text-black disabled:opacity-30"
             style={{ background: "#19e57f" }}
           >
@@ -465,6 +415,7 @@ export default function Page() {
           <button
             disabled={!inPosition}
             onClick={onSell}
+            title={inPosition ? "Paper SELL the open position" : "No open position on this instrument"}
             className="text-sm font-bold px-4 py-1.5 rounded-lg text-white disabled:opacity-30"
             style={{ background: "#ff4d4d" }}
           >
@@ -475,6 +426,64 @@ export default function Page() {
             {connected ? "LIVE" : "OFFLINE"}
           </span>
         </div>
+      </div>
+
+  <div className="card shrink-0 flex w-full overflow-x-auto text-xs font-semibold p-0">
+        <button
+          onClick={() => setView("signal")}
+          className={view === "signal" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+          title="Quantum Signal — the single-page decision tool (regime/volatility-gated BUY/WAIT/HOLD/EXIT)"
+        >
+          Signal
+        </button>
+        <button
+          onClick={() => setView("decision")}
+          className={view === "decision" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Decision
+        </button>
+        <button
+          onClick={() => setView("futures")}
+          className={view === "futures" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Futures <span className="text-[9px] text-amber-300/80">PAPER</span>
+        </button>
+        <button
+          onClick={() => setView("options")}
+          className={view === "options" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Options <span className="text-[9px] text-amber-300/80">PAPER</span>
+        </button>
+        <button
+          onClick={() => setView("journal")}
+          className={view === "journal" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Journal
+        </button>
+        <button
+          onClick={() => setView("books")}
+          className={view === "books" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Books <span className="text-[9px] text-amber-300/80">PAPER</span>
+        </button>
+        <button
+          onClick={() => setView("reports")}
+          className={view === "reports" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Reports
+        </button>
+        <button
+          onClick={() => setView("research")}
+          className={view === "research" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Research
+        </button>
+        <button
+          onClick={() => setView("account")}
+          className={view === "account" ? "flex-1 whitespace-nowrap px-3 py-2 bg-white/10 text-white" : "flex-1 whitespace-nowrap px-3 py-2 text-white/60 hover:bg-white/5"}
+        >
+          Account
+        </button>
       </div>
 
       {view === "signal" ? (
@@ -520,33 +529,26 @@ export default function Page() {
             }
           }}
         />
-      ) : view === "momentum" ? (
-        /* Early Momentum board — a SEPARATE advisory engine with its own full
-           trade plan (EARLY BUY CE/PE · entry/stop/targets/exit). Never changes
-           the frozen Decision engine. Uses the shared instrument selector. */
-        <MomentumBoard snap={snap} />
-      ) : view === "flow" ? (
-        /* Candle-Flow board — a SEPARATE advisory engine that rides the 1-min
-           candle (BUY green · HOLD · EXIT red · SWITCH CE↔PE). Never changes the
-           frozen Decision engine. Uses the shared instrument selector. */
-        <FlowBoard snap={snap} />
-      ) : view === "spreads" ? (
-        /* Premium-SELLING board — defined-risk credit spreads, PAPER ONLY. A
-           SEPARATE advisory engine with no order path; never touches the frozen
-           Decision engine. */
-        <SpreadBoard snap={snap} />
       ) : view === "futures" ? (
         /* FUTURES paper bot — a SEPARATE self-driving tool with its OWN capital
            pot and point-based risk. Shares no sizing/stop/exit logic with the
            option engine and has NO live order route. */
         <FuturesBoard snap={snap} />
+      ) : view === "options" ? (
+        <OptionsBoard snap={snap} />
       ) : view === "journal" ? (
         /* Complete trade journal — the full persisted record of every closed
            paper/live trade with reason, confidence, P&L and analyst note. */
         <>
           <JournalBoard />
-          <BuySignalsPanel />
+          
         </>
+      ) : view === "books" ? (
+        /* Six parallel PAPER books (5L/10L/15L x FULL/RISK) on the same signals. */
+        <PaperBooksBoard />
+      ) : view === "reports" ? (
+        /* Every BUY signal persisted in journal v2, executed or skipped, with reason. */
+        <ReportsBoard />
       ) : view === "decision" ? (
         /* Clean, decision-first dashboard: should I trade, which option, entry,
            stop, targets, hold time, risk, opportunity, why. */

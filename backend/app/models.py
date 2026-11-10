@@ -920,6 +920,8 @@ class Decision(BaseModel):
     htf_trend: str | None = None  # UP / DOWN / SIDEWAYS
     htf_strength: float | None = None  # 0..100
     entry_trigger: str | None = None  # PULLBACK / BREAKOUT_RETEST / WAIT_PULLBACK / NONE
+    # Every entry trigger satisfied this tick (entry_trigger is only the first by priority).
+    entry_triggers: list[str] = []
     # ATR-based dynamic risk (Phase 1): stop/targets scale with volatility+regime.
     atr_points: float | None = None       # 1x ATR in underlying points
     underlying_stop: float | None = None  # invalidation level on the FUTURES price
@@ -1097,7 +1099,7 @@ class FeedHealth(BaseModel):
     # Explicit provenance so a synthetic or dead feed can never read as live.
     provider: str = ""               # configured QT_DATA_PROVIDER
     source: str = "UNKNOWN"          # LIVE | SIMULATED | UNAVAILABLE | UNKNOWN
-    state: str = "UNKNOWN"           # CONNECTED | DEGRADED | DISCONNECTED | SIMULATED
+    state: str = "UNKNOWN"           # CONNECTED | DEGRADED | RECONNECTING | DISCONNECTED | SIMULATED
     checked_at: float | None = None  # local wall-clock time of this reading
 
 
@@ -1152,6 +1154,7 @@ class AutoTradeState(BaseModel):
 
     enabled: bool = False
     mode: str = "paper"                 # always 'paper' for now (never live here)
+    kill_switch: bool = False           # live entries blocked while engaged
     min_confidence: float = 90.0        # auto-buy gate
     max_lots: int = 1
     in_position: bool = False
@@ -1252,6 +1255,14 @@ class Snapshot(BaseModel):
     futures_prev_close: float | None = None
     option_day_high: float | None = None
     option_day_low: float | None = None
+    # Live ATM CE/PE quotes, shown when no option is recommended (WAIT/AVOID)
+    # so the option price panel is never blank while the chain is live.
+    atm_ce_symbol: str | None = None
+    atm_ce_premium: float | None = None
+    atm_pe_symbol: str | None = None
+    atm_pe_premium: float | None = None
+    display_option_symbol: str | None = None
+    display_option_premium: float | None = None
     market_open: bool = True
     session_note: str | None = None
     data_source: str = "simulated"

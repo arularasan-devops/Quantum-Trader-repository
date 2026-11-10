@@ -1,4 +1,5 @@
 "use client";
+import DateRangeDownload from "./DateRangeDownload";
 
 import { useEffect, useState } from "react";
 import { API_BASE } from "@/lib/api";
@@ -31,13 +32,15 @@ export default function BuySignalsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const pageSize = 100;
+  const [range, setRange] = useState<{ since: number | null; until: number | null }>({ since: null, until: null });
+  const rangeQ = `${range.since !== null ? `&since=${range.since}` : ""}${range.until !== null ? `&until=${range.until}` : ""}`;
   const pages = Math.max(1, Math.ceil(total / pageSize));
 
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
-        const r = await fetch(`${API_BASE}/api/journal/v2/signals?signal=BUY&page=${page}&page_size=${pageSize}`);
+        const r = await fetch(`${API_BASE}/api/journal/v2/signals?signal=BUY&page=${page}&page_size=${pageSize}${rangeQ}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();
         if (!alive) return;
@@ -54,7 +57,7 @@ export default function BuySignalsPanel() {
       alive = false;
       clearInterval(id);
     };
-  }, [page]);
+  }, [page, rangeQ]);
 
   return (
     <section style={{ marginTop: 24, flexShrink: 0, maxHeight: "45vh", display: "flex", flexDirection: "column" }}>
@@ -65,8 +68,10 @@ export default function BuySignalsPanel() {
         <span style={{ margin: "0 6px", fontSize: 12 }}>page {page}/{pages}</span>
         <button onClick={() => setPage((p) => Math.min(pages, p + 1))} disabled={page >= pages}
                 style={{ fontSize: 12 }}>Next</button>
-        <a href={`${API_BASE}/api/journal/v2/trades.csv`}
-           style={{ marginLeft: 12, fontSize: 12 }} target="_blank" rel="noreferrer">Trades CSV</a>
+        <span style={{ marginLeft: 12 }}>
+          <DateRangeDownload href={`${API_BASE}/api/journal/v2/trades.csv`} label="Trades CSV"
+            onRange={(since, until) => { setRange({ since, until }); setPage(1); }} />
+        </span>
       </h3>
       {error && <div style={{ color: "#ef4444", fontSize: 12 }}>Signals unavailable: {error}</div>}
       <div style={{ overflow: "auto", minHeight: 0, flex: 1 }}>

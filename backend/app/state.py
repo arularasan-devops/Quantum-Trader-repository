@@ -8,6 +8,9 @@ scaling out (see DEPLOYMENT.md).
 """
 from __future__ import annotations
 
+import logging
+import contextlib
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -41,6 +44,8 @@ from app.engine import account_risk
 from app.engine import backtest as bt
 from app.engine import decision as eng
 from app.engine import learning as learn
+from app.engine import paper_books
+from app.engine import paper_positions
 from app.engine import recovery as rec_eng
 from app.engine import risk_v2
 from app.engine import weights
@@ -61,7 +66,8 @@ from app.execution import (
     signal_delay,
     zero_to_hero,
 )
-from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, universe_specs
+from app.market import instruments as _instruments
+from app.market.instruments import DEFAULT_INSTRUMENT, REGISTRY, get_spec, resolve_key, universe_specs
 from app.market import tiers
 from app.market.provider import MarketDataProvider, build_provider
 from app.execution import live_control
@@ -120,6 +126,8 @@ def _mark_stage(instrument: str, stage: str) -> None:
     except Exception:
         pass
 
+
+_log = logging.getLogger(__name__)
 
 class _UnavailableProvider(MarketDataProvider):
     """Stand-in used when a real provider cannot be constructed for an
@@ -188,6 +196,8 @@ def classify_feed(health: FeedHealth, provider: MarketDataProvider) -> FeedHealt
         health.state = "CONNECTED"
     else:
         health.state = "DEGRADED"
+    if health.state == "DEGRADED" and not health.ws_connected and health.mode != "rest":
+        health.state = "RECONNECTING"
     return health
 
 
@@ -197,7 +207,7 @@ class AppState:
         # instrument (see StateRegistry) so two browser tabs watching different
         # instruments (e.g. Crude in one, Nifty in another) stay independent
         # instead of overwriting a single shared "active instrument".
-        chosen = (instrument or settings.angel_symbol_root or DEFAULT_INSTRUMENT).upper()
+        chosen = resolve_key(instrument or settings.angel_symbol_root or DEFAULT_INSTRUMENT)
         self._instrument = chosen if chosen in REGISTRY else DEFAULT_INSTRUMENT
         self._providers: dict[str, MarketDataProvider] = {}
         self.provider = self._provider_for(self._instrument)
@@ -265,6 +275,10 @@ class AppState:
         self._wa_last_key: str | None = None
         # --- paper auto-trader (simulated fills only; never live) ---
         self._auto_last_key: str | None = None   # one auto-entry per signal episode
+        # when the episode key was consumed by a successful auto-buy; a closed
+        # trade re-arms the same episode once the re-entry cooldown has passed
+        self._auto_key_traded_ts: float | None = None
+        self._auto_last_exit_was_stop = False
         self._auto_target1: float | None = None  # T1 captured at auto-entry
         self._auto_target2: float | None = None  # T2 captured at auto-entry
         self._auto_target3: float | None = None  # T3 captured at auto-entry
@@ -272,6 +286,7 @@ class AppState:
         # highest target FLOOR reached this trade (ratchets up): 0=none,1=T1,2=T2
         self._auto_tgt_floor: float | None = None
         self._auto_scaled_out: bool = False       # part already booked at T1
+        self._auto_pre_t1_halved: bool = False    # half booked at the pre-T1 trail
         # running high premium this trade (for the pre-T1 peak-giveback trail)
         self._auto_peak: float | None = None
         self._auto_entry_prem: float | None = None  # actual entry fill this trade
@@ -304,7 +319,13 @@ class AppState:
         self._order_recovery: dict | None = None
         self._persist_error: str | None = None
         self._last_order_poll = 0.0
+        self._last_broker_pos_check = 0.0
+        self._exit_retry_at = 0.0
+        self._broker_flat_seen = 0
         self._restore_live_ledger()
+        self._paper_pos_saved_at = 0.0
+        self._paper_pos_saved = False
+        self._restore_paper_position()
 
     def _provider_for(self, instrument: str) -> MarketDataProvider:
         cached = self._providers.get(instrument)
@@ -321,6 +342,50 @@ class AppState:
             return _UnavailableProvider(f"{instrument} unavailable — {exc}")
         self._providers[instrument] = provider
         return provider
+
+    @staticmethod
+    def _atm_pair(chain, price) -> dict:
+        """Nearest-strike CE and PE quotes (symbol + premium) for the panel."""
+        out = {"atm_ce_symbol": None, "atm_ce_premium": None,
+               "atm_pe_symbol": None, "atm_pe_premium": None}
+        try:
+            strikes = {q.strike for q in chain or []}
+            if not strikes or not price:
+                return out
+            k = min(strikes, key=lambda s: abs(s - float(price)))
+            for q in chain:
+                if q.strike != k or not q.premium:
+                    continue
+                side = "ce" if q.option_type == OptionType.CALL else "pe"
+                out[f"atm_{side}_symbol"] = q.symbol
+                out[f"atm_{side}_premium"] = float(q.premium)
+        except Exception:
+            pass
+        return out
+
+    def _own_bid(self) -> float | None:
+        """Best bid of the open option (None without a two-sided quote)."""
+        sym = self.position.option_symbol
+        if not sym:
+            return None
+        try:
+            q = next((x for x in self.provider.option_chain() if x.symbol == sym), None)
+        except Exception:
+            return None
+        if q is None or not q.bid or not q.ask or not (0 < q.bid <= q.ask):
+            return None
+        return float(q.bid)
+
+    def _liq_pnl(self) -> float:
+        """Open P&L valued at the bid (what closing now pays) in PAPER."""
+        p = self.position
+        pnl = float(p.net_pnl or 0.0)
+        if self.is_live or not settings.auto_trade_exit_on_bid or not p.option_symbol:
+            return pnl
+        bid, mark = self._own_bid(), p.current_premium
+        if bid is not None and mark is not None and bid < mark:
+            pnl -= (mark - bid) * get_spec(self._instrument).lot_size * p.quantity_lots
+        return pnl
 
     def _feed_ready(self) -> bool:
         """Whether the prices behind the current plan are current enough to act on.
@@ -361,7 +426,7 @@ class AppState:
         return self._instrument
 
     def set_instrument(self, instrument: str) -> str:
-        name = (instrument or "").upper()
+        name = resolve_key(instrument)
         if name not in REGISTRY:
             raise ValueError(f"Unknown instrument {instrument}")
         if self.position.option_symbol:
@@ -565,19 +630,23 @@ class AppState:
                     message=refused,
                 )
 
-        if adopted is None and live_control.kill_switch_engaged():
+        if adopted is None and self.is_live and live_control.kill_switch_engaged():
             if manual:
                 self._add_alert("KILL_SWITCH", "Entry refused: kill switch engaged", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
                                option_symbol=q.symbol, lots=lots,
                                message="Kill switch engaged — new entries blocked.")
-        can, reason = (True, "") if adopted is not None else self.risk.can_open(time.time())
+        can, reason = ((True, "") if adopted is not None
+                       else self.risk.can_open(time.time()))
         if not can:
             self._add_alert("RISK_BLOCK", f"Trade blocked: {reason}", "warning")
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
                                option_symbol=q.symbol, lots=lots, message=f"Risk limit: {reason}")
 
         entry = q.premium
+        # Paper fills pay the ask when a two-sided book exists (never LTP/mid).
+        if adopted is None and not self.is_live and q.bid and q.ask and 0 < q.bid <= q.ask:
+            entry = float(q.ask)
         order_id = None
         if adopted is not None:
             entry = float(adopted.fill_premium)
@@ -609,6 +678,8 @@ class AppState:
             self._ledger_position = {"symbol": q.symbol, "lots": lots, "entry": entry,
                                      "order_ids": [order_id] if order_id else [],
                                      "ts": int(time.time()), "verified": True}
+            if self.is_live and adopted is None and self._buy_product():
+                self._ledger_position["product"] = self._buy_product()
             self._persist_state()
             self._event("POSITION_OPENED", {"order_id": order_id, "side": "BUY",
                                             "symbol": q.symbol, "lots": lots},
@@ -628,6 +699,7 @@ class AppState:
         mode = "LIVE" if self.is_live else "paper"
         self._add_alert("BUY_NOW", f"[{mode}] Entered {q.symbol} @ {entry}", "info")
         journal_hooks.on_entry(self, q, lots, entry, manual)
+        self._paper_pos_saved_at = 0.0
         return OrderResult(ok=True, mode=mode.lower(), side="BUY", option_symbol=q.symbol,
                            lots=lots, fill_premium=entry, order_id=order_id, message="Entered",
                            status="FILLED", filled_lots=lots)
@@ -680,7 +752,31 @@ class AppState:
                                        "before anything was sent.")
         # If place_order raises, the SUBMITTING record stays: the outcome is
         # unknown, so new entries remain blocked until it is reconciled.
-        res = self.provider.place_order(symbol, side, lots)
+        from app.ai.safety import RealMoneyBlocked
+        try:
+            prod = (self._ledger_position or {}).get("product") if side == "SELL" else self._buy_product()
+            res = (self.provider.place_order(symbol, side, lots, product=prod) if prod
+                   else self.provider.place_order(symbol, side, lots))
+        except RealMoneyBlocked as exc:
+            # The build's real-money lock raises before any broker call, so the
+            # outcome is known (nothing sent): clear the record, refuse cleanly.
+            setattr(self, attr, None)
+            self._persist_state()
+            self._event("SUBMIT_REFUSED_LOCKED", pend)
+            self._add_alert("LIVE_ORDERS_LOCKED", f"{side} {symbol} not sent: {exc}", "critical")
+            return OrderResult(ok=False, mode="live", side=side, option_symbol=symbol, lots=lots,
+                               message="Live order not sent: real-money execution is "
+                                       "disabled in this build.")
+        if not res.ok and res.status == "UNKNOWN":
+            # The request may have reached Angel: keep the SUBMITTING record so no
+            # duplicate is sent; it is resolved via /api/order-recovery.
+            pend["last_status"] = "UNKNOWN"
+            self._persist_state()
+            self._event("SUBMIT_UNKNOWN", pend, res)
+            self._add_alert("ORDER_UNRESOLVED", f"{side} {symbol}: outcome unknown "
+                            f"({res.message}) — check the Angel order book; not sending "
+                            "another until resolved via /api/order-recovery", "critical")
+            return res
         if not res.ok:
             setattr(self, attr, None)
             self._persist_state()
@@ -854,6 +950,7 @@ class AppState:
         if not busy:
             if order_ledger.mirror_backlog_bytes() > 0:
                 order_ledger.mirror_pending()
+            self._check_broker_position(now)
             return
         try:
             if self._persist_error:
@@ -878,6 +975,89 @@ class AppState:
         except Exception as exc:
             self._add_alert("ORDER_RECONCILE_ERROR", f"Order reconciliation error: {exc}",
                             "critical")
+
+    def _check_broker_position(self, now: float) -> None:
+        """Read-only: an open LIVE app position that Angel shows flat (netqty 0
+        on two checks in a row) was closed outside the app. Flag recovery so
+        the bot neither re-sells it (that would open a short) nor buys again
+        until the operator confirms. An unknown answer is never read as flat."""
+        sym = self.position.option_symbol
+        fetch = getattr(self.provider, "broker_position", None)
+        if (not self.is_live or not sym or fetch is None
+                or self._pending_order or self._pending_exit):
+            self._broker_flat_seen = 0
+            return
+        if now - self._last_broker_pos_check < settings.live_position_check_sec:
+            return
+        self._last_broker_pos_check = now
+        try:
+            row = fetch(sym)
+        except Exception:
+            row = None
+        if not row or row.get("net_qty") != 0:
+            self._broker_flat_seen = 0
+            return
+        self._broker_flat_seen += 1
+        if self._broker_flat_seen < 2:
+            return
+        px = row.get("sell_avg")
+        if (settings.live_auto_sync_angel_close and px and px > 0
+                and self._order_recovery is None):
+            self._sync_angel_close(sym, float(px), "closed in Angel")
+            return
+        p = self.position
+        if self._ledger_position is None:
+            self._ledger_position = {"symbol": sym, "lots": p.quantity_lots,
+                                     "entry": p.entry_premium, "order_ids": [],
+                                     "ts": int(self._entry_time or now), "verified": False}
+        reason = (f"Angel shows {sym} flat while the app holds {p.quantity_lots} lot(s) "
+                  "— closed outside the app")
+        if self._order_recovery is None:
+            self._order_recovery = {"reason": reason, "since": now, "manual_only": True}
+        self._order_recovery["broker_flat"] = {"symbol": sym, "sell_avg": row.get("sell_avg"),
+                                               "buy_avg": row.get("buy_avg")}
+        self._enter_recovery(reason)
+
+    def _angel_closed_row(self, sym: str) -> dict | None:
+        """Read-only: Angel's row for ``sym`` if it shows the position closed
+        (netqty 0 with a sell average). None = open or unknown."""
+        fetch = getattr(self.provider, "broker_position", None)
+        if fetch is None:
+            return None
+        try:
+            row = fetch(sym)
+        except Exception:
+            return None
+        if row and row.get("net_qty") == 0 and (row.get("sell_avg") or 0) > 0:
+            return row
+        return None
+
+    def _sync_angel_close(self, sym: str, px: float, why: str) -> OrderResult:
+        """The position was closed in the Angel app: book it at Angel's sell
+        average so the journal matches Angel. Nothing is sent to the broker."""
+        self._event("ANGEL_CLOSE_SYNCED", note=f"{why}: Angel netqty 0, sell avg {px}",
+                    saved_position=self._ledger_position)
+        self._pending_exit_reason = "MANUAL EXIT (ANGEL)"
+        res = self._book_exit(self.position.quantity_lots, None, px)
+        self._ledger_position = None
+        self._broker_flat_seen = 0
+        self._reset_auto_trade_marks()
+        self._persist_state()
+        self._add_alert("ANGEL_CLOSE_SYNCED", f"{sym} closed in Angel @ {px:.2f}: booked in "
+                        "the journal, no order sent", "info")
+        return res.model_copy(update={"message": f"{sym} already closed in Angel @ {px:.2f}: "
+                                      "booked from Angel, no SELL sent."})
+
+    def _broker_closed(self) -> bool:
+        rec = self._order_recovery
+        return bool(rec and rec.get("broker_flat")
+                    and rec["broker_flat"].get("symbol") == self.position.option_symbol)
+
+    def _recovery_cleared(self, note: str) -> None:
+        self._order_recovery = None
+        self._event("RECOVERY_CLEARED", note=note)
+        self.alerts = [a for a in self.alerts if a.kind != "ORDER_RECOVERY"]
+        self._add_alert("ORDER_RECOVERY_CLEARED", f"Order recovery cleared: {note}", "info")
 
     # ---------- crash-safe persistence + restart recovery ----------
     def _persist_state(self) -> bool:
@@ -934,6 +1114,93 @@ class AppState:
             return (f"Order persistence failed ({self._persist_error}) — new live entries "
                     "blocked.")
         return None
+
+    _PAPER_SAVE_FIELDS = (
+        "_entry_time", "_entry_factors", "_entry_context", "_entry_book",
+        "_auto_last_key", "_auto_target1", "_auto_target2", "_auto_target3",
+        "_auto_stop", "_auto_tgt_floor", "_auto_scaled_out", "_auto_pre_t1_halved", "_auto_peak",
+        "_auto_entry_prem", "_auto_entry_active", "_auto_entry_strike",
+        "_auto_entry_conf", "_auto_entry_lots", "_z2h_is_sleeve", "_jr_trade_id",
+    )
+
+    # A live bot trade's exit state, saved with the order ledger so an adopted
+    # position resumes the same stop / T1-T3 / locked floor / peak after a restart.
+    _LIVE_MGMT_FIELDS = (
+        "_auto_target1", "_auto_target2", "_auto_target3", "_auto_stop", "_auto_tgt_floor",
+        "_auto_scaled_out", "_auto_pre_t1_halved", "_auto_peak", "_auto_entry_prem",
+        "_auto_entry_strike", "_auto_entry_conf", "_auto_entry_lots",
+    )
+
+    def _save_live_mgmt(self, force: bool = False) -> None:
+        c = self._ledger_position
+        if not (self.is_live and self._auto_entry_active and c and self.position.option_symbol
+                and c.get("symbol") == self.position.option_symbol):
+            return
+        m = {f: getattr(self, f, None) for f in self._LIVE_MGMT_FIELDS}
+        old = c.get("mgmt") or {}
+        peak, opeak = m.get("_auto_peak"), old.get("_auto_peak")
+        same = all(m[f] == old.get(f) for f in m if f != "_auto_peak")
+        peak_moved = peak is not None and (opeak is None or peak > opeak * 1.01)
+        if not force and same and not peak_moved:
+            return
+        c["mgmt"] = m
+        c.update(t1=m["_auto_target1"], t2=m["_auto_target2"])
+        self._persist_state()
+
+    def _save_paper_position(self, now: float) -> None:
+        """Keep the open PAPER position in the database so a restart resumes it
+        (exits keep running) instead of silently dropping the trade."""
+        if self.is_live or settings.trade_mode.lower() != "paper":
+            return
+        try:
+            if self.position.option_symbol and self.position.quantity_lots > 0:
+                if now - self._paper_pos_saved_at < settings.paper_position_save_sec:
+                    return
+                payload = {"position": self.position.model_dump(),
+                           "jr_levels": list(getattr(self, "_jr_levels", (None, None)))}
+                for f in self._PAPER_SAVE_FIELDS:
+                    payload[f] = getattr(self, f, None)
+                paper_positions.save(self._instrument, payload)
+                self._paper_pos_saved_at = now
+                self._paper_pos_saved = True
+            elif self._paper_pos_saved:
+                paper_positions.clear(self._instrument)
+                self._paper_pos_saved = False
+        except Exception:
+            _log.warning("could not save the open paper position for %s",
+                         self._instrument, exc_info=True)
+
+    def _restore_paper_position(self) -> None:
+        if settings.trade_mode.lower() != "paper":
+            return
+        try:
+            saved = paper_positions.load(self._instrument)
+            if not saved:
+                return
+            ts, payload = saved
+            pos = payload.get("position") or {}
+            if (time.time() - ts > settings.paper_position_restore_max_age_sec
+                    or not pos.get("option_symbol") or not pos.get("quantity_lots")):
+                paper_positions.clear(self._instrument)
+                return
+            self.position = Position(**pos)
+            for f in self._PAPER_SAVE_FIELDS:
+                if f in payload:
+                    setattr(self, f, payload[f])
+            if payload.get("jr_levels"):
+                self._jr_levels = tuple(payload["jr_levels"])
+            self._entry_context = dict(self._entry_context or {})
+            self._entry_factors = list(self._entry_factors or [])
+            self._paper_pos_saved = True
+            self._paper_pos_saved_at = time.time()
+            self._add_alert(
+                "POSITION_RESTORED",
+                f"[paper] Restored open {self.position.option_symbol} "
+                f"x{self.position.quantity_lots} @ {self.position.entry_premium} after restart",
+                "info")
+        except Exception:
+            _log.warning("could not restore the paper position for %s",
+                         self._instrument, exc_info=True)
 
     def _restore_live_ledger(self) -> None:
         """After a restart, saved live state is a CLAIM, not the broker's truth:
@@ -1009,9 +1276,7 @@ class AppState:
         if (rec and self._ledger_position is None and not self._pending_order
                 and not self._pending_exit and not rec.get("fills_seen")
                 and not rec.get("manual_only") and not rec.get("conflicts")):
-            self._order_recovery = None
-            self._event("RECOVERY_CLEARED", note="restored orders ended unfilled; "
-                        "no saved position")
+            self._recovery_cleared("restored orders ended unfilled; no saved position")
             self._persist_state()
 
     def recovery_status(self) -> dict:
@@ -1054,6 +1319,14 @@ class AppState:
                 raise ValueError("Resolve the pending exit order first.")
             self._event("OPERATOR_CONFIRMED_FLAT", note=note,
                         saved_position=self._ledger_position)
+            if self._broker_closed():
+                # Closed in Angel: book it at Angel's sell average (nothing is
+                # sent) so the journal and the day's loss cap see this trade.
+                px = self._order_recovery["broker_flat"].get("sell_avg")
+                self._pending_exit_reason = "MANUAL EXIT (ANGEL)"
+                self._book_exit(self.position.quantity_lots, None,
+                                float(px) if px else None)
+                self._reset_auto_trade_marks()
             self._ledger_position = None
             self._order_recovery.pop("conflicts", None)
         elif action == "adopt_position":
@@ -1078,6 +1351,22 @@ class AppState:
             self._entry_factors = []
             self._entry_context = {"recovered": True, "entry_time": opened,
                                    "order_ids": list(c.get("order_ids") or [])}
+            mg = c.get("mgmt") or {}
+            if mg:
+                for f in self._LIVE_MGMT_FIELDS:
+                    if f in mg:
+                        setattr(self, f, mg[f])
+                self._auto_entry_active = True
+            elif c.get("t1") or c.get("t2"):
+                self._auto_target1, self._auto_target2 = c.get("t1"), c.get("t2")
+                self._auto_entry_active = True
+            if self._auto_entry_active:
+                # The bot keeps managing the exit: a hard stop is always set.
+                self._auto_entry_prem = self._auto_entry_prem or entry
+                self._auto_entry_lots = self._auto_entry_lots or int(c["lots"])
+                self._auto_peak = max(self._auto_peak or entry, entry)
+                if not self._auto_stop:
+                    self._auto_stop = round(entry * 0.9, 1)
             c["verified"] = True
             self._order_recovery.pop("conflicts", None)
             self._event("OPERATOR_ADOPTED_POSITION", note=note, saved_position=c)
@@ -1088,13 +1377,13 @@ class AppState:
                 and not self._order_recovery.get("conflicts")
                 and not any(pd and not pd.get("order_id")
                             for pd in (self._pending_order, self._pending_exit))):
-            self._order_recovery = None
-            self._event("RECOVERY_CLEARED", note=note)
+            self._recovery_cleared(note)
         if not self._persist_state():
             raise RuntimeError(f"Order ledger write failed: {self._persist_error}")
         return self.recovery_status()
 
-    def sell(self, confirm: bool = False, lots: int | None = None) -> OrderResult:
+    def sell(self, confirm: bool = False, lots: int | None = None,
+             fill_px: float | None = None, check_broker: bool = False) -> OrderResult:
         """Close the position. ``lots`` sells only part of it (scale-out), leaving
         the remainder open to ride; ``None`` (default) closes everything."""
         if not self.position.option_symbol:
@@ -1117,12 +1406,39 @@ class AppState:
             if not confirm:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Confirmation required for a live order.")
+            if self._broker_closed():
+                return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                   lots=lots, message="Angel shows this position already "
+                                   "closed — no SELL sent. Confirm flat via /api/order-recovery.")
+            if check_broker and not partial:
+                row = self._angel_closed_row(sym)
+                if row:
+                    return self._sync_angel_close(sym, float(row["sell_avg"]), "Exit now")
+            now = time.time()
+            if now < self._exit_retry_at:
+                return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                   lots=lots, status="NOT_SENT",
+                                   message="Last SELL never reached Angel; retrying shortly.")
             res = self._submit_live("_pending_exit", sym, "SELL", lots)
             if not res.ok:
+                if res.status == "NOT_SENT" and not self._pending_exit:
+                    self._exit_retry_at = now + settings.live_exit_retry_sec
                 return res
             order_id = res.order_id
             lots = int(res.filled_lots or lots)
             exit_px = res.fill_premium
+        else:
+            # Paper exits receive the bid when a two-sided book exists.
+            try:
+                q = next((x for x in self.provider.option_chain() if x.symbol == sym), None)
+            except Exception:
+                q = None
+            if q is not None and q.bid and q.ask and 0 < q.bid <= q.ask:
+                exit_px = float(q.bid)
+            if fill_px is not None and fill_px > 0:
+                # PAPER resting limit (a target): filled at the level, or at a
+                # better bid.
+                exit_px = max(float(fill_px), exit_px or 0.0)
         return self._book_exit(lots, order_id, exit_px)
 
     def _book_exit(self, lots: int, order_id: str | None,
@@ -1213,7 +1529,7 @@ class AppState:
         # be checked against a contract note instead of being taken on trust.
         exit_prem = self.position.current_premium
         charges_now = option_costs.charges(
-            entry_prem, exit_prem, spec_now.lot_size * lots
+            entry_prem, exit_prem, spec_now.lot_size * lots, self._instrument
         )
         trade_row.update(charges_now.as_dict())
         # Top-of-book at both ends, or COST_STATUS UNKNOWN. Never a modelled
@@ -1273,6 +1589,7 @@ class AppState:
             self.position.quantity_lots = held - lots
             self._auto_entry_lots = max(0, self._auto_entry_lots - lots)
             self._ledger_after_exit(held - lots)
+            self._paper_pos_saved_at = 0.0
             self._add_alert(
                 "EXIT_NOW",
                 f"[{mode}] Scaled out {lots}/{held} {sym} net {pnl:+.0f}",
@@ -1284,10 +1601,14 @@ class AppState:
         self._entry_factors = []
         self._entry_context = {}
         self._auto_last_exit_ts = int(time.time())
+        self._auto_last_exit_was_stop = str(
+            trade_row.get("exit_reason") or "").upper().startswith("STOP")
         self._add_alert("EXIT_NOW", f"[{mode}] Exited {sym} net {pnl:+.0f}", "info")
         self.position = Position()
         self._entry_time = None
         self._ledger_after_exit(0)
+        self._paper_pos_saved_at = 0.0
+        self._save_paper_position(time.time())
         return OrderResult(ok=True, mode=mode.lower(), side="SELL", option_symbol=sym,
                            lots=lots, fill_premium=exit_prem, order_id=order_id,
                            message=f"Exited net {pnl:+.0f}")
@@ -1314,9 +1635,13 @@ class AppState:
         provider_note = self.provider.reason if isinstance(self.provider, _UnavailableProvider) else None
         self.provider.step()
         self._poll_live_orders()
+        self._save_paper_position(time.time())
         _mark_stage(self._instrument, "cache")
         now = int(time.time())
-        candles = self.provider.futures_candles(300)
+        # v3.5.46: REST history extended with the 1-minute bars built from the
+        # live ticks, so the trend is read on current prices even when the
+        # key's history budget is behind. Same series the futures plan uses.
+        candles = self.provider.futures_candles_live(300) or self.provider.futures_candles(300)
         if not candles and not provider_note:
             # Instrument resolved and may be streaming a live price, but the
             # historical-candle feed returned nothing (rate-limit / no historical
@@ -1381,6 +1706,9 @@ class AppState:
             market_status, in_pos, pos_type,
             news_factor=news_session["factor"] * eg["factor"],
             spot=price,
+            option_atr=self._option_atr,
+            exchange=get_spec(self._instrument).exchange,
+            lot_size=int(get_spec(self._instrument).lot_size or 0),
         )
         self._last_breakdown = breakdown
         _mark_stage(self._instrument, "decision")
@@ -1647,6 +1975,7 @@ class AppState:
         # one definition and one report instead of two that can disagree.
         with signal_visibility.execution_context(self._instrument, decision):
             self._auto_trade(decision, in_pos, now)
+        self._save_live_mgmt()
         in_pos = bool(self.position.option_symbol)
         if in_pos and not was_in_pos:
             signal_visibility.mark_filled(
@@ -1657,6 +1986,8 @@ class AppState:
 
         # Journal v2 (record only): session, signal outcome, stop/target changes.
         journal_hooks.after_tick(self, decision, chain, was_in_pos, now)
+        # Parallel PAPER comparison books (ledger only; never the broker).
+        paper_books.on_tick(self, decision, chain, now)
 
         # Phase 23 — the break-even hurdle shadow. It runs AFTER the auto-trader
         # has decided, records this BUY opportunity with the measured book, and
@@ -1702,12 +2033,21 @@ class AppState:
 
         # selected option chart series
         sel_symbol = self.position.option_symbol or decision.recommended_option
-        sel_candles = self.provider.option_candles(sel_symbol) if sel_symbol else []
+        # Nothing recommended (WAIT/AVOID): follow the ATM option on the bias
+        # side so the option price, its day H/L and chart are never blank.
+        atm = self._atm_pair(chain, price)
+        disp_symbol, disp_premium = None, None
+        if not sel_symbol:
+            bear = (decision.htf_trend or "").upper() in ("DOWN", "BEARISH")
+            side = "pe" if bear else "ce"
+            disp_symbol, disp_premium = atm[f"atm_{side}_symbol"], atm[f"atm_{side}_premium"]
+        chart_symbol = sel_symbol or disp_symbol
+        sel_candles = self.provider.option_candles(chart_symbol) if chart_symbol else []
 
         # Official exchange day OHLC (matches the broker app). Falls back to
         # None on feeds that can't supply it; the UI then derives from candles.
         fut_ohlc = self.provider.day_ohlc()
-        opt_ohlc = self.provider.day_ohlc(sel_symbol) if sel_symbol else None
+        opt_ohlc = self.provider.day_ohlc(chart_symbol) if chart_symbol else None
         # Day change is measured against the PREVIOUS SESSION CLOSE (like the
         # broker) when available, not the previous 1-min bar.
         prev = candles[-2].close if len(candles) > 1 else price
@@ -1744,7 +2084,10 @@ class AppState:
         learning = learn.summarize(self.journal)
         # Show the ACTIVE universe (post auto-pick / QT_INSTRUMENTS) in the
         # dropdown, not the full master, so the dashboard focuses on today's set.
-        instruments = [InstrumentOption(symbol=s.symbol, display=s.display) for s in universe_specs()]
+        # Registry KEY, not the scrip name: "BAJAJ-AUTO" is keyed BAJAJAUTO, and
+        # sending the scrip name back used to open the default (Crude) instead.
+        instruments = [InstrumentOption(symbol=k, display=REGISTRY[k].display)
+                       for k in _instruments.UNIVERSE if k in REGISTRY]
 
         # ---- Phase 3.1 Intelligence Layer (ADVISORY, read-only) ------------
         # Computed alongside the frozen engine from data it already produced;
@@ -1800,6 +2143,9 @@ class AppState:
             futures_prev_close=fut_ohlc.get("prev_close") if fut_ohlc else None,
             option_day_high=opt_ohlc.get("high") if opt_ohlc else None,
             option_day_low=opt_ohlc.get("low") if opt_ohlc else None,
+            **atm,
+            display_option_symbol=disp_symbol,
+            display_option_premium=disp_premium,
             market_open=is_open,
             session_note=session_note,
             data_source=settings.data_provider,
@@ -1906,6 +2252,15 @@ class AppState:
         c.htf_trend = raw.htf_trend
         c.htf_strength = raw.htf_strength
         c.entry_trigger = raw.entry_trigger
+        c.entry_triggers = list(raw.entry_triggers)
+        if c.signal not in (Signal.BUY, Signal.HOLD, Signal.EXIT):
+            # No plan is held on a stand-aside call, so its strike is display
+            # only: follow this tick's pick, else one committed before the chain
+            # loaded stays blank ("—") until the signal changes. The contract and
+            # its premium follow too, so the card never pairs one strike's label
+            # with another strike's price.
+            c.strike, c.option_type = raw.strike, raw.option_type
+            c.recommended_option, c.current_premium = raw.recommended_option, raw.current_premium
         return self._decorate(now)
 
     def _decorate(self, now: float) -> Decision:
@@ -2068,10 +2423,103 @@ class AppState:
         lines.append("Paper/advisory alert — place the order manually per your risk plan.")
         notify.push("\n".join(lines))
 
+    def _live_squareoff_due(self, now: float) -> bool:
+        """LIVE only: past the intraday square-off time of this exchange."""
+        if settings.hours_ignored():
+            return False
+        exch = (get_spec(self._instrument).exchange or "").upper()
+        raw = (settings.auto_trade_live_squareoff_mcx_ist if exch == "MCX"
+               else settings.auto_trade_live_squareoff_equity_ist)
+        try:
+            h, m = (int(x) for x in str(raw).split(":"))
+        except ValueError:
+            return False
+        return account_risk.ist_minutes(now) >= h * 60 + m
+
+    def _live_entry_ask(self, opt: str | None) -> float:
+        """Current ask of ``opt`` from the feed (0 when unknown). Read-only."""
+        try:
+            q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+        except Exception:
+            q = None
+        return float(getattr(q, "ask", 0) or 0)
+
     def _auto_live_armed(self) -> bool:
         """True only when the bot is fully armed to place REAL orders: live feed +
         auto-trader on + the explicit second live switch. Any one missing → paper."""
         return bool(self.is_live and settings.auto_trade_enabled and settings.auto_trade_allow_live)
+
+    def _pullback_spread_and_risk_ok(self, decision: Decision, opt: str, now: float) -> bool:
+        """SPREAD OK? and RISK ACCEPTABLE? of the PAPER pullback engine."""
+        self._auto_entry_ask = 0.0
+        try:
+            q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+        except Exception:
+            q = None
+        bid = float(getattr(q, "bid", 0) or 0)
+        ask = float(getattr(q, "ask", 0) or 0)
+        spread = None
+        if bid > 0 and ask >= bid:
+            spread = (ask - bid) / ((ask + bid) / 2.0) * 100.0
+            if spread > settings.auto_trade_max_spread_pct:
+                self._auto_last_action = f"AUTO SKIP {opt}: spread {spread:.1f}% too wide"
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "VALIDATION", "SPREAD_TOO_WIDE", instrument=self._instrument, option=opt,
+                    value=round(spread, 2), threshold=settings.auto_trade_max_spread_pct,
+                    where="state.py:_pullback_spread_and_risk_ok", reason="bid/ask spread too wide",
+                )
+                return False
+        entry = ask if ask > 0 else float(decision.current_premium or 0.0)
+        stop = decision.stop_loss
+        if entry <= 0 or stop is None or stop >= entry:
+            exec_funnel.blocked(
+                "RISK", "INVALID_STOP", instrument=self._instrument, option=opt,
+                value=stop, where="state.py:_pullback_spread_and_risk_ok",
+                reason="stop is missing or not below the entry price",
+            )
+            return False
+        self._auto_entry_ask = ask
+        sig = float(decision.current_premium or 0.0)
+        chase_cap = settings.auto_trade_max_chase_pct
+        if chase_cap > 0 and ask > 0 and 0 < stop < sig < ask:
+            chase = (ask - sig) / (sig - stop) * 100.0
+            if chase > chase_cap:
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: ask {ask:.2f} is {chase:.0f}% of the stop above "
+                    f"the signal {sig:.2f}")
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "RISK", "ENTRY_CHASE", instrument=self._instrument, option=opt,
+                    value=round(chase, 1), threshold=chase_cap,
+                    where="state.py:_pullback_spread_and_risk_ok",
+                    reason="ask too far above the signal price for its stop",
+                )
+                return False
+        risk_pct = (entry - stop) / entry * 100.0
+        metals = {m.upper() for m in settings.auto_trade_metal_roots}
+        if self._instrument.upper() in metals and settings.auto_trade_metal_risk_caps:
+            caps = settings.auto_trade_metal_risk_caps
+            cap = float(caps[int(now // 60) % len(caps)])
+            label = f"metal cap {cap:g}%"
+        else:
+            cap = float(settings.auto_trade_max_structural_risk_pct)
+            label = f"risk cap {cap:g}%"
+        if cap > 0 and risk_pct > cap:
+            self._auto_last_action = (
+                f"AUTO SKIP {opt}: structural risk {risk_pct:.1f}% > {label}")
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "RISK", "STRUCTURAL_RISK", instrument=self._instrument, option=opt,
+                value=round(risk_pct, 2), threshold=cap,
+                where="state.py:_pullback_spread_and_risk_ok",
+                reason=f"natural stop {risk_pct:.1f}% away exceeds the {label}",
+            )
+            return False
+        self._auto_entry_note = (
+            f"pullback engine: spread {spread:.1f}%" if spread is not None else "pullback engine: spread n/a"
+        ) + f", structural risk {risk_pct:.1f}% within {label}"
+        return True
 
     def _auto_trade(self, decision: Decision, in_pos: bool, now: int) -> None:
         """Auto-trader: auto-enter on a BUY at/above the gate and auto-exit on the
@@ -2086,12 +2534,16 @@ class AppState:
                      each live entry is additionally bounded by a hard lots cap and
                      a per-order notional cap. If the live feed is up but the bot is
                      not armed for live, it stays completely hands-off."""
-        if not settings.auto_trade_enabled:
-            return
-        # Live feed but not armed for live orders → do nothing (never a surprise order).
-        if self.is_live and not settings.auto_trade_allow_live:
-            return
-        live = self._auto_live_armed()
+        # An open LIVE auto position keeps its exits running when the bot is
+        # switched off or the kill switch disarms it; only new entries stop.
+        manage_only = False
+        if not settings.auto_trade_enabled or (self.is_live and not settings.auto_trade_allow_live):
+            if not (self.is_live and in_pos and self._auto_entry_active):
+                return
+            manage_only = True
+        live = self._auto_live_armed() or manage_only
+        if in_pos and self._broker_closed():
+            return  # closed in Angel: no exits on a position that no longer exists
 
         # --- manage an open auto-position ---
         # Two exit styles:
@@ -2108,6 +2560,56 @@ class AppState:
             prem = p.current_premium
             if prem is None:
                 return
+            ltp_now = prem
+            if live and self._live_squareoff_due(now) and not self._carry_keep(p.option_symbol, now):
+                self._pending_exit_reason = "SQUARE-OFF"
+                self.sell(confirm=True)
+                self._auto_last_action = f"AUTO EXIT {p.option_symbol} · LIVE SQUARE-OFF"
+                self._auto_last_action_ts = now
+                self._reset_auto_trade_marks()
+                return
+            if (settings.auto_trade_exit_on_bid
+                    and (not live or settings.auto_trade_live_exit_on_bid)):
+                bid = self._own_bid()
+                if bid is not None:
+                    prem = bid  # judge every exit on the price a sell fills at
+            # Targets behave like a resting sell at the level: reached when the
+            # last trade OR the bid gets there. Stops and trails stay on the bid.
+            tgt_px = max(prem, ltp_now)
+            if ((not live or settings.auto_trade_live_loss_budget)
+                    and self._auto_entry_prem is not None):
+                with contextlib.suppress(Exception):
+                    acct = account_risk.account
+                    equity = acct.day_pnl + sum(
+                        o._liq_pnl() for o in registry.active() if o.position.option_symbol
+                    )
+                    if acct.must_flatten(equity):
+                        self._pending_exit_reason = "PROFIT LOCK"
+                        self.sell(confirm=live)
+                        self._auto_last_action = (
+                            f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · PROFIT LOCK "
+                            f"(day ₹{equity:,.0f} fell to the lock ₹{acct.lock_level() or 0:,.0f})"
+                        )
+                        self._auto_last_action_ts = now
+                        self._reset_auto_trade_marks()
+                        return
+            if self._stock_hold_active(live):
+                tgt = self._auto_target2 or self._auto_target1
+                entry = self._auto_entry_prem or p.entry_premium or 0.0
+                cap = settings.auto_trade_stock_hold_max_loss_rupees
+                qty = get_spec(self._instrument).lot_size * p.quantity_lots
+                if tgt is not None and tgt_px >= tgt:
+                    why = "STOCK HOLD TARGET"
+                elif cap > 0 and entry > 0 and (entry - prem) * qty >= cap:
+                    why = "STOCK HOLD MAX LOSS"
+                else:
+                    return
+                self._pending_exit_reason = why
+                self.sell(confirm=live)
+                self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {tgt_px if why.endswith('TARGET') else prem:.1f} · {why}"
+                self._auto_last_action_ts = now
+                self._reset_auto_trade_marks()
+                return
             if not settings.auto_trade_ride_trail:
                 stop = max(self._auto_stop or 0.0, p.trailing_stop or 0.0)
                 if self._auto_target1 is not None and prem >= self._auto_target1:
@@ -2116,7 +2618,9 @@ class AppState:
                     self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · TARGET 1"
                     self._auto_last_action_ts = now
                     self._reset_auto_trade_marks()
-                elif stop > 0 and prem <= stop:
+                elif stop > 0 and prem <= stop and not (
+                        stop == (self._auto_stop or 0.0) and self._no_stop_loss_exit()
+                        and stop < (self._auto_entry_prem or p.entry_premium or 0.0)):
                     reason = "TRAIL STOP" if (p.trailing_stop and stop == p.trailing_stop) else "STOP LOSS"
                     self._pending_exit_reason = reason
                     self.sell(confirm=live)
@@ -2136,11 +2640,16 @@ class AppState:
                     lvl = "T3+ RATCHET"
                 elif t3 is not None and abs(prev_floor - t3) < 1e-6:
                     lvl = "TARGET 3"
+                elif t2 is not None and prev_floor > t2 + 1e-6:
+                    lvl = "T2 RATCHET"
                 elif t2 is not None and abs(prev_floor - t2) < 1e-6:
                     lvl = "TARGET 2"
+                elif t1 is not None and prev_floor > t1 + 1e-6:
+                    lvl = "T1 RATCHET"
                 else:
                     lvl = "TARGET 1"
                 self._pending_exit_reason = f"{lvl} lock"
+                # A floor is hit on the way DOWN: it is a stop, filled at the bid.
                 self.sell(confirm=live)
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {lvl} lock"
                 self._auto_last_action_ts = now
@@ -2153,7 +2662,7 @@ class AppState:
             # the first tick that falls back to it (i.e. once the move rolls over).
             # Note this cannot exit AT the top — a trail only knows the peak has
             # passed after price comes off it, so one step is always given back.
-            if t3 is not None and prem >= t3:
+            if t3 is not None and tgt_px >= t3:
                 floor = t3
                 if settings.auto_trade_beyond_t3_ratchet:
                     # Step sized as a % of the CURRENT premium so the giveback scales
@@ -2165,14 +2674,35 @@ class AppState:
                     )
                     if step > 0:
                         floor = t3 + int((prem - t3) // step) * step
+                if settings.auto_trade_tiered_exit:
+                    self._auto_peak = max(self._auto_peak or prem, prem)
+                    runner = self._auto_peak * (1.0 - settings.tier_t3_runner_trail_pct / 100.0)
+                    floor = max(floor, t3, runner)
                 if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
                     self._auto_tgt_floor = floor
-            elif t2 is not None and prem >= t2:
-                if self._auto_tgt_floor is None or t2 > self._auto_tgt_floor:
-                    self._auto_tgt_floor = t2
-            elif t1 is not None and prem >= t1:
-                if self._auto_tgt_floor is None or t1 > self._auto_tgt_floor:
-                    self._auto_tgt_floor = t1
+            elif t2 is not None and tgt_px >= t2:
+                floor = t2
+                if settings.auto_trade_tiered_exit and t1 is not None:
+                    self._auto_peak = max(self._auto_peak or prem, prem)
+                    floor = max(t2, self._auto_peak - (self._auto_peak - t1)
+                                * settings.tier_t2_giveback_pct / 100.0)
+                if self._auto_tgt_floor is None or floor > self._auto_tgt_floor:
+                    self._auto_tgt_floor = floor
+            elif t1 is not None and tgt_px >= t1:
+                # Stage C (T1 -> T2): the runner's floor starts a buffer BELOW T1
+                # (tier_t1_runner_buffer_pct of entry->T1), so a bid flicker at T1
+                # no longer closes it seconds after the scale-out; then it trails
+                # the peak and only ever moves up.
+                entry_ref = self._auto_entry_prem or p.entry_premium or 0.0
+                t1_floor = t1 - max(0.0, t1 - entry_ref) * settings.tier_t1_runner_buffer_pct / 100.0
+                if (settings.auto_trade_tiered_exit and self._auto_tgt_floor is not None
+                        and self._auto_tgt_floor >= t1_floor - 1e-9):
+                    self._auto_peak = max(self._auto_peak or prem, prem)
+                    f_c = self._auto_peak - (self._auto_peak - t1_floor) * settings.tier_t1_giveback_pct / 100.0
+                    if f_c > self._auto_tgt_floor:
+                        self._auto_tgt_floor = f_c
+                if self._auto_tgt_floor is None or t1_floor > self._auto_tgt_floor + 1e-9:
+                    self._auto_tgt_floor = t1_floor
                     # SCALE-OUT: bank part of the position at T1 and let the rest
                     # ride toward T2/T3. Walk-forward measured: NIFTY PF
                     # 1.098 -> 1.162, CRUDEOIL 1.143 -> 1.172.
@@ -2189,7 +2719,8 @@ class AppState:
                             ),
                         )
                         self._pending_exit_reason = "SCALE-OUT T1"
-                        res = self.sell(confirm=live, lots=book)
+                        res = self.sell(confirm=live, lots=book,
+                                        fill_px=(max(prem, t1) if not live else None))
                         if res.ok:
                             self._auto_scaled_out = True
                             self._auto_stop = max(
@@ -2235,7 +2766,8 @@ class AppState:
             # T1: track the running high and, once we're meaningfully advanced
             # toward T1, exit if price gives back a share of the run from that peak
             # (locks the high instead of drifting back to the hard stop).
-            if self._auto_tgt_floor is None and settings.auto_trade_pre_t1_trail:
+            if (self._auto_tgt_floor is None and settings.auto_trade_pre_t1_trail
+                    and p.quantity_lots >= max(1, settings.auto_trade_pre_t1_trail_min_lots)):
                 entry = self._auto_entry_prem or p.entry_premium
                 if self._auto_peak is None or prem > self._auto_peak:
                     self._auto_peak = prem
@@ -2277,11 +2809,32 @@ class AppState:
                         peak is not None
                         and peak >= entry * (1.0 + settings.auto_trade_pre_t1_trail_arm_profit_pct / 100.0)
                     )
-                    if peak is not None and (arm_by_t1 or arm_by_profit):
+                    arm_rs = settings.auto_trade_pre_t1_trail_arm_rupees
+                    qty = int(get_spec(self._instrument).lot_size or 0) * int(
+                        self._auto_entry_lots or p.quantity_lots or 0
+                    )
+                    arm_by_rupees = (
+                        arm_rs > 0 and peak is not None and qty > 0
+                        and (peak - entry) * qty >= arm_rs
+                    )
+                    lock_pts = self._pre_t1_lock_points()
+                    be = entry + self._exit_cost_per_unit(entry)
+                    lock_px = be + lock_pts if lock_pts > 0 else None
+                    locked = lock_px is not None and peak is not None and peak >= lock_px
+                    mcx_hold = self._mcx_hold()
+                    if mcx_hold:
+                        # MCX: let small profits run; nothing arms before +arm pts.
+                        lock_px = be + settings.mcx_hold_floor_points
+                        locked = peak is not None and peak >= be + settings.mcx_hold_arm_points
+                        arm_by_t1 = arm_by_profit = arm_by_rupees = False
+                    if peak is not None and (locked or arm_by_t1 or arm_by_profit or arm_by_rupees):
                         # Once we've seen real profit, ratchet the hard stop up to
-                        # break-even so a green trade can't become a full loss.
+                        # break-even (after charges) so a green trade can't become a loss.
                         if settings.auto_trade_breakeven_after_arm:
-                            self._auto_stop = max(self._auto_stop or 0.0, entry)
+                            self._auto_stop = max(self._auto_stop or 0.0, be)
+                        if locked:
+                            self._auto_stop = max(self._auto_stop or 0.0, lock_px)
+                        base_floor = lock_px if locked else be
                         run = peak - entry
                         pct_floor = settings.auto_trade_pre_t1_trail_min_giveback_pct
                         floor = (
@@ -2293,24 +2846,68 @@ class AppState:
                             floor,
                             run * (settings.auto_trade_pre_t1_trail_giveback_pct / 100.0),
                         )
-                        trail = peak - giveback
-                        if prem <= trail and prem > entry:
-                            self._pending_exit_reason = "PRE-T1 PEAK TRAIL"
+                        if mcx_hold:
+                            giveback = max(giveback, settings.mcx_hold_min_giveback_points)
+                        trail = max(peak - giveback, base_floor)
+                        hit = prem <= trail and (locked or prem > entry)
+                        halved = getattr(self, "_auto_pre_t1_halved", False)
+                        if (hit and not halved
+                                and settings.auto_trade_pre_t1_half_out
+                                and p.quantity_lots >= 2):
+                            # Bank half; the rest holds with the locked / break-even
+                            # stop until T1 (price-path replay: early trails left
+                            # T1 runs on the table).
+                            book = p.quantity_lots // 2
+                            self._pending_exit_reason = "PRE-T1 HALF OUT"
+                            res = self.sell(confirm=live, lots=book)
+                            if res.ok:
+                                self._auto_pre_t1_halved = True
+                                self._auto_stop = max(self._auto_stop or 0.0, base_floor)
+                                self._auto_last_action = (
+                                    f"AUTO HALF OUT {book} lot(s) {p.option_symbol} @ "
+                                    f"{prem:.1f} · peak trail — rest holds to T1, stop at "
+                                    f"{base_floor:.1f}")
+                                self._auto_last_action_ts = now
+                            return
+                        if hit and not halved:
+                            why = ("PRE-T1 PROFIT LOCK" if locked and trail <= base_floor
+                                   else "PRE-T1 PEAK TRAIL")
+                            self._pending_exit_reason = why
                             self.sell(confirm=live)
                             self._auto_last_action = (
-                                f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · peak trail "
-                                f"(high {peak:.1f})"
+                                f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why.lower()} "
+                                f"(high {peak:.1f}, floor {trail:.1f})"
                             )
                             self._auto_last_action_ts = now
                             self._reset_auto_trade_marks()
                             return
-            # before any target is reached the hard stop still protects the trade
-            if self._auto_tgt_floor is None and self._auto_stop and prem <= self._auto_stop:
-                self._pending_exit_reason = "STOP LOSS"
+            np_min = settings.auto_trade_no_progress_exit_min
+            if (np_min > 0 and self._auto_tgt_floor is None and self._entry_time
+                    and entry_prem and (self._auto_stop or 0.0) < entry_prem
+                    and not getattr(self, "_auto_pre_t1_halved", False)
+                    and now - self._entry_time >= np_min * 60):
+                self._pending_exit_reason = "NO-PROGRESS EXIT"
                 self.sell(confirm=live)
-                self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · STOP LOSS"
+                self._auto_last_action = (
+                    f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · no progress in "
+                    f"{np_min:g} min (trail never armed)")
                 self._auto_last_action_ts = now
                 self._reset_auto_trade_marks()
+                return
+            # before any target is reached the hard stop still protects the trade
+            if self._auto_tgt_floor is None and self._auto_stop and prem <= self._auto_stop:
+                ent = self._auto_entry_prem or p.entry_premium or 0.0
+                why = ("BREAK-EVEN STOP" if getattr(self, "_auto_pre_t1_halved", False)
+                       or (ent > 0 and self._auto_stop >= ent) else "STOP LOSS")
+                if why == "STOP LOSS" and self._no_stop_loss_exit():
+                    return
+                self._pending_exit_reason = why
+                self.sell(confirm=live)
+                self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why}"
+                self._auto_last_action_ts = now
+                self._reset_auto_trade_marks()
+            return
+        if manage_only:
             return
 
         # --- consider a fresh auto-entry ---
@@ -2336,22 +2933,53 @@ class AppState:
             return
         opt = decision.recommended_option or ""
         exec_funnel.reached("SIGNAL")
-        if decision.confidence < settings.auto_trade_min_confidence:
+        # PAPER pullback engine: TRENDING -> PULLBACK -> quote -> spread -> risk -> BUY.
+        eng = settings.auto_trade_pullback_engine and (
+            not live or settings.auto_trade_live_pullback_engine)
+        if live and self._live_squareoff_due(now):
             exec_funnel.blocked(
-                "RISK", "CONFIDENCE_FLOOR", instrument=self._instrument, option=opt,
-                value=round(decision.confidence, 1),
-                threshold=settings.auto_trade_min_confidence,
-                where="state.py:_auto_trade",
-                reason="confidence below the auto-entry floor",
+                "RISK", "LIVE_SQUAREOFF_TIME", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade", reason="past the live intraday square-off time",
             )
             return
+        _only = {s.strip().upper() for s in (settings.auto_trade_instruments or "").split(",") if s.strip()}
+        if _only and (self._instrument or "").upper() not in _only:
+            self._auto_last_action = (
+                f"AUTO SKIP {opt}: {self._instrument} not in auto-trade instruments "
+                f"({','.join(sorted(_only))})")
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "SIGNAL", "INSTRUMENT_NOT_ALLOWED", instrument=self._instrument, option=opt,
+                value=self._instrument, threshold=",".join(sorted(_only)),
+                where="state.py:_auto_trade", reason="instrument not in QT_AUTO_TRADE_INSTRUMENTS",
+            )
+            return
+        _mini = dict(p.split(":", 1) for p in (settings.auto_trade_metal_mini or "").upper()
+                     .replace(" ", "").split(",") if ":" in p)
+        if (self._instrument or "").upper() in _mini:
+            m = _mini[(self._instrument or "").upper()]
+            self._auto_last_action = f"AUTO SKIP {opt}: {self._instrument} is bought as {m} (mini)"
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "SIGNAL", "TRADED_AS_MINI", instrument=self._instrument, option=opt, value=m,
+                where="state.py:_auto_trade",
+                reason=f"{self._instrument} auto-buys go to {m} (QT_AUTO_TRADE_METAL_MINI)",
+            )
+            return
+        self._auto_entry_note = ""
         if settings.auto_trade_strategy_gate:
             trig = (decision.entry_trigger or "").upper()
             regime = (getattr(self, "_last_market_status", "") or "").upper()
             allowed_t = {t.upper() for t in settings.auto_trade_allowed_triggers}
+            if live:  # v3.5.49: a blocked setup alone never buys live; with another allowed one it does
+                allowed_t -= {t.upper() for t in settings.auto_trade_live_blocked_triggers}
             allowed_r = {r.upper() for r in settings.auto_trade_allowed_regimes}
-            if trig not in allowed_t or regime not in allowed_r:
-                blocker = "STRATEGY_TRIGGER" if trig not in allowed_t else "STRATEGY_REGIME"
+            # A tick can satisfy several triggers; entry_trigger names only the
+            # highest-priority one (PULLBACK outranks MOMENTUM/RETEST), so check all.
+            trig_ok = trig in allowed_t or any(
+                t.upper() in allowed_t for t in (decision.entry_triggers or []))
+            if not trig_ok or regime not in allowed_r:
+                blocker = "STRATEGY_TRIGGER" if not trig_ok else "STRATEGY_REGIME"
                 self._auto_last_action = (
                     f"AUTO SKIP {opt}: strategy needs {'/'.join(sorted(allowed_t))} in "
                     f"{'/'.join(sorted(allowed_r))} (got {trig or 'none'} in {regime or 'unknown'})"
@@ -2365,11 +2993,20 @@ class AppState:
                     reason="not a pullback entry in a trending market",
                 )
                 return
+        if decision.confidence < settings.auto_trade_min_confidence:
+            exec_funnel.blocked(
+                "RISK", "CONFIDENCE_FLOOR", instrument=self._instrument, option=opt,
+                value=round(decision.confidence, 1),
+                threshold=settings.auto_trade_min_confidence,
+                where="state.py:_auto_trade",
+                reason="confidence below the auto-entry floor",
+            )
+            return
         # Confidence CEILING (default 100 = off). Measured three sessions running,
         # the score inverts at the top end: 13 Aug, >=95% produced 8 trades, 2
         # wins, -Rs10,712, while <80% lost a tenth of that. The knob exists so
         # that can be acted on without silently rewriting the score.
-        if decision.confidence > settings.auto_trade_max_confidence:
+        if not eng and decision.confidence > settings.auto_trade_max_confidence:
             self._auto_last_action = (
                 f"AUTO SKIP {decision.recommended_option}: confidence "
                 f"{decision.confidence:.0f}% is above the "
@@ -2384,12 +3021,27 @@ class AppState:
             )
             return
         if self._auto_last_key == key:
+            left = self._episode_rearm_wait(now)
+            if left is not None and left <= 0:
+                self._auto_last_key = None
+                self._auto_key_traded_ts = None
+        if self._auto_last_key == key:
+            left = self._episode_rearm_wait(now)
             exec_funnel.blocked(
                 "SIGNAL", "EPISODE_ALREADY_TRADED", instrument=self._instrument,
                 option=opt, where="state.py:_auto_trade",
-                reason="this signal episode has already been auto-traded",
+                reason=("this signal episode has already been auto-traded" if left is None
+                        else f"same setup was traded and closed; re-arms in {int(left)}s"),
             )
             return  # already auto-traded this signal episode; wait for a new one
+        retry_at = getattr(self, "_auto_unsent_retry_at", 0.0)
+        if now < retry_at:
+            exec_funnel.blocked(
+                "SIGNAL", "ORDER_NOT_SENT_RETRY", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade",
+                reason=f"last order never reached Angel; retrying in {int(retry_at - now)}s",
+            )
+            return
         exec_funnel.reached("RISK")
 
         # --- opening-window block: an option premium gaps THROUGH its stop in
@@ -2399,7 +3051,7 @@ class AppState:
         open_block = account_risk.account.opening_window_block(
             now, account_risk.session_open_min(get_spec(self._instrument).exchange)
         )
-        if open_block:
+        if open_block and not eng:
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {open_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(
@@ -2413,6 +3065,45 @@ class AppState:
         # ticks on a ₹7 option is a ~28% move, so no stop is meaningful there and
         # a capital-based size buys an absurd number of lots. Journal evidence:
         # 10 lots of a ₹7.2 option lost 28% in 18 minutes.
+        # --- execution eligibility: data, quote and contract metadata ---
+        if not self._feed_ready():
+            self._auto_last_action = f"AUTO SKIP {opt}: feed not ready (stale or disconnected)"
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "VALIDATION", "FEED_NOT_READY", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade", reason="market data is stale or disconnected",
+            )
+            return
+        if self._feed_health().source != "SIMULATED":
+            try:
+                q_now = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+            except Exception:
+                q_now = None
+            bid = getattr(q_now, "bid", None)
+            ask = getattr(q_now, "ask", None)
+            if not bid or not ask or bid <= 0 or ask < bid:
+                self._auto_last_action = f"AUTO SKIP {opt}: no executable two-sided quote"
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "VALIDATION", "NO_TWO_SIDED_QUOTE", instrument=self._instrument,
+                    option=opt, value=f"bid={bid} ask={ask}",
+                    where="state.py:_auto_trade", reason="no executable two-sided quote",
+                )
+                return
+        try:
+            lot_ok = int(get_spec(self._instrument).lot_size or 0) > 0
+        except Exception:
+            lot_ok = False
+        if not lot_ok:
+            self._auto_last_action = f"AUTO SKIP {opt}: contract lot size unknown"
+            self._auto_last_action_ts = now
+            exec_funnel.blocked(
+                "VALIDATION", "MISSING_METADATA", instrument=self._instrument, option=opt,
+                where="state.py:_auto_trade", reason="contract lot size unknown",
+            )
+            return
+        if eng and not self._pullback_spread_and_risk_ok(decision, opt, now):
+            return
         prem_now = float(decision.current_premium or 0.0)
 
         # --- stale feed guard: a premium that has not moved a single tick is not
@@ -2439,7 +3130,7 @@ class AppState:
             )
             return
 
-        if prem_now < settings.auto_trade_min_premium:
+        if not eng and prem_now < settings.auto_trade_min_premium:
             self._auto_last_action = (
                 f"AUTO SKIP {decision.recommended_option}: premium {prem_now:.1f} is "
                 f"below the ₹{settings.auto_trade_min_premium:g} floor — too cheap to "
@@ -2455,7 +3146,7 @@ class AppState:
 
         # --- opportunity gate: the SAME test the signal board shows, so the bot
         # never buys a contract the board is calling too quiet to pay for.
-        if settings.opportunity_gate_enabled:
+        if not eng and settings.opportunity_gate_enabled:
             ind_now = self._last_indicators
             opp = opportunity.score(
                 self._instrument,
@@ -2482,7 +3173,7 @@ class AppState:
         # restart — an in-memory cooldown handed the bot a fresh ladder every
         # time the backend came back up mid-session.
         cool_block = account_risk.account.instrument_blocked(self._instrument, now)
-        if cool_block:
+        if cool_block and not eng:
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {cool_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(
@@ -2493,7 +3184,8 @@ class AppState:
 
         # --- instrument allowlist: only trade what has a measured positive edge
         if (
-            settings.instrument_allowlist
+            not eng
+            and settings.instrument_allowlist
             and self._instrument not in settings.instrument_allowlist
         ):
             self._auto_last_action = f"AUTO SKIP {self._instrument}: not in the allowlist"
@@ -2506,7 +3198,7 @@ class AppState:
         # --- time-of-day filter: block the hours whose measured profit factor is
         # below 1 for this instrument (walk-forward validated; see config).
         blocked = settings.blocked_entry_hours.get(self._instrument) or []
-        if blocked:
+        if blocked and not eng:
             hour_ist = time.gmtime(now + 19800).tm_hour
             if hour_ist in blocked:
                 self._auto_last_action = (
@@ -2526,7 +3218,7 @@ class AppState:
         # says "wait for a pullback" we do NOT consume the episode — we can still enter
         # once the trigger actually fires.
         exec_funnel.reached("VALIDATION")
-        if settings.auto_trade_momentum_entry:
+        if not eng and settings.auto_trade_momentum_entry:
             trig = (decision.entry_trigger or "").upper()
             if trig in ("WAIT_PULLBACK", "NONE", ""):
                 self._auto_last_action = (
@@ -2554,7 +3246,7 @@ class AppState:
 
         # --- B) no-chase filter: skip an already-extended / trap-like move so we don't
         # buy the top. Uses the engine's own buy-trap probability + premium health.
-        if settings.auto_trade_no_chase:
+        if not eng and settings.auto_trade_no_chase:
             if (
                 decision.buy_trap_prob >= settings.auto_trade_no_chase_trap_prob
                 or (decision.premium_health or "").upper() == "DANGEROUS"
@@ -2574,7 +3266,16 @@ class AppState:
                 )
                 return
 
+        # RISK_GATE: the pullback engine is gated like every other entry —
+        # daily loss, daily profit target, giveback from the day's equity peak,
+        # trade cap, loss streak, max concurrent and the manual kill switch.
+        with contextlib.suppress(Exception):
+            account_risk.account.note_equity(
+                now, sum(o._liq_pnl() for o in registry.active()
+                         if o.position.option_symbol))
         can, _reason = self.risk.can_open(time.time())
+        if can and live and live_control.kill_switch_engaged():
+            can, _reason = False, "kill switch engaged (live)"
         if not can:
             exec_funnel.blocked(
                 "RISK", "RISK_GOVERNOR", instrument=self._instrument, option=opt,
@@ -2658,7 +3359,8 @@ class AppState:
 
         # LIVE safeguards: a hard lots cap + a per-order notional ceiling so a single
         # real order can never exceed the configured blast radius.
-        if live:
+        live_cap_sized = bool(live and eng and settings.auto_trade_live_capital_sizing)
+        if live and not live_cap_sized:
             lots = max(1, min(lots, settings.auto_trade_live_max_lots))
             order_value = (decision.current_premium or 0.0) * lot_size * lots
             if order_value > settings.auto_trade_live_max_order_value:
@@ -2727,14 +3429,114 @@ class AppState:
                     reason="not enough free capital for a single lot",
                 )
                 return
-            if affordable < lots:
+            if eng and (settings.auto_trade_capital_sizing if not live else live_cap_sized):
+                # As many lots as the free capital pays for (LIVE: QT_CAPITAL).
+                lots = affordable
+            elif affordable < lots:
                 lots = affordable
 
+        # LOSS BUDGET (paper): the stop-out of this trade may not exceed the
+        # per-trade rupee cap, nor (once the day lock is armed) its share of the
+        # room above the lock — a single trade can't give back the locked day.
+        live_ask = 0.0
+        if live and settings.auto_trade_live_loss_budget and lots >= 1 and not eng:
+            live_ask = self._live_entry_ask(opt)
+            sig = float(decision.current_premium or 0.0)
+            stop = float(decision.stop_loss) if decision.stop_loss is not None else 0.0
+            chase_cap = settings.auto_trade_max_chase_pct
+            if chase_cap > 0 and live_ask > 0 and 0 < stop < sig < live_ask:
+                chase = (live_ask - sig) / (sig - stop) * 100.0
+                if chase > chase_cap:
+                    self._auto_last_action = (
+                        f"AUTO SKIP {opt}: ask {live_ask:.2f} is {chase:.0f}% of the stop "
+                        f"above the signal {sig:.2f}")
+                    self._auto_last_action_ts = now
+                    self._auto_last_key = key
+                    exec_funnel.blocked(
+                        "RISK", "ENTRY_CHASE", instrument=self._instrument, option=opt,
+                        value=round(chase, 1), threshold=chase_cap,
+                        where="state.py:_auto_trade", reason="live ask too far above the signal",
+                    )
+                    return
+        if ((not live or settings.auto_trade_live_loss_budget)
+                and lots >= 1 and decision.stop_loss is not None):
+            acct = account_risk.account
+            equity = acct.day_pnl + sum(
+                o._liq_pnl() for o in registry.active() if o.position.option_symbol)
+            budget = account_risk.entry_loss_budget(
+                acct.day_peak_equity, equity,
+                per_trade_cap=settings.auto_trade_max_loss_rupees,
+                lock=acct.lock_level())
+            # Size on the price a buy fills at (the ask), not the signal premium.
+            entry_est = max(float(decision.current_premium or 0.0),
+                            float(getattr(self, "_auto_entry_ask", 0.0) or 0.0) if eng else 0.0,
+                            live_ask)
+            stop_est = float(decision.stop_loss)
+            stop_pts = settings.auto_trade_stop_points.get(self._instrument)
+            if stop_pts and stop_pts > 0:
+                stop_est = entry_est - float(stop_pts)
+            elif settings.auto_trade_max_stop_pct > 0:
+                stop_est = max(stop_est, entry_est * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
+            if budget is not None and entry_est > 0:
+                fit = account_risk.lots_for_budget(budget, entry_est, stop_est, lot_size)
+                if fit < 1:
+                    self._auto_last_action = (
+                        f"AUTO SKIP {decision.recommended_option}: 1 lot risks more than "
+                        f"the loss budget ₹{budget:,.0f}"
+                    )
+                    self._auto_last_action_ts = now
+                    self._auto_last_key = key
+                    exec_funnel.blocked(
+                        "RISK", "LOSS_BUDGET", instrument=self._instrument, option=opt,
+                        value=round((entry_est - stop_est) * lot_size, 0),
+                        threshold=round(budget, 0), where="state.py:_auto_trade",
+                        reason="one lot's stop-out exceeds the per-trade cap / daily room / lock room",
+                    )
+                    return
+                if fit < lots:
+                    lots = fit
+                    note = f"lots cut to {fit} by loss budget ₹{budget:,.0f}"
+                    prev = getattr(self, "_auto_entry_note", "") or ""
+                    self._auto_entry_note = f"{prev}; {note}" if prev else note
+
+        if live_cap_sized and lots >= 1:
+            px = max(float(decision.current_premium or 0.0),
+                     float(getattr(self, "_auto_entry_ask", 0.0) or 0.0))
+            per_lot = px * lot_size
+            fit = int(settings.auto_trade_live_max_order_value // per_lot) if per_lot > 0 else 0
+            if fit < 1:
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: one lot ₹{per_lot:,.0f} > live order cap "
+                    f"₹{settings.auto_trade_live_max_order_value:,.0f}")
+                self._auto_last_action_ts = now
+                self._auto_last_key = key
+                exec_funnel.blocked(
+                    "EXECUTION", "LIVE_ORDER_VALUE_CAP", instrument=self._instrument,
+                    option=opt, value=round(per_lot, 0),
+                    threshold=settings.auto_trade_live_max_order_value,
+                    where="state.py:_auto_trade", reason="one lot above the live order cap",
+                )
+                return
+            lots = min(lots, fit)
+
+        if self._stock_hold_active(live):
+            lots = 1
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")
         res = self.buy(decision.recommended_option, lots=lots, confirm=live,
                        manual=False)
         self._auto_last_key = key
+        self._auto_key_traded_ts = float(now) if res.ok else None
+        prev_key, tries = getattr(self, "_auto_unsent", (None, 0))
+        tries = tries if prev_key == key else 0
+        if (not res.ok and res.status == "NOT_SENT" and not res.order_id
+                and not self._pending_order and tries < settings.auto_trade_unsent_max_retries):
+            # Nothing reached Angel: the still-valid signal may buy again shortly.
+            self._auto_unsent = (key, tries + 1)
+            self._auto_last_key = None
+            self._auto_unsent_retry_at = float(now) + settings.auto_trade_unsent_retry_sec
+        elif res.ok:
+            self._auto_unsent = (None, 0)
         if not res.ok:
             exec_funnel.blocked(
                 "ACCEPTED", "ORDER_REJECTED", instrument=self._instrument, option=opt,
@@ -2748,6 +3550,9 @@ class AppState:
             self._auto_target2 = decision.target2
             self._auto_target3 = decision.target3
             self._auto_stop = decision.stop_loss
+            if live and self._ledger_position is not None:
+                self._ledger_position.update(t1=decision.target1, t2=decision.target2)
+                self._persist_state()
             # Cap how far the hard stop may sit below entry (one-click Live
             # Auto-Buy sets this) so a single trade can't bleed to a distant stop.
             entry_fill = res.fill_premium
@@ -2780,6 +3585,48 @@ class AppState:
             )
             self._auto_last_action_ts = now
 
+    def _no_stop_loss_exit(self) -> bool:
+        """v3.5.47: this instrument's exchange has no stop-loss exit."""
+        try:
+            exch = get_spec(self._instrument).exchange.upper()
+        except Exception:
+            return False
+        return exch in {e.upper() for e in settings.auto_trade_no_stop_loss_exchanges}
+
+    def _stock_hold_active(self, live: bool) -> bool:
+        """v3.5.32: LIVE single-stock option under the hold-to-T2 rule."""
+        if not (live and settings.auto_trade_stock_hold_to_target):
+            return False
+        from app.analysis.instrument_family import INDEX_ROOTS
+        try:
+            spec = get_spec(self._instrument)
+        except Exception:
+            return False
+        return spec.exchange in ("NFO", "BFO") and self._instrument.upper() not in INDEX_ROOTS
+
+    def _buy_product(self) -> str | None:
+        """v3.5.33: broker product for a new live buy (None = the default angel_product)."""
+        if settings.auto_trade_stock_hold_carry_forward and self._stock_hold_active(True):
+            return settings.angel_product_carry
+        return None
+
+    def _carry_keep(self, sym: str | None, now: float) -> bool:
+        """v3.5.33: keep a CARRYFORWARD stock hold past the square-off, unless expiry is near
+        (or unknown)."""
+        led = self._ledger_position or {}
+        if not (settings.auto_trade_stock_hold_carry_forward and sym and led.get("symbol") == sym
+                and led.get("product") == settings.angel_product_carry):
+            return False
+        import datetime as _dt
+        import re as _re
+        m = _re.search(r"(\d{2})([A-Z]{3})(\d{2})\d+(?:\.\d+)?(?:CE|PE)$", sym.upper())
+        try:
+            exp = _dt.datetime.strptime("".join(m.groups()), "%d%b%y").date()
+        except (AttributeError, ValueError):
+            return False
+        today = _dt.datetime.fromtimestamp(now, _dt.timezone(_dt.timedelta(hours=5, minutes=30))).date()
+        return (exp - today).days > settings.auto_trade_stock_hold_exit_days_before_expiry
+
     def _early_target_points(self, entry: float | None) -> float | None:
         """Premium points for the early profit-lock, floored at a minimum R.
 
@@ -2805,15 +3652,134 @@ class AppState:
             target = max(target, (entry - stop) * settings.auto_trade_min_target_r)
         return target
 
-    def _reset_auto_trade_marks(self) -> None:
+    def _pre_t1_lock_points(self) -> float:
+        by = settings.auto_trade_pre_t1_lock_points_by_instrument or {}
+        if self._instrument in by:
+            return max(0.0, float(by[self._instrument] or 0.0))
+        base = settings.auto_trade_pre_t1_lock_points
+        if base <= 0:
+            return 0.0
+        hq = settings.auto_trade_pre_t1_lock_high_qty
+        if hq > 0 and int(get_spec(self._instrument).lot_size or 0) >= hq:
+            return max(0.0, settings.auto_trade_pre_t1_lock_points_high_qty)
+        return base
+
+    def _option_atr(self, symbol: str | None) -> float | None:
+        """The option's own 1-min ATR (premium points); None without enough candles."""
+        n = max(2, int(settings.vol_atr_period or 14))
+        if not symbol:
+            return None
+        try:
+            cs = self.provider.option_candles(symbol, limit=n + 30) or []
+        except Exception:
+            return None
+        cs = [c for c in cs if c.high and c.low and c.close and c.high >= c.low]
+        if len(cs) < n + 1:
+            return None
+        tr = [max(cs[i].high - cs[i].low, abs(cs[i].high - cs[i - 1].close),
+                  abs(cs[i].low - cs[i - 1].close)) for i in range(len(cs) - n, len(cs))]
+        v = sum(tr) / n
+        return float(v) if v > 0 else None
+
+    def _mcx_hold(self) -> bool:
+        spec = get_spec(self._instrument)
+        hq = settings.auto_trade_pre_t1_lock_high_qty
+        return (str(spec.exchange).upper() == "MCX" and settings.mcx_hold_arm_points > 0
+                and not (hq > 0 and int(spec.lot_size or 0) >= hq))
+
+    def relevel_auto(self, use_vol: bool = False, stop: float | None = None,
+                     t1: float | None = None, t2: float | None = None,
+                     t3: float | None = None) -> dict:
+        """Re-set the OPEN bot trade's stop and targets (pre-T1 only). Never sends
+        an order; refuses a stop at/above the current price (that would sell now)."""
+        p = self.position
+        if not p.option_symbol or not self._auto_entry_active:
+            return {"ok": False, "message": "No open bot trade on this instrument."}
+        if self._auto_tgt_floor is not None:
+            return {"ok": False, "message": "T1 already locked; levels are managed by the ratchet."}
+        entry = float(self._auto_entry_prem or p.entry_premium or 0.0)
+        if entry <= 0:
+            return {"ok": False, "message": "Entry premium unknown."}
+        atr_v = None
+        if use_vol:
+            atr_v = self._option_atr(p.option_symbol)
+            spec = get_spec(self._instrument)
+            lv = eng.vol_levels(entry, atr_v, spec.exchange, int(spec.lot_size or 0)) if atr_v else None
+            if lv is None:
+                return {"ok": False, "message": "No option 1-min candles yet; try again in a minute."}
+            stop, t1, t2, t3 = (round(entry - lv[0], 1), round(entry + lv[1], 1),
+                                round(entry + lv[2], 1), round(entry + lv[3], 1))
+        stop = self._auto_stop if stop is None else float(stop)
+        t1 = self._auto_target1 if t1 is None else float(t1)
+        t2 = self._auto_target2 if t2 is None else float(t2)
+        t3 = self._auto_target3 if t3 is None else float(t3)
+        now_px = self._own_bid() or p.current_premium
+        if stop is None or stop <= 0:
+            return {"ok": False, "message": "Stop must be above 0."}
+        if now_px is not None and stop >= float(now_px):
+            return {"ok": False, "message": (
+                f"Stop {stop:.1f} is at/above the current price {float(now_px):.1f}; that would sell "
+                "immediately. Use Exit instead.")}
+        if not (t1 and t2 and t3 and entry < t1 < t2 < t3):
+            return {"ok": False, "message": "Targets must be above entry and T1 < T2 < T3."}
+        old = (self._auto_stop, self._auto_target1, self._auto_target2, self._auto_target3)
+        # A profit lock already above entry is never loosened.
+        if old[0] is not None and old[0] >= entry:
+            stop = max(stop, old[0])
+        self._auto_stop = round(stop, 2)
+        self._auto_target1, self._auto_target2, self._auto_target3 = t1, t2, t3
+        if self.is_live and self._ledger_position is not None:
+            self._save_live_mgmt(force=True)
+        else:
+            with contextlib.suppress(Exception):
+                self._save_paper_position(time.time())
+        msg = (f"Levels re-set {p.option_symbol}: stop {self._auto_stop:.1f}, T1 {t1:.1f}, "
+               f"T2 {t2:.1f}, T3 {t3:.1f}" + (f" (option ATR {atr_v:.1f})" if atr_v else ""))
+        self._add_alert("LEVELS", msg, "info")
+        self._auto_last_action = msg
+        self._auto_last_action_ts = int(time.time())
+        return {"ok": True, "message": msg, "old": old,
+                "new": (self._auto_stop, t1, t2, t3), "option_atr": atr_v}
+
+    def _exit_cost_per_unit(self, entry: float) -> float:
+        """Round-trip charges per unit of premium, so a floor at entry + this
+        books zero net, not a loss."""
+        if not settings.auto_trade_lock_covers_charges or entry <= 0:
+            return 0.0
+        qty = int(get_spec(self._instrument).lot_size or 0) * int(
+            self._auto_entry_lots or self.position.quantity_lots or 1)
+        if qty <= 0:
+            return 0.0
+        try:
+            return float(option_costs.charges(entry, entry, qty, self._instrument).total) / qty
+        except Exception:
+            return 0.0
+
+    def _episode_rearm_wait(self, now: float) -> float | None:
+        """Seconds until a traded-and-closed episode may be bought again; None
+        when the episode is still held (open, or an order whose fate is unknown)."""
+        traded, ex = self._auto_key_traded_ts, self._auto_last_exit_ts
+        if (traded is None or ex is None or ex < traded or self.position.option_symbol
+                or self._pending_order or self._pending_exit):
+            return None
+        wait = (settings.auto_trade_post_stop_cooldown_sec if self._auto_last_exit_was_stop
+                else settings.auto_trade_reentry_cooldown_sec)
+        return max(0.0, wait - (now - ex))
+
+    def _reset_auto_trade_marks(self, force: bool = False) -> None:
         """Clear the per-trade exit marks after an auto-exit so the next entry
         starts clean (targets, stop and the ratcheting target floor)."""
+        if not force and self.is_live and self.position.option_symbol:
+            # The live SELL did not complete: keep the stop/targets so the next
+            # tick tries the exit again instead of leaving the trade unmanaged.
+            return
         self._auto_target1 = None
         self._auto_target2 = None
         self._auto_target3 = None
         self._auto_stop = None
         self._auto_tgt_floor = None
         self._auto_scaled_out = False
+        self._auto_pre_t1_halved = False
         self._auto_peak = None
         self._auto_entry_prem = None
         self._auto_entry_active = False
@@ -2827,6 +3793,9 @@ class AppState:
         # the bot is intentionally standing down rather than silently broken.
         if not reason and self.is_live and not settings.auto_trade_allow_live and settings.auto_trade_enabled:
             reason = "Live feed — bot NOT armed for live orders (set auto_trade_allow_live)"
+        mode_error = live_control.trade_mode_error()
+        if mode_error:
+            reason = mode_error
 
         # Persistent entry snapshot so the UI can always show what the bot took, even
         # after the BUY signal card has cleared once a position is open.
@@ -2871,6 +3840,7 @@ class AppState:
         return AutoTradeState(
             enabled=settings.auto_trade_enabled,
             mode="live" if self._auto_live_armed() else "paper",
+            kill_switch=live_control.kill_switch_engaged(),
             min_confidence=settings.auto_trade_min_confidence,
             max_lots=(settings.auto_trade_live_max_lots if self._auto_live_armed() else max(1, settings.auto_trade_max_lots)),
             in_position=in_pos,
@@ -3221,7 +4191,7 @@ class AppState:
                     self._z2h_is_sleeve = True
                     # ride it: no targets / no hard stop (lottery ticket), let it run
                     # to a spike or day-end. Budget already caps the downside.
-                    self._reset_auto_trade_marks()
+                    self._reset_auto_trade_marks(force=True)
                     tag = "LIVE HERO" if live else "HERO PUNT"
                     self._auto_last_action = (
                         f"{tag} {z.option_symbol} x{z.lots} @ "
@@ -3540,7 +4510,7 @@ class AppState:
         lot_size = get_spec(self._instrument).lot_size
         qty = lot_size * p.quantity_lots
         gross = (premium - (p.entry_premium or premium)) * qty
-        ch = option_costs.charges(p.entry_premium, premium, qty)
+        ch = option_costs.charges(p.entry_premium, premium, qty, self._instrument)
         p.brokerage = ch.brokerage
         p.statutory_charges = ch.statutory
         p.total_costs = ch.total
@@ -3672,15 +4642,27 @@ class StateRegistry:
 
     def __init__(self) -> None:
         self._states: dict[str, AppState] = {}
+        self._guard = threading.Lock()
+        self._build_locks: dict[str, threading.Lock] = {}
 
     def get(self, instrument: str | None) -> AppState:
-        name = (instrument or DEFAULT_INSTRUMENT).upper()
+        name = resolve_key(instrument or DEFAULT_INSTRUMENT)
         if name not in REGISTRY:
             name = DEFAULT_INSTRUMENT
         st = self._states.get(name)
-        if st is None:
-            st = AppState(name)
-            self._states[name] = st
+        if st is not None:
+            return st
+        # Construction is slow (broker login, candles) and reads the live order
+        # ledger. Concurrent callers must share ONE instance per instrument: a
+        # second copy would restore an in-flight order as "unresolved" and could
+        # trade independently of the first.
+        with self._guard:
+            lock = self._build_locks.setdefault(name, threading.Lock())
+        with lock:
+            st = self._states.get(name)
+            if st is None:
+                st = AppState(name)
+                self._states[name] = st
         return st
 
     def active(self) -> list[AppState]:

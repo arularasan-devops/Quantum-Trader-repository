@@ -24,8 +24,32 @@ from app.config import settings
 CONFIGURED_CAPITAL = float(settings.capital)
 LIVE_TOKEN_HEADER = "X-QT-Live-Token"
 
+VALID_TRADE_MODES = ("paper", "live")
+
 _lock = threading.Lock()
 _state: dict | None = None
+_mode_error = ""
+
+
+def verify_trade_mode() -> str:
+    """Startup check of QT_TRADE_MODE. An unrecognised value fails closed: the
+    auto-trader is switched off and stays refused until the config is fixed."""
+    global _mode_error
+    mode = (settings.trade_mode or "").strip().lower()
+    if mode in VALID_TRADE_MODES:
+        _mode_error = ""
+    else:
+        _mode_error = (
+            f"QT_TRADE_MODE={settings.trade_mode!r} is not 'paper' or 'live', so the "
+            "trading mode cannot be established safely. Automatic trading is disabled. "
+            "Set QT_TRADE_MODE=paper in .env and restart the backend."
+        )
+        settings.auto_trade_enabled = False
+    return _mode_error
+
+
+def trade_mode_error() -> str:
+    return _mode_error
 
 
 def require_live_auth(token: str | None) -> None:

@@ -22,7 +22,9 @@ Notes / limitations (be honest):
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import math
 import os
 import random
 import re as _re
@@ -134,6 +136,23 @@ SCRIP_MASTER_URL = (
 _QUOTE_MODE = "FULL"
 # Angel /quote FULL mode caps tokens per request (~50). Batch below that.
 _QUOTE_TOKEN_CHUNK = 45
+# Option backfill polls share ONE account-wide budget (non-blocking: a tick that
+# finds no slot skips the poll), so 50 instruments cannot flood /quote and slow
+# every other price read.
+_backfill_lock = threading.Lock()
+_backfill_next_at = 0.0
+
+
+def _backfill_slot(now: float) -> bool:
+    global _backfill_next_at
+    rate = settings.option_rest_backfill_per_sec
+    if rate <= 0:
+        return False
+    with _backfill_lock:
+        if now < _backfill_next_at:
+            return False
+        _backfill_next_at = now + 1.0 / rate
+        return True
 
 # Cap on every Angel REST call. The SDK defaults to 7s, and a 7s CONNECT stall
 # was seen holding a quote call (and therefore a tick) in a live log — an entry
@@ -219,7 +238,7 @@ _scrip_master_cache: list | None = None
 # from that key's endpoint, so without coordination they race and trip the
 # limit. Each shard (Angel key) owns its OWN limiter, so with multiple keys the
 # historical warm-up runs in parallel (N keys -> ~N times the throughput).
-_HIST_MIN_INTERVAL = 3.5   # min seconds between historical calls, per key
+_HIST_MIN_INTERVAL = float(os.environ.get("QT_ANGEL_HIST_MIN_INTERVAL", "3.5") or 3.5)  # per key
 _HIST_COOLDOWN = 12.0      # base pause after a rate-limit (grows exponentially)
 _HIST_COOLDOWN_MAX = 90.0  # cap the exponential back-off here
 _HIST_JITTER = 0.75        # random spread (s) added to spacing to de-sync shards
@@ -245,6 +264,25 @@ _HIST_BLOCKING_BUDGET_SEC = 6.0
 # acquires the cache that would take it off this path, so without a cap it pays
 # the full budget on every tick for the whole session.
 _HIST_BLOCKING_PASSES = 3
+# One key serves ~17 history calls a minute; the watchlist asks for more. An
+# instrument with NO candles cannot signal at all, so while any instrument on
+# the key is still warming, instruments that already hold a recent cache skip
+# their routine refresh and leave the slot to it. Bounded so no cache is held
+# back longer than this.
+_HIST_YIELD_MAX_AGE = 600.0
+# A warming instrument retries this often instead of once a minute.
+_HIST_WARMUP_RETRY_SEC = 5.0
+# v3.5.46: one key serves ~17 history calls a minute, a 50-name watchlist asks
+# for 80+. First-come-first-served let the same instruments win every slot while
+# others kept days-old candles. Futures refreshes now queue round-robin: the
+# instrument whose last history call is oldest goes next. An instrument counts
+# as queued while it asked within _HIST_QUEUE_ACTIVE_SEC (a closed exchange
+# stops asking and drops out). A due instrument re-asks every
+# _HIST_QUEUE_RETRY_SEC; option charts wait while any futures cache is older
+# than _HIST_OPTION_YIELD_SEC.
+_HIST_QUEUE_ACTIVE_SEC = 60.0
+_HIST_QUEUE_RETRY_SEC = 5.0
+_HIST_OPTION_YIELD_SEC = 240.0
 
 
 class _HistLimiter:
@@ -267,6 +305,43 @@ class _HistLimiter:
         self._deferrals = 0
         self._trips = 0
         self._successes = 0
+        self._warming: set[int] = set()
+        self._fut_last_call: dict[int, float] = {}
+        self._fut_asked_at: dict[int, float] = {}
+
+    def fut_turn(self, key: int, now: float) -> bool:
+        """True when ``key`` has the oldest futures history call of the
+        instruments currently asking (ties all go)."""
+        with self._lock:
+            self._fut_asked_at[key] = now
+            mine = self._fut_last_call.get(key, 0.0)
+            for k, asked in self._fut_asked_at.items():
+                if (k != key and now - asked <= _HIST_QUEUE_ACTIVE_SEC
+                        and self._fut_last_call.get(k, 0.0) < mine):
+                    return False
+            return True
+
+    def fut_called(self, key: int, now: float) -> None:
+        with self._lock:
+            self._fut_last_call[key] = now
+
+    def fut_backlog(self, now: float, older_than: float) -> int:
+        """Queued instruments whose last futures history call is older than this."""
+        with self._lock:
+            return sum(1 for k, asked in self._fut_asked_at.items()
+                       if now - asked <= _HIST_QUEUE_ACTIVE_SEC
+                       and now - self._fut_last_call.get(k, 0.0) > older_than)
+
+    def set_warming(self, key: int, warming: bool) -> None:
+        with self._lock:
+            if warming:
+                self._warming.add(key)
+            else:
+                self._warming.discard(key)
+
+    def warming_count(self) -> int:
+        with self._lock:
+            return len(self._warming)
 
     def stats(self) -> dict:
         with self._lock:
@@ -279,6 +354,7 @@ class _HistLimiter:
                     max(0.0, self._cooldown_until - time.time()), 1),
                 "consecutive_rate_limits": self._consecutive_trips,
                 "min_interval_sec": _HIST_MIN_INTERVAL,
+                "instruments_warming": len(self._warming),
             }
 
     def note_deferral(self) -> None:
@@ -382,12 +458,90 @@ def _historical_candles(shard: "_Shard", params: dict, *, blocking: bool) -> tup
     return [], "historical API rate-limited (AB1021) — sharing budget with other instruments, will retry shortly"
 
 
+# A saved copy of the scrip master under data_dir lets a restart skip the
+# ~37 MB download (Angel's file server can trickle at ~100-200 KB/s), and is the
+# fallback when today's download is too slow. Contracts are listed per IST day,
+# so a copy saved today is reused as-is; an older copy is used only if the
+# download fails or exceeds _SCRIP_DOWNLOAD_DEADLINE_SEC.
+_SCRIP_DOWNLOAD_DEADLINE_SEC = 240.0
+_SCRIP_MIN_ROWS = 1000
+
+
+def _scrip_cache_path() -> str:
+    return os.path.join(settings.data_dir, "scrip_master.json")
+
+
+def _ist_date(ts: float) -> dt.date:
+    return dt.datetime.fromtimestamp(ts, dt.timezone(dt.timedelta(hours=5, minutes=30))).date()
+
+
+def _read_scrip_cache() -> tuple[list | None, float]:
+    path = _scrip_cache_path()
+    try:
+        mtime = os.path.getmtime(path)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None, 0.0
+    if not isinstance(data, list) or len(data) < _SCRIP_MIN_ROWS:
+        return None, 0.0
+    return data, mtime
+
+
+def _write_scrip_cache(raw: bytes) -> None:
+    path = _scrip_cache_path()
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log.warning("scrip master: could not save local copy (%s)", exc)
+
+
+def _download_scrip_master(deadline_sec: float | None) -> list:
+    start = time.time()
+    buf = bytearray()
+    with httpx.stream("GET", SCRIP_MASTER_URL, timeout=60.0) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_bytes():
+            buf.extend(chunk)
+            if deadline_sec is not None and time.time() - start > deadline_sec:
+                raise TimeoutError(
+                    f"scrip master download exceeded {deadline_sec:.0f}s "
+                    f"({len(buf) / 1e6:.1f} MB received)")
+    data = json.loads(bytes(buf))
+    if not isinstance(data, list) or len(data) < _SCRIP_MIN_ROWS:
+        raise ValueError("scrip master download returned an unexpected payload")
+    _write_scrip_cache(bytes(buf))
+    _log.info("scrip master: downloaded %d rows in %.0fs", len(data), time.time() - start)
+    return data
+
+
+def _load_scrip_master() -> list:
+    cached, mtime = _read_scrip_cache()
+    if cached is not None and _ist_date(mtime) == _ist_date(time.time()):
+        _log.info("scrip master: using today's saved copy (%d rows)", len(cached))
+        return cached
+    try:
+        # With no saved copy there is nothing to fall back to: wait it out.
+        return _download_scrip_master(_SCRIP_DOWNLOAD_DEADLINE_SEC if cached else None)
+    except Exception as exc:
+        if cached is None:
+            raise
+        _log.warning("scrip master: download failed (%s); using saved copy from %s "
+                     "(%d rows) — contracts listed since then are missing until the "
+                     "next successful download", exc, _ist_date(mtime), len(cached))
+        return cached
+
+
 def _get_scrip_master() -> list:
     global _scrip_master_cache
     if _scrip_master_cache is None:
         with _scrip_lock:
             if _scrip_master_cache is None:
-                _scrip_master_cache = httpx.get(SCRIP_MASTER_URL, timeout=60.0).json()
+                _scrip_master_cache = _load_scrip_master()
     return _scrip_master_cache
 
 
@@ -679,11 +833,16 @@ class _LiveStream:
             if toks and toks[0] not in seen:
                 seen.add(toks[0])
                 ordered.append(toks[0])
-        for toks in self._provider_tokens.values():
-            for t in toks[1:]:
-                if t not in seen:
-                    seen.add(t)
-                    ordered.append(t)
+        # Option strikes round-robin across instruments (each list is nearest
+        # first). Taking them instrument by instrument gave the first ~20 names
+        # every strike and the rest none: their option prices never ticked.
+        rest = [toks[1:] for toks in self._provider_tokens.values()]
+        depth = max((len(r) for r in rest), default=0)
+        for k in range(depth):
+            for r in rest:
+                if k < len(r) and r[k] not in seen:
+                    seen.add(r[k])
+                    ordered.append(r[k])
         self._union_wanted = len(ordered)
         return set(ordered[:_MAX_WS_TOKENS])
 
@@ -735,6 +894,17 @@ class _LiveStream:
             self._sws.close_connection()
         except Exception:
             pass
+
+
+_NOT_SENT_MARKERS = ("ConnectTimeoutError", "NewConnectionError", "NameResolutionError",
+                     "Failed to establish a new connection",
+                     "Temporary failure in name resolution")
+
+
+def order_not_sent(exc: object) -> bool:
+    """True only when the request provably never reached Angel (connect phase)."""
+    text = f"{type(exc).__name__}: {exc}"
+    return any(m in text for m in _NOT_SENT_MARKERS)
 
 
 def _login_with(creds: dict) -> object:
@@ -1126,6 +1296,11 @@ class AngelOneProvider(MarketDataProvider):
     def __init__(self, spec=None) -> None:
         self._exchange = (spec.exchange if spec else None) or settings.angel_exchange or self.EXCHANGE
         self._root = (spec.symbol if spec else None) or settings.angel_symbol_root or "CRUDEOIL"
+        from app.market.instruments import REGISTRY
+
+        # history.db keys bars by registry name ("BAJAJAUTO"), not the scrip root.
+        self._ooo_dropped = 0
+        self._store_key = next((k for k, v in REGISTRY.items() if v is spec), self._root)
         # This instrument is assigned to one Angel key (shard); all its live
         # data (login session, WebSocket, historical rate limiter) comes from it.
         self._shard = _shard_for(self._root)
@@ -1147,6 +1322,7 @@ class AngelOneProvider(MarketDataProvider):
         self._quotes: dict[str, dict] = {}  # token -> {ltp, oi, volume}
         self._fut_candles: list[Candle] = []
         self._opt_candles: dict[str, list[Candle]] = {}
+        self._opt_candles_at: dict[str, float] = {}
         self._last_quote_at = 0.0
         self._last_fut_candles_at = 0.0
         self._candle_diag: str = ""
@@ -1165,6 +1341,8 @@ class AngelOneProvider(MarketDataProvider):
         self._subscribed_tokens: list[str] = []
         self._ws_exchange_code = _WS_EXCHANGE_CODE.get(self._exchange, 5)
         self._last_ws_tick = 0.0  # per-instrument: last time THIS instrument got a push
+        self._last_opt_backfill_at = 0.0
+        self._backfill_busy = False
         self._streaming = False   # True while prices arrive via WebSocket push
         # Per-token tick times: an ATM option can go quiet (illiquid strike)
         # while the underlying keeps streaming, and only the option age exposes
@@ -1180,9 +1358,35 @@ class AngelOneProvider(MarketDataProvider):
         self._was_streaming = False
         self._start_stream()
 
-        self._refresh_futures_candles()
+        self._seed_candles_from_disk()
+        self._refresh_futures_candles(allow_blocking=True)
         self._last_fut_candles_at = time.time()  # avoid an immediate re-fetch in step()
         self.step()
+
+    def _seed_candles_from_disk(self) -> None:
+        """Start from the 1-minute bars already saved in history.db.
+
+        They are the same REST candles, recorded every pass, so a restart no
+        longer queues every instrument behind the key's history rate limit. The
+        next REST refresh replaces the seed as usual.
+        """
+        if self._fut_candles or not settings.store_history:
+            return
+        try:
+            from app import storage
+
+            stored = storage.store.candles(self._store_key, 600)
+        except Exception as exc:  # a broken store must never stop the feed
+            _log.warning("%s: candle seed skipped: %s", self._root, exc)
+            return
+        try:
+            max_age = float(os.environ.get("QT_ANGEL_HIST_SEED_MAX_AGE_HOURS", "72") or 72) * 3600
+        except ValueError:
+            max_age = 72 * 3600
+        if len(stored) >= 60 and time.time() - float(stored[-1].time) <= max_age:
+            self._fut_candles = stored
+            self._fut_candles_cached_at = 0.0
+            self._candle_diag = ""
 
     # --------------------------------------------------------- live streaming
     def _start_stream(self) -> None:
@@ -1203,10 +1407,18 @@ class AngelOneProvider(MarketDataProvider):
             seq=_as_int(meta.get("seq")),
             source="push",
         )
-        if ltp <= 0:
+        if not math.isfinite(ltp) or ltp <= 0:
+            return
+        # A late packet must not overwrite a newer price the socket already gave.
+        if verdict == "OUT_OF_ORDER":
+            self._ooo_dropped += 1
             return
         prev = self._quotes.get(token) or {}
         bid, ask = meta.get("bid"), meta.get("ask")
+        if bid is not None and ask is not None and (
+            not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask < bid
+        ):
+            bid = ask = None  # crossed / invalid book: keep the price, not the book
         bid_size, ask_size = meta.get("bid_size"), meta.get("ask_size")
         now = time.time()
         fresh_book = bid is not None or ask is not None
@@ -1297,6 +1509,23 @@ class AngelOneProvider(MarketDataProvider):
         nearest = opt_expiries[0]
         self._options = [o for o in options_all if o.expiry == nearest]
         self._by_token = {i.token: i for i in [self._future, *self._options]}
+        # Sizing, risk caps and the journal use the registry lot size, but the
+        # order quantity uses the broker's: keep them equal when the exchange
+        # revises a lot (BANKNIFTY 15 -> 30 doubled real risk).
+        _blots = {o.lot_size for o in self._options if o.lot_size and o.lot_size > 1}
+        if len(_blots) == 1:
+            from app.market.instruments import REGISTRY as _reg, resolve_key as _rk
+            _spec = _reg.get(getattr(self, "_store_key", None) or _rk(self._root))
+            _lot = _blots.pop()
+            from app.market.instruments import PNL_LOT_FIXED as _fixed
+            if (_spec is not None and _spec.symbol == self._root and _spec.lot_size != _lot
+                    and self._root not in _fixed):
+                _log.warning("%s: lot size %s -> %s (broker scrip master)",
+                             self._root, _spec.lot_size, _lot)
+                object.__setattr__(_spec, "lot_size", _lot)
+        elif len(_blots) > 1:
+            _log.warning("%s: mixed broker lot sizes %s; registry lot kept",
+                         self._root, sorted(_blots))
 
     # ----------------------------------------------------------- live pulls
     def _atm_option_tokens(self) -> list[str]:
@@ -1306,11 +1535,18 @@ class AngelOneProvider(MarketDataProvider):
         # Use the PER-INSTRUMENT strike spacing (Nifty 50, Sensex 100, Crude 50),
         # not the global default — otherwise Sensex's ATM window is computed on
         # the wrong grid and can miss the real strikes.
-        step = self._strike_step
-        atm = round(spot / step) * step
+        # Window over the strikes the exchange actually LISTS (n each side of
+        # the nearest one), so a stale configured spacing (e.g. GOLD 100 when
+        # MCX lists every 500/1000) cannot leave the window empty.
         n = settings.strikes_each_side
-        lo, hi = atm - n * step, atm + n * step
-        return [o.token for o in self._options if lo <= o.strike <= hi]
+        strikes = sorted({o.strike for o in self._options})
+        i = min(range(len(strikes)), key=lambda k: abs(strikes[k] - spot))
+        lo, hi = strikes[max(0, i - n)], strikes[min(len(strikes) - 1, i + n)]
+        # Nearest strikes first: the socket's token cap is shared fairly across
+        # instruments from this order, so the strikes a trade uses go live first.
+        window = [o for o in self._options if lo <= o.strike <= hi]
+        window.sort(key=lambda o: abs(o.strike - spot))
+        return [o.token for o in window]
 
     def _next_future(self) -> "_Instrument | None":
         """The contract after the quoted one, or None when only one exists."""
@@ -1318,12 +1554,23 @@ class AngelOneProvider(MarketDataProvider):
             return None
         return self._futures_chain[1]
 
-    def _refresh_quotes(self) -> None:
+    def _run_backfill(self, tokens: list[str]) -> None:
+        try:
+            self._refresh_quotes(only=tokens)
+        except Exception:
+            pass
+        finally:
+            self._backfill_busy = False
+
+    def _refresh_quotes(self, only: list[str] | None = None) -> None:
         tokens = [self._future.token] + self._atm_option_tokens() if self._future else []
+        if only is not None:
+            tokens = list(only)
         # The next expiry rides along on the SAME quote call (one extra token,
         # no extra request) purely so the near/next basis can be measured at one
         # instant. Nothing reads it for a signal or an order.
-        nxt = self._next_future() if settings.pair_next_expiry_capture else None
+        nxt = (self._next_future() if settings.pair_next_expiry_capture and only is None
+               else None)
         if nxt is not None and nxt.token not in tokens:
             tokens.append(nxt.token)
         if not tokens:
@@ -1375,16 +1622,23 @@ class AngelOneProvider(MarketDataProvider):
                         else None
                     ),
                 }
+                # The poll is a current read of this contract (its book is
+                # now), so its age restarts here, push or no push.
+                self._token_tick_at[token] = time.time()
         if self._future and self._future.token in self._quotes:
             self._spot = self._quotes[self._future.token]["ltp"] or self._spot
 
-    def _refresh_futures_candles(self) -> None:
+    def _refresh_futures_candles(self, allow_blocking: bool = False) -> None:
         if not self._future:
             return
-        # 48h IST lookback: enough 1-minute bars for the indicators even right
-        # after the open (covers the previous session), and in IST so the window
+        limiter = self._shard.hist
+        if (self._fut_candles and limiter.warming_count()
+                and time.time() - self._fut_candles_cached_at < _HIST_YIELD_MAX_AGE):
+            return
+        # 96h IST lookback: enough 1-minute bars for the indicators even right
+        # after the open (covers the previous session, incl. Friday on a Monday), and in IST so the window
         # actually overlaps daytime-only markets (Nifty/Sensex).
-        frm, to = _ist_window(48)
+        frm, to = _ist_window(96)
         params = {
             "exchange": self._exchange,
             "symboltoken": self._future.token,
@@ -1402,12 +1656,20 @@ class AngelOneProvider(MarketDataProvider):
         # so it would pay the blocking budget on every tick for the whole
         # session. After the first few passes it refreshes non-blocking like any
         # other instrument and keeps reporting that it has no candles.
+        # Only the constructor may block. A blocking wait inside a tick holds the
+        # serial hub loop, which is what froze the on-screen LTP during warm-up.
         blocking = (
-            not self._fut_candles
+            allow_blocking
+            and not self._fut_candles
             and self._fut_rest_attempts < _HIST_BLOCKING_PASSES
         )
+        now = time.time()
+        if self._fut_candles and not limiter.fut_turn(id(self), now):
+            return
         self._fut_rest_attempts += 1
         rows, diag = _historical_candles(self._shard, params, blocking=blocking)
+        if not diag.startswith("deferred"):
+            limiter.fut_called(id(self), time.time())
         candles = _to_candles(rows)
         if candles:
             self._fut_candles = candles
@@ -1416,11 +1678,20 @@ class AngelOneProvider(MarketDataProvider):
             self._candle_diag = ""
         elif diag.startswith("deferred"):
             self._fut_rest_deferred += 1
+        limiter.set_warming(id(self), not self._fut_candles)
         if not candles and not self._fut_candles:
             # No cached data yet — surface WHY (rate-limit / token / permission),
             # never a silently-blank instrument. No credentials are ever logged.
-            self._candle_diag = f"{self._root}/{self._exchange}: {diag}"
-            _log.warning(self._candle_diag)
+            if diag.startswith("deferred"):
+                # Not an error: queued behind the key's history rate limit.
+                self._candle_diag = (
+                    f"{self._root}/{self._exchange}: loading price history, queued for "
+                    f"Angel One rate limit ({limiter.warming_count()} instruments waiting)"
+                )
+                _log.debug("%s/%s: %s", self._root, self._exchange, diag)
+            else:
+                self._candle_diag = f"{self._root}/{self._exchange}: {diag}"
+                _log.warning(self._candle_diag)
 
     # ------------------------------------------------- provider interface
     def step(self) -> None:
@@ -1448,8 +1719,27 @@ class AngelOneProvider(MarketDataProvider):
         if not streaming and now - self._last_quote_at >= max(3.0, settings.tick_interval_seconds):
             self._refresh_quotes()
             self._last_quote_at = now
+        elif streaming and settings.option_rest_backfill_sec > 0 and (
+                now - self._last_opt_backfill_at >= settings.option_rest_backfill_sec):
+            # The future can tick while this instrument's option strikes are off
+            # the socket (token cap) or silent: poll just those, or their prices
+            # freeze at start-up and every entry reads "feed not ready".
+            stale = [t for t in self._atm_option_tokens()
+                     if not self._stream.is_subscribed(t)
+                     or (self._token_age(t, now) or 1e9) > _WS_STALE_SECONDS]
+            if stale and not self._backfill_busy and _backfill_slot(now):
+                # Off the tick path: a slow or failing /quote call must never
+                # hold up this instrument's (or the hub's) price updates.
+                self._last_opt_backfill_at = now
+                self._backfill_busy = True
+                threading.Thread(target=self._run_backfill,
+                                 args=(stale[:_QUOTE_TOKEN_CHUNK],),
+                                 daemon=True, name=f"qt-backfill-{self._root}").start()
         # Candles (for indicators) always come from the 1-minute historical API.
-        if now - self._last_fut_candles_at >= 60.0:
+        interval = 60.0 if self._fut_candles else _HIST_WARMUP_RETRY_SEC
+        if self._fut_candles and now - self._fut_candles_cached_at > 60.0:
+            interval = _HIST_QUEUE_RETRY_SEC
+        if now - self._last_fut_candles_at >= interval:
             self._refresh_futures_candles()
             self._last_fut_candles_at = now
 
@@ -1516,11 +1806,15 @@ class AngelOneProvider(MarketDataProvider):
                 self._future.token if self._future else None, now
             ),
             "option_age_sec": min(opt_ages) if opt_ages else None,
+            "option_tokens_wanted": len(atm),
+            "option_tokens_on_socket": sum(
+                1 for t in atm if self._stream is not None and self._stream.is_subscribed(t)),
             "stale_after_sec": _WS_STALE_SECONDS,
             "ws_connected": connected,
             "subscribed_tokens": len(self._subscribed_tokens),
             "push_pct_today": round(100.0 * self._push_sec / total, 1) if total > 0 else None,
             "fallbacks_today": self._fallbacks,
+            "out_of_order_dropped": self._ooo_dropped,
             "note": note,
         }
 
@@ -1691,9 +1985,18 @@ class AngelOneProvider(MarketDataProvider):
         if inst is None:
             return []
         cached = self._opt_candles.get(symbol)
-        if cached:
+        ttl = float(settings.option_candles_refresh_sec or 0)
+        fresh = time.time() - getattr(self, "_opt_candles_at", {}).get(symbol, 0.0) < ttl
+        if cached and (ttl <= 0 or fresh):
             return cached[-limit:]
-        frm, to = _ist_window(48)
+        if not cached and self._shard.hist.warming_count():
+            # An instrument still has no futures history: its first candles
+            # outrank an option chart, or it can starve on the shared budget.
+            return []
+        if self._shard.hist.fut_backlog(time.time(), _HIST_OPTION_YIELD_SEC):
+            # Futures candles drive the BUY decision; they get the budget first.
+            return cached[-limit:] if cached else []
+        frm, to = _ist_window(96)
         # Non-blocking: option charts are secondary to the futures decision, so
         # they must never stall the tick. They share the same historical budget
         # via the limiter and simply fill in once the rate limit allows.
@@ -1707,6 +2010,11 @@ class AngelOneProvider(MarketDataProvider):
         candles = _to_candles(rows)
         if candles:
             self._opt_candles[symbol] = candles
+            if not hasattr(self, "_opt_candles_at"):
+                self._opt_candles_at = {}
+            self._opt_candles_at[symbol] = time.time()
+        elif cached:
+            return cached[-limit:]
         return candles[-limit:]
 
     def news(self) -> list[NewsItem]:
@@ -1818,7 +2126,8 @@ class AngelOneProvider(MarketDataProvider):
     def supports_trading(self) -> bool:
         return True
 
-    def place_order(self, option_symbol: str, side: str, lots: int) -> OrderResult:
+    def place_order(self, option_symbol: str, side: str, lots: int,
+                    product: str | None = None) -> OrderResult:
         # Phase 6 kill switch — must be the first statement, before any SDK call.
         safety.assert_order_allowed("angelone.place_order", option_symbol, side, lots)
         inst = next((o for o in self._options if o.symbol == option_symbol), None)
@@ -1833,7 +2142,7 @@ class AngelOneProvider(MarketDataProvider):
             "transactiontype": side.upper(),  # BUY / SELL
             "exchange": self._exchange,
             "ordertype": settings.angel_order_type,
-            "producttype": settings.angel_product,
+            "producttype": product or settings.angel_product,
             "duration": "DAY",
             "price": "0",
             "squareoff": "0",
@@ -1854,8 +2163,12 @@ class AngelOneProvider(MarketDataProvider):
         try:
             resp = order_smart.placeOrder(params)
         except Exception as exc:  # pragma: no cover - live API
+            # NOT_SENT: the connection never opened, so Angel cannot have the
+            # order. Anything else (read timeout, dropped reply) is UNKNOWN: the
+            # order may be live at Angel and must be reconciled, never re-sent.
             return OrderResult(ok=False, mode="live", side=side, option_symbol=option_symbol,
-                               lots=lots, message=f"Order error: {exc}")
+                               lots=lots, message=f"Order error: {exc}",
+                               status="NOT_SENT" if order_not_sent(exc) else "UNKNOWN")
         order_id = str(resp) if resp else None
         # placeOrder returns an order id = an ACKNOWLEDGEMENT, not a fill. The
         # fill price/quantity come from order_status(), never from the quote.
@@ -1897,6 +2210,30 @@ class AngelOneProvider(MarketDataProvider):
             fill_premium=round(avg, 2) if avg else None, order_id=str(order_id),
             status=status, message=str(row.get("text") or row.get("status") or ""),
         )
+
+    def broker_position(self, option_symbol: str) -> dict | None:
+        """Read-only: today's Angel position row for ``option_symbol`` from the
+        account that places orders. None = unknown (error, no data, no row)."""
+        smart = self._smart
+        if settings.orders_on_primary_only:
+            try:
+                shards = _get_shards()
+                if shards:
+                    smart = shards[0].smart
+            except Exception:
+                smart = self._smart
+        try:
+            rows = (smart.position() or {}).get("data") or []
+        except Exception:  # pragma: no cover - live API
+            return None
+        row = next((r for r in rows if str(r.get("tradingsymbol")) == option_symbol), None)
+        if row is None:
+            return None
+        net = _as_int(row.get("netqty"))
+        if net is None:
+            return None
+        return {"net_qty": net, "buy_avg": _to_float(row.get("buyavgprice")),
+                "sell_avg": _to_float(row.get("sellavgprice"))}
 
     # --------------------------------------------------------------- helpers
     def _time_to_expiry(self) -> float:

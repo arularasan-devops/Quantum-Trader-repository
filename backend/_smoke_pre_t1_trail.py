@@ -93,6 +93,18 @@ check(
 )
 
 print()
+# --- capital-sized position: small % move, big rupee profit ----------------
+# NATURALGAS PE, 29 lots x 1250, entry 13.7, T1 15.0, peak 14.15 (+3.3%).
+E, T1, PK, QTY = 13.7, 15.0, 14.15, 29 * 1250
+by_t1 = PK >= E + (T1 - E) * settings.auto_trade_pre_t1_trail_arm_pct / 100.0
+by_pct = PK >= E * (1 + settings.auto_trade_pre_t1_trail_arm_profit_pct / 100.0)
+by_rs = (PK - E) * QTY >= settings.auto_trade_pre_t1_trail_arm_rupees > 0
+check("big position: % rules alone would NOT arm (the observed miss)", not (by_t1 or by_pct))
+check("big position: the rupee rule arms the trail", by_rs, f"peak open ₹{(PK - E) * QTY:,.0f}")
+trail = PK - giveback(E, PK)
+check("big position: trail exits in profit, above entry", trail > E,
+      f"exit ≈{trail:.2f} → ₹{(trail - E) * QTY:,.0f}")
+
 if _failures:
     print(f"{len(_failures)} CHECK(S) FAILED: {_failures}")
     raise SystemExit(1)
