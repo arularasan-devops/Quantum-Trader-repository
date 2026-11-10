@@ -98,3 +98,7 @@ backend/*_ONE_MINUTE.jsonl
 backups/*.dump
 backups-paper/
 backups/*.tmp
+
+# editor/backup copies (may contain .env secrets)
+~
+*~
