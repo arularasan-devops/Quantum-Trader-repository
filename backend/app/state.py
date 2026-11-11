@@ -969,11 +969,21 @@ class AppState:
                 self._reconcile_recovery()
                 return
             if self._pending_order:
+                auto = self._pending_order.get("auto")
                 inc = self._poll_pending_entry()
+                if (inc is None or not inc.ok) and self._pending_order:
+                    inc = self._adopt_from_broker_position(now) or inc
                 if inc is not None and inc.ok:
                     res = self.buy(inc.option_symbol, lots=int(inc.filled_lots or 0),
                                    manual=False, _fill=inc)
-                    if res.ok:
+                    if res.ok and auto and auto.get("option") == inc.option_symbol:
+                        self._arm_auto_entry(auto, res.fill_premium, int(inc.filled_lots or 0),
+                                             True, now)
+                        self._add_alert("ORDER_FILL", f"Late broker fill adopted and managed: "
+                                        f"{inc.option_symbol} {inc.filled_lots} lot(s) @ "
+                                        f"{inc.fill_premium:.2f}, stop {auto.get('stop')}, "
+                                        f"T1 {auto.get('t1')}", "warning")
+                    elif res.ok:
                         self._add_alert("ORDER_FILL", f"Late broker fill adopted: "
                                         f"{inc.option_symbol} {inc.filled_lots} lot(s) @ "
                                         f"{inc.fill_premium:.2f} — review stop/target",
@@ -990,6 +1000,41 @@ class AppState:
         except Exception as exc:
             self._add_alert("ORDER_RECONCILE_ERROR", f"Order reconciliation error: {exc}",
                             "critical")
+
+    def _adopt_from_broker_position(self, now: float) -> OrderResult | None:
+        """Read-only fallback for a live BUY acknowledged by Angel whose order
+        status can't be confirmed: once Angel's positions show exactly that
+        quantity held, adopt it at Angel's buy average (no order is sent)."""
+        pend = self._pending_order
+        fetch = getattr(self.provider, "broker_position", None)
+        wait = settings.live_pending_adopt_sec
+        if (not self.is_live or not pend or pend.get("side") != "BUY" or fetch is None
+                or wait <= 0 or not pend.get("order_id") or self.position.option_symbol
+                or int(pend.get("filled_lots") or 0) > 0
+                or now - float(pend.get("ts") or now) < wait):
+            return None
+        sym = pend["symbol"]
+        try:
+            row = fetch(sym)
+        except Exception:
+            row = None
+        lot = 0
+        with contextlib.suppress(Exception):
+            lot = int(next((o.lot_size for o in self.provider.option_chain() if o.symbol == sym),
+                           0) or get_spec(self._instrument).lot_size or 0)
+        lots = int(pend["lots"])
+        px = (row or {}).get("buy_avg") or 0.0
+        if not row or lot <= 0 or row.get("net_qty") != lots * lot or px <= 0:
+            return None
+        self._event("ADOPTED_FROM_POSITION", pend,
+                    note=f"Angel position {sym} netqty {row.get('net_qty')} @ {px}; "
+                         "order status unconfirmed")
+        self._pending_order = None
+        self._persist_state()
+        return OrderResult(ok=True, mode="live", side="BUY", option_symbol=sym, lots=lots,
+                           filled_lots=lots, fill_premium=round(float(px), 2),
+                           order_id=pend.get("order_id"), status="FILLED",
+                           message="Adopted from the Angel position (order status unconfirmed)")
 
     def _check_broker_position(self, now: float) -> None:
         """Read-only: an open LIVE app position that Angel shows flat (netqty 0
@@ -1103,25 +1148,44 @@ class AppState:
         """Rest (or raise) a STOPLOSS_LIMIT SELL at the locked floor. It only ever
         moves up, is never placed at or below entry (stop losses stay bot market
         exits), and never coexists with another working order."""
-        self._exch_stop_breach_at = None
+        lvl = self._auto_tgt_floor if self._auto_tgt_floor is not None else self._auto_stop
+        if bid is not None and lvl is not None and bid > lvl:
+            self._exch_stop_breach_at = None
         p = self.position
-        floor = self._auto_tgt_floor
         place = getattr(self.provider, "place_stop_order", None)
-        if (not settings.live_exchange_trail_stop or not self.is_live or floor is None
-                or place is None or not p.option_symbol or not self._auto_entry_active
+        if (not self.is_live or place is None or not p.option_symbol
+                or not self._auto_entry_active
                 or self._pending_order or self._pending_exit or self._order_recovery
                 or self._persist_error):
             return
         sym = p.option_symbol
         tick = self._exch_tick(sym)
         entry = self._auto_entry_prem or p.entry_premium or 0.0
+        floor = self._auto_tgt_floor
+        kind = "floor"
+        if floor is None or not settings.live_exchange_trail_stop:
+            # Before T1 (or with the floor feature off): rest the hard stop itself,
+            # so Angel still sells at the stop if the app, PC or WSL goes down.
+            if (not settings.live_exchange_hard_stop or not self._auto_stop
+                    or self._no_stop_loss_exit() or self._stock_hold_active(True)):
+                return
+            if floor is not None and self._exch_stop:
+                return  # floor feature off: keep the resting hard stop as-is
+            floor, kind = float(self._auto_stop), "stop"
         trigger = round(int(floor / tick + 1e-9) * tick, 2)
-        if trigger <= entry or bid is None or bid < trigger + tick:
+        if trigger <= 0 or (kind == "floor" and trigger <= entry):
+            return
+        if bid is None or bid < trigger + tick:
             return  # Angel rejects a SELL trigger at/above the market
         buf = max(0.0, settings.live_exchange_trail_stop_buffer_pct)
         limit = round(max(tick, int(trigger * (1.0 - buf / 100.0) / tick + 1e-9) * tick), 2)
         lots = int(p.quantity_lots)
-        reason = f"{self._floor_level(floor)} lock (exchange stop)"
+        if kind == "floor":
+            reason = f"{self._floor_level(floor)} lock (exchange stop)"
+        elif getattr(self, "_auto_pre_t1_halved", False) or (entry > 0 and floor >= entry):
+            reason = "BREAK-EVEN STOP (exchange stop)"
+        else:
+            reason = "STOP LOSS (exchange stop)"
         now = time.time()
         es = self._exch_stop
         if es:
@@ -1129,7 +1193,12 @@ class AppState:
                 return
             step = max(tick, float(es["trigger"]) * settings.live_exchange_trail_stop_min_step_pct
                        / 100.0)
-            if int(es["lots"]) == lots and trigger < float(es["trigger"]) + step - 1e-9:
+            # Only ever raised; a hard stop may also follow a manual levels re-set down.
+            lowered = kind == "stop" and trigger <= float(es["trigger"]) - step + 1e-9
+            if (int(es["lots"]) == lots and not lowered
+                    and trigger < float(es["trigger"]) + step - 1e-9):
+                if es.get("reason") != reason and abs(trigger - float(es["trigger"])) < 1e-9:
+                    es["reason"] = reason
                 return
             if now - float(es.get("moved") or 0.0) < 3.0:
                 return
@@ -1143,7 +1212,7 @@ class AppState:
                 res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                   lots=lots, order_id=es["order_id"], message=str(exc))
             if res is not None and res.ok:
-                es.update(trigger=trigger, limit=limit, lots=lots, reason=reason)
+                es.update(trigger=trigger, limit=limit, lots=lots, reason=reason, kind=kind)
                 self._persist_state()
                 self._event("EXCH_STOP_MODIFIED", {"order_id": es["order_id"], "side": "SELL",
                             "symbol": sym, "lots": lots}, res, trigger=trigger, limit=limit)
@@ -1157,7 +1226,7 @@ class AppState:
             return
         es = {"order_id": None, "symbol": sym, "lots": lots, "trigger": trigger,
               "limit": limit, "variety": "STOPLOSS", "ts": now, "moved": now,
-              "reason": reason}
+              "reason": reason, "kind": kind}
         self._exch_stop = es
         if not (self._persist_state() and self._event("EXCH_STOP_INTENT", {"side": "SELL",
                 "symbol": sym, "lots": lots}, trigger=trigger, limit=limit)):
@@ -1226,6 +1295,22 @@ class AppState:
         if not self.position.option_symbol:
             self._reset_auto_trade_marks()
         return res
+
+    def _exch_stop_breach(self) -> bool | None:
+        """Price is at/through a level a resting exchange stop covers. True = it
+        filled and was booked; False = still inside the fallback window, wait;
+        None = no working order, or the window passed: send the bot exit."""
+        if not (self.is_live and self._exch_stop and self._exch_stop.get("order_id")):
+            return None
+        if self._poll_exch_stop(time.time(), min_gap=1.0):
+            return True
+        if not self._exch_stop:
+            return None
+        since = self._exch_stop_breach_at or time.time()
+        self._exch_stop_breach_at = since
+        if time.time() - since < settings.live_exchange_trail_stop_fallback_sec:
+            return False
+        return None
 
     def _poll_exch_stop(self, now: float, min_gap: float = 5.0) -> bool:
         """Read-only check of the resting stop. True = it filled and was booked
@@ -2925,18 +3010,15 @@ class AppState:
             prev_floor = self._auto_tgt_floor
             if prev_floor is not None and prem <= prev_floor:
                 lvl = self._floor_level(prev_floor)
-                if live and self._exch_stop and self._exch_stop.get("order_id"):
-                    if self._poll_exch_stop(time.time(), min_gap=1.0):
-                        self._auto_last_action = (f"AUTO EXIT {p.option_symbol} · {lvl} lock "
-                                                  "filled at the exchange stop")
-                        self._auto_last_action_ts = now
-                        self._reset_auto_trade_marks()
-                        return
-                    if self._exch_stop:
-                        since = self._exch_stop_breach_at or time.time()
-                        self._exch_stop_breach_at = since
-                        if time.time() - since < settings.live_exchange_trail_stop_fallback_sec:
-                            return  # the resting order is working at the exchange
+                held = self._exch_stop_breach() if live else None
+                if held:
+                    self._auto_last_action = (f"AUTO EXIT {p.option_symbol} · {lvl} lock "
+                                              "filled at the exchange stop")
+                    self._auto_last_action_ts = now
+                    self._reset_auto_trade_marks()
+                    return
+                if held is False:
+                    return  # the resting order is working at the exchange
                 self._pending_exit_reason = f"{lvl} lock"
                 # A floor is hit on the way DOWN: it is a stop, filled at the bid.
                 self.sell(confirm=live)
@@ -3192,6 +3274,15 @@ class AppState:
                        or (ent > 0 and self._auto_stop >= ent) else "STOP LOSS")
                 if why == "STOP LOSS" and self._no_stop_loss_exit():
                     return
+                held = self._exch_stop_breach() if live else None
+                if held:
+                    self._auto_last_action = (f"AUTO EXIT {p.option_symbol} · {why} "
+                                              "filled at the exchange stop")
+                    self._auto_last_action_ts = now
+                    self._reset_auto_trade_marks()
+                    return
+                if held is False:
+                    return  # the resting hard stop is working at the exchange
                 self._pending_exit_reason = why
                 self.sell(confirm=live)
                 self._auto_last_action = f"AUTO EXIT {p.option_symbol} @ {prem:.1f} · {why}"
@@ -3836,45 +3927,61 @@ class AppState:
         else:
             exec_funnel.reached("ACCEPTED")
             exec_funnel.reached("FILLED")
+        levels = {"option": decision.recommended_option, "stop": decision.stop_loss,
+                  "t1": decision.target1, "t2": decision.target2, "t3": decision.target3,
+                  "strike": decision.strike, "conf": decision.confidence, "lots": lots}
         if res.ok:
-            self._auto_target1 = decision.target1
-            self._auto_target2 = decision.target2
-            self._auto_target3 = decision.target3
-            self._auto_stop = decision.stop_loss
-            if live and self._ledger_position is not None:
-                self._ledger_position.update(t1=decision.target1, t2=decision.target2)
-                self._persist_state()
-            # Cap how far the hard stop may sit below entry (one-click Live
-            # Auto-Buy sets this) so a single trade can't bleed to a distant stop.
-            entry_fill = res.fill_premium
-            # A per-instrument FIXED point stop (set in the dashboard) takes
-            # precedence: hard stop = entry − points, for an exact, predictable
-            # rupee risk. Falls back to the % cap when no points are configured.
-            stop_pts = settings.auto_trade_stop_points.get(self._instrument)
-            if stop_pts and stop_pts > 0 and entry_fill and entry_fill > 0:
-                self._auto_stop = max(0.05, entry_fill - float(stop_pts))
-            elif (
-                settings.auto_trade_max_stop_pct > 0
-                and entry_fill
-                and entry_fill > 0
-                and self._auto_stop is not None
-            ):
-                floor = entry_fill * (1.0 - settings.auto_trade_max_stop_pct / 100.0)
-                if self._auto_stop < floor:
-                    self._auto_stop = floor
-            self._auto_tgt_floor = None
-            self._auto_peak = res.fill_premium
-            self._auto_entry_prem = res.fill_premium
-            self._auto_entry_active = True
-            self._auto_entry_strike = decision.strike
-            self._auto_entry_conf = decision.confidence
-            self._auto_entry_lots = lots
-            tag = "LIVE BUY" if live else "AUTO BUY"
-            self._auto_last_action = (
-                f"{tag} {decision.recommended_option} x{lots} @ {res.fill_premium:.1f} "
-                f"· conf {decision.confidence:.0f}%"
-            )
-            self._auto_last_action_ts = now
+            self._arm_auto_entry(levels, res.fill_premium, lots, live, now)
+        elif live and self._pending_order and self._pending_order.get("side") == "BUY":
+            # Still working at Angel: keep the auto levels with the order so a late
+            # fill is managed (stop/targets/trail) instead of left unmanaged.
+            self._pending_order["auto"] = levels
+            self._persist_state()
+
+    def _arm_auto_entry(self, levels: dict, fill_premium: float | None, lots: int,
+                        live: bool, now: float) -> None:
+        """Auto-entry filled: set stop/targets and trail marks from the signal."""
+        self._auto_target1 = levels.get("t1")
+        self._auto_target2 = levels.get("t2")
+        self._auto_target3 = levels.get("t3")
+        self._auto_stop = levels.get("stop")
+        if live and self._ledger_position is not None:
+            self._ledger_position.update(t1=levels.get("t1"), t2=levels.get("t2"))
+            self._persist_state()
+        # Cap how far the hard stop may sit below entry (one-click Live
+        # Auto-Buy sets this) so a single trade can't bleed to a distant stop.
+        entry_fill = fill_premium
+        # A per-instrument FIXED point stop (set in the dashboard) takes
+        # precedence: hard stop = entry − points, for an exact, predictable
+        # rupee risk. Falls back to the % cap when no points are configured.
+        stop_pts = settings.auto_trade_stop_points.get(self._instrument)
+        if stop_pts and stop_pts > 0 and entry_fill and entry_fill > 0:
+            self._auto_stop = max(0.05, entry_fill - float(stop_pts))
+        elif (
+            settings.auto_trade_max_stop_pct > 0
+            and entry_fill
+            and entry_fill > 0
+            and self._auto_stop is not None
+        ):
+            floor = entry_fill * (1.0 - settings.auto_trade_max_stop_pct / 100.0)
+            if self._auto_stop < floor:
+                self._auto_stop = floor
+        self._auto_tgt_floor = None
+        self._auto_peak = fill_premium
+        self._auto_entry_prem = fill_premium
+        self._auto_entry_active = True
+        self._auto_entry_strike = levels.get("strike")
+        self._auto_entry_conf = levels.get("conf")
+        self._auto_entry_lots = lots
+        tag = "LIVE BUY" if live else "AUTO BUY"
+        self._auto_last_action = (
+            f"{tag} {levels.get('option')} x{lots} @ {float(fill_premium or 0):.1f} "
+            f"· conf {float(levels.get('conf') or 0):.0f}%"
+        )
+        self._auto_last_action_ts = now
+        if live:
+            with contextlib.suppress(Exception):
+                self._save_live_mgmt(force=True)
 
     def _no_stop_loss_exit(self) -> bool:
         """v3.5.47: this instrument's exchange has no stop-loss exit."""

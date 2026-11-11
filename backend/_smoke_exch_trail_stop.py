@@ -38,6 +38,8 @@ class Broker(SimulatedProvider):
         self.status: dict[str, OrderResult] = {}
         self.cancel_confirms = True
         self.fill_px = 100.0
+        self.hold_fill = False
+        self.positions: dict[str, dict] = {}
 
     def supports_trading(self):
         return True
@@ -51,6 +53,8 @@ class Broker(SimulatedProvider):
         self.status[oid] = OrderResult(ok=True, mode="live", side=side, option_symbol=sym,
                                        lots=lots, filled_lots=lots, fill_premium=self.fill_px,
                                        order_id=oid, status="FILLED")
+        if self.hold_fill:  # Angel filled it, but the order book can't show it
+            self.status.pop(oid)
         return OrderResult(ok=True, mode="live", side=side, option_symbol=sym, lots=lots,
                            order_id=oid, status="ACKNOWLEDGED")
 
@@ -75,6 +79,9 @@ class Broker(SimulatedProvider):
         return OrderResult(ok=True, mode="live", side="SELL", option_symbol="", lots=0,
                            order_id=oid, status="ACKNOWLEDGED")
 
+    def broker_position(self, sym):
+        return self.positions.get(sym)
+
     def order_status(self, oid):
         return self.status.get(oid)
 
@@ -85,6 +92,7 @@ class Broker(SimulatedProvider):
 
 
 settings.order_fill_timeout_sec = 0.2
+settings.max_trades_per_day = 0
 settings.auto_trade_enabled = True
 settings.auto_trade_allow_live = True
 settings.auto_trade_exit_on_bid = False
@@ -96,6 +104,8 @@ live_control.set_kill_switch(False, "smoke start")
 
 def engine(flag=True):
     order_ledger.save(INST, None)
+    from app.engine import account_risk
+    account_risk.account.reset()
     settings.trade_mode = "paper"
     st = AppState(instrument=INST)
     registry._states[INST] = st
@@ -228,6 +238,102 @@ settings.trade_mode = "paper"
 st3 = AppState(instrument=INST)
 st3._sync_exch_stop(115.0)
 check("paper engine never places an exchange stop", st3._exch_stop is None)
+
+# 12. hard stop at Angel right after the buy (live_exchange_hard_stop)
+settings.trade_mode = "live"
+check("hard stop is off by default",
+      type(settings).model_fields["live_exchange_hard_stop"].default is False)
+st, b, sym = engine(flag=True)
+at(st, 101.0)
+check("hard stop off: nothing resting before T1", not b.stops)
+settings.live_exchange_hard_stop = True
+st, b, sym = engine(flag=True)
+at(st, 101.0)
+check("hard stop placed at the stop after the buy", len(b.stops) == 1 and b.stops[0][2] == 94.0,
+      str(b.stops))
+check("hard stop reason is STOP LOSS", (st._exch_stop or {}).get("reason", "").startswith("STOP LOSS"))
+at(st, 95.0)
+check("price near the stop: no market SELL", not [o for o in b.orders if o[1] == "SELL"])
+b.fill_stop("S1", 93.8)
+at(st, 93.5)
+check("hard stop filled at Angel: booked, no market SELL",
+      not st.position.option_symbol and not [o for o in b.orders if o[1] == "SELL"],
+      str(b.orders))
+
+# 13. hard stop breach with no exchange fill: wait, then cancel + ONE market SELL
+st, b, sym = engine(flag=True)
+at(st, 101.0)
+at(st, 93.9)
+check("hard-stop breach: waits for the exchange order",
+      st.position.option_symbol and not [o for o in b.orders if o[1] == "SELL"])
+st._exch_stop_breach_at = time.time() - 10
+at(st, 93.5)
+sells = [o for o in b.orders if o[1] == "SELL"]
+check("hard-stop fallback: cancel then one market SELL", b.cancels == ["S1"] and len(sells) == 1,
+      f"{b.cancels} {sells}")
+
+# 14. stop raised (break-even) -> order modified up; then T1 floor -> modified to floor
+st, b, sym = engine(flag=True)
+at(st, 101.0)
+st._exch_stop["moved"] = 0
+st._auto_stop = 100.5
+at(st, 104.0)
+check("raised stop modifies the resting order up",
+      b.modifies and b.modifies[-1][2] == 100.5, str(b.modifies))
+check("raised stop at entry is a break-even stop",
+      (st._exch_stop or {}).get("reason", "").startswith("BREAK-EVEN"))
+st._exch_stop["moved"] = 0
+st._auto_tgt_floor = 110.0
+at(st, 115.0)
+check("T1 floor: same order moved to the floor", len(b.stops) == 1
+      and b.modifies[-1][2] == 110.0 and st._exch_stop.get("kind") == "floor", str(b.modifies))
+
+# 15. hard stop never lowered by the trail; only a manual re-set can lower it
+st, b, sym = engine(flag=True)
+at(st, 101.0)
+st._exch_stop["moved"] = 0
+st._auto_stop = 90.0
+at(st, 101.0)
+check("manual lower re-set follows the stop down", b.modifies and b.modifies[-1][2] == 90.0,
+      str(b.modifies))
+
+# 16. exchanges with no stop-loss exit: no hard stop resting
+settings.auto_trade_no_stop_loss_exchanges = ["MCX"]
+st, b, sym = engine(flag=True)
+at(st, 101.0)
+check("no-stop-loss exchange: no hard stop placed", not b.stops)
+settings.auto_trade_no_stop_loss_exchanges = []
+settings.live_exchange_hard_stop = False
+
+# 17. BUY acknowledged, fill never visible in the order book: adopted from the
+#     Angel position after the wait, and managed with the signal's stop/targets
+st, b, sym = engine(flag=True)
+st.sell(confirm=True)
+check("flat before the pending-entry test", not st.position.option_symbol)
+b.hold_fill = True
+r = st.buy(sym, lots=2, confirm=True, manual=False)
+check("unconfirmed BUY stays pending (no position yet)",
+      not r.ok and st._pending_order and not st.position.option_symbol, r.message)
+st._pending_order["auto"] = {"option": sym, "stop": 92.0, "t1": 111.0, "t2": 121.0,
+                             "t3": 131.0, "strike": None, "conf": 85.0, "lots": 2}
+lot = next(o.lot_size for o in b.option_chain() if o.symbol == sym)
+b.positions[sym] = {"net_qty": 2 * lot, "buy_avg": 101.5, "sell_avg": 0.0}
+st._last_order_poll = 0
+st._poll_live_orders()
+check("not adopted before the wait", st._pending_order and not st.position.option_symbol)
+st._pending_order["ts"] = time.time() - 60
+st._last_order_poll = 0
+st._poll_live_orders()
+check("adopted from the Angel position at Angel's buy average",
+      st.position.option_symbol == sym and st.position.quantity_lots == 2
+      and abs((st.position.entry_premium or 0) - 101.5) < 1e-6 and not st._pending_order,
+      f"{st.position.option_symbol} {st.position.entry_premium}")
+check("late fill is managed with the signal levels",
+      st._auto_entry_active and st._auto_stop == 92.0 and st._auto_target1 == 111.0,
+      f"{st._auto_stop} {st._auto_target1}")
+check("adoption sent no extra order", len([o for o in b.orders if o[1] == "BUY"]) == 2,
+      str(b.orders))
+b.hold_fill = False
 
 print("ALL PASS" if not FAIL else f"{len(FAIL)} FAIL: {FAIL}")
 raise SystemExit(1 if FAIL else 0)

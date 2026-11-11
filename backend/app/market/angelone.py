@@ -2282,7 +2282,9 @@ class AngelOneProvider(MarketDataProvider):
         if not order_id:
             return None
         try:
-            book = (self._smart.orderBook() or {}).get("data") or []
+            # The order key that placed the order, not this instrument's data shard
+            # (its rate limit is spent on quotes, which left fills unseen).
+            book = (self._order_smart().orderBook() or {}).get("data") or []
         except Exception:  # pragma: no cover - live API
             return None
         row = next((r for r in book if str(r.get("orderid")) == str(order_id)), None)

@@ -151,11 +151,20 @@ class Settings(BaseSettings):
     live_auto_sync_angel_close: bool = True
     # After a live SELL that never reached Angel, wait this long before retrying.
     live_exit_retry_sec: float = 5.0
+    # A live BUY Angel acknowledged but whose fill can't be read from the order
+    # book: after this many seconds, adopt it once Angel's positions show exactly
+    # that quantity (at Angel's buy average). 0 = off.
+    live_pending_adopt_sec: float = 20.0
     # LIVE only, off by default. Once a target floor is locked (T1/T2/T3/ratchet,
     # never below entry), rest a STOPLOSS_LIMIT SELL at Angel at that floor and
     # raise it as the floor ratchets, so the exit fills at the exchange near the
     # floor instead of a market sell sent after the bid has already fallen.
     live_exchange_trail_stop: bool = False
+    # LIVE only, off by default. As soon as an auto-buy fills, rest the hard stop
+    # (below entry, raised as the pre-T1 trail / break-even moves it) at Angel as
+    # a STOPLOSS_LIMIT SELL, so the stop still fires if the app, PC or WSL dies.
+    # Same buffer / fallback / min-step settings as the floor order below.
+    live_exchange_hard_stop: bool = False
     # Limit = trigger minus this % of it: room to fill on a fast drop.
     live_exchange_trail_stop_buffer_pct: float = 1.0
     # Move the resting order only when the floor has risen this % (Angel caps modifies).
