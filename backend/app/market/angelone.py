@@ -597,10 +597,13 @@ class _TickBars:
 
 
 class _Instrument:
-    __slots__ = ("token", "symbol", "strike", "expiry", "opt_type", "is_future", "lot_size")
+    __slots__ = ("token", "symbol", "strike", "expiry", "opt_type", "is_future", "lot_size",
+                 "tick")
 
     def __init__(self, token: str, symbol: str, strike: float, expiry: dt.date,
-                 opt_type: OptionType | None, is_future: bool, lot_size: int = 1) -> None:
+                 opt_type: OptionType | None, is_future: bool, lot_size: int = 1,
+                 tick: float = 0.05) -> None:
+        self.tick = tick if tick and tick > 0 else 0.05
         self.token = token
         self.symbol = symbol
         self.strike = strike
@@ -1475,6 +1478,10 @@ class AngelOneProvider(MarketDataProvider):
             token = str(row.get("token"))
             sym = row.get("symbol", "")
             lot = int(float(row.get("lotsize", 1) or 1))
+            try:
+                tick = float(row.get("tick_size") or 0) / 100.0  # scrip master tick is in paise
+            except (TypeError, ValueError):
+                tick = 0.0
             # Handle BOTH commodity (MCX: FUTCOM/OPTFUT) and index/equity
             # (NFO/BFO: FUTIDX/FUTSTK / OPTIDX/OPTSTK) contracts. The previous
             # code only matched FUTCOM/OPTFUT, so Nifty & Sensex (index type)
@@ -1484,7 +1491,7 @@ class AngelOneProvider(MarketDataProvider):
             elif itype.startswith("OPT"):
                 strike = float(row.get("strike", 0)) / 100.0  # scrip master strike is x100
                 otype = OptionType.CALL if sym.endswith("CE") else OptionType.PUT
-                options_all.append(_Instrument(token, sym, strike, expiry, otype, False, lot))
+                options_all.append(_Instrument(token, sym, strike, expiry, otype, False, lot, tick))
 
         today = dt.date.today()
         fut_future = sorted((f for f in futures if f.expiry >= today), key=lambda x: x.expiry)
@@ -2177,12 +2184,107 @@ class AngelOneProvider(MarketDataProvider):
                            status="ACKNOWLEDGED" if order_id else "REJECTED",
                            message="Order acknowledged" if order_id else "Order rejected")
 
+    def _order_smart(self):
+        if settings.orders_on_primary_only:
+            try:
+                shards = _get_shards()
+                if shards:
+                    return shards[0].smart
+            except Exception:
+                return self._smart
+        return self._smart
+
+    def tick_size(self, option_symbol: str) -> float:
+        inst = next((o for o in self._options if o.symbol == option_symbol), None)
+        return float(inst.tick) if inst is not None else 0.05
+
+    def _stop_params(self, inst: _Instrument, lots: int, trigger: float, limit: float,
+                     product: str | None) -> dict:
+        return {
+            "variety": "STOPLOSS",
+            "tradingsymbol": inst.symbol,
+            "symboltoken": inst.token,
+            "transactiontype": "SELL",
+            "exchange": self._exchange,
+            "ordertype": "STOPLOSS_LIMIT",
+            "producttype": product or settings.angel_product,
+            "duration": "DAY",
+            "price": f"{limit:.2f}",
+            "triggerprice": f"{trigger:.2f}",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(max(1, lots) * max(1, inst.lot_size)),
+        }
+
+    def place_stop_order(self, option_symbol: str, lots: int, trigger: float, limit: float,
+                         product: str | None = None) -> OrderResult:
+        """Resting SELL that the exchange triggers at ``trigger`` (LTP) and fills
+        at ``limit`` or better. Acknowledgement only; fills via order_status()."""
+        safety.assert_order_allowed("angelone.place_stop_order", option_symbol, "SELL", lots)
+        inst = next((o for o in self._options if o.symbol == option_symbol), None)
+        if inst is None:
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=option_symbol,
+                               lots=lots, status="NOT_SENT",
+                               message=f"Unknown option {option_symbol}")
+        params = self._stop_params(inst, lots, trigger, limit, product)
+        try:
+            resp = self._order_smart().placeOrder(params)
+        except Exception as exc:  # pragma: no cover - live API
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=option_symbol,
+                               lots=lots, message=f"Stop order error: {exc}",
+                               status="NOT_SENT" if order_not_sent(exc) else "UNKNOWN")
+        order_id = str(resp) if resp else None
+        return OrderResult(ok=bool(order_id), mode="live", side="SELL",
+                           option_symbol=option_symbol, lots=lots, order_id=order_id,
+                           status="ACKNOWLEDGED" if order_id else "REJECTED",
+                           message="Stop order acknowledged" if order_id else
+                           "Stop order rejected")
+
+    def modify_stop_order(self, order_id: str, option_symbol: str, lots: int, trigger: float,
+                          limit: float, product: str | None = None) -> OrderResult:
+        safety.assert_order_allowed("angelone.modify_stop_order", option_symbol, "SELL", lots)
+        inst = next((o for o in self._options if o.symbol == option_symbol), None)
+        if inst is None:
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=option_symbol,
+                               lots=lots, order_id=order_id,
+                               message=f"Unknown option {option_symbol}")
+        params = self._stop_params(inst, lots, trigger, limit, product)
+        params["orderid"] = str(order_id)
+        try:
+            resp = self._order_smart().modifyOrder(params)
+        except Exception as exc:  # pragma: no cover - live API
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=option_symbol,
+                               lots=lots, order_id=order_id, status="UNKNOWN",
+                               message=f"Modify error: {exc}")
+        ok = bool(resp.get("status")) if isinstance(resp, dict) else bool(resp)
+        msg = str(resp.get("message") or "") if isinstance(resp, dict) else ""
+        return OrderResult(ok=ok, mode="live", side="SELL", option_symbol=option_symbol,
+                           lots=lots, order_id=order_id, status="OPEN" if ok else "REJECTED",
+                           message=msg or ("Stop order modified" if ok else "Modify rejected"))
+
+    def cancel_order(self, order_id: str, variety: str = "STOPLOSS") -> OrderResult:
+        """Cancel a working order. Confirm the outcome with order_status()."""
+        safety.assert_order_allowed("angelone.cancel_order", str(order_id), "CANCEL", 0)
+        try:
+            resp = self._order_smart().cancelOrder(str(order_id), variety)
+        except Exception as exc:  # pragma: no cover - live API
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol="", lots=0,
+                               order_id=order_id, status="UNKNOWN",
+                               message=f"Cancel error: {exc}")
+        ok = bool(resp.get("status")) if isinstance(resp, dict) else bool(resp)
+        return OrderResult(ok=ok, mode="live", side="SELL", option_symbol="", lots=0,
+                           order_id=order_id, status="ACKNOWLEDGED" if ok else "REJECTED",
+                           message=(str(resp.get("message") or "") if isinstance(resp, dict)
+                                    else "") or ("Cancel sent" if ok else "Cancel rejected"))
+
     def order_status(self, order_id: str) -> OrderResult | None:
         """Read-only: look the order up in the SmartAPI order book."""
         if not order_id:
             return None
         try:
-            book = (self._smart.orderBook() or {}).get("data") or []
+            # The order key that placed the order, not this instrument's data shard
+            # (its rate limit is spent on quotes, which left fills unseen).
+            book = (self._order_smart().orderBook() or {}).get("data") or []
         except Exception:  # pragma: no cover - live API
             return None
         row = next((r for r in book if str(r.get("orderid")) == str(order_id)), None)
