@@ -3987,6 +3987,10 @@ class AppState:
                     return
                 rec = self._gapup_levels(rec, entry, spec.lot_size)
                 book.update_trade(inst, **rec)
+                self._arm_auto_entry({"option": p.option_symbol, "stop": rec["stop"],
+                                      "t1": rec["target"], "t2": None, "t3": None,
+                                      "strike": None, "conf": None},
+                                     entry, int(p.quantity_lots), live, now)
             mtm = float(p.net_pnl or 0.0)
             self._gapup_last_mtm = mtm
             book.mark(inst, mtm, now)
