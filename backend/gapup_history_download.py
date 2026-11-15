@@ -81,7 +81,13 @@ def _write(path: str, header: list[str], rows: list[list]) -> None:
 
 def _scrip(roots: set[str]):
     """Reduce the scrip master to the equity tokens and CE contracts we need."""
-    data = httpx.get(ah.SCRIP_MASTER_URL, timeout=180.0).json()
+    cached = os.path.join(settings.data_dir, "scrip_master.json")  # backend's same-day cache
+    if os.path.exists(cached):
+        import json
+        with open(cached, encoding="utf-8") as fh:
+            data = json.load(fh)
+    else:
+        data = httpx.get(ah.SCRIP_MASTER_URL, timeout=300.0).json()
     eq, opts = {}, {}
     want = {_key(r): r for r in roots}
     for r in data:
