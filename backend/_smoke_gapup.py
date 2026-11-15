@@ -4,7 +4,9 @@ import datetime as dt
 import os
 import tempfile
 
-os.environ.setdefault("QT_DATA_DIR", tempfile.mkdtemp())
+# Always a throwaway dir: never touch the real order ledger (inside Docker
+# QT_DATA_DIR is /app/data).
+os.environ["QT_DATA_DIR"] = tempfile.mkdtemp()
 
 from app.config import settings  # noqa: E402
 from app.engine import gapup  # noqa: E402
@@ -24,11 +26,12 @@ def ist(h: int, m: int) -> float:
 
 check("gap % from prev close", round(gapup.gap_pct(101.0, 100.0), 6) == 1.0)
 check("no gap without prev close", gapup.gap_pct(101.0, None) is None)
+check("smoke uses a temp data dir", settings.data_dir != "/app/data", settings.data_dir)
 check("NSE window open 09:15", gapup.in_window("NSE", ist(9, 15)))
 check("NSE closed 09:10", not gapup.in_window("NSE", ist(9, 10)))
 check("NSE closed 09:45", not gapup.in_window("NSE", ist(9, 45)))
 check("MCX window open 09:00", gapup.in_window("MCX", ist(9, 0)))
-check("high-qty target 1 pt", gapup.target_points(1500) == settings.gapup_target_pts_hq == 1.0)
+check("high-qty target 2 pts", gapup.target_points(1500) == settings.gapup_target_pts_hq == 2.0)
 check("low-qty target 5 pts", gapup.target_points(250) == settings.gapup_target_pts_lq == 5.0)
 
 check("no lock below 5k", gapup.lock_floor(4999) is None)

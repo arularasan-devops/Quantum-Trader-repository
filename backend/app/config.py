@@ -181,9 +181,9 @@ class Settings(BaseSettings):
     gapup_max_gap_pct: float = 2.0
     gapup_lots: int = 2
     gapup_capital: float = 200000.0
-    # Lot size at/above this counts as "high quantity" (1-point target).
+    # Lot size at/above this counts as "high quantity" (2-point target).
     gapup_hq_lot: int = 1000
-    gapup_target_pts_hq: float = 1.0
+    gapup_target_pts_hq: float = 2.0
     gapup_target_pts_lq: float = 5.0
     gapup_stop_pct: float = 15.0
     # No re-buy of the same instrument for this long after a gap-up exit.
