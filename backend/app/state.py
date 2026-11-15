@@ -4089,7 +4089,8 @@ class AppState:
         if (not self.is_live or reason == "GAPUP TARGET" or not pend
                 or not pend.get("exchange_stop") or not pend.get("order_id")
                 or not str(pend.get("reason") or "").startswith("GAPUP TARGET")
-                or pend.get("cancel_sent")):
+                or pend.get("cancel_sent")
+                or time.time() - float(pend.get("cancel_tried_at") or 0) < 5.0):
             return
         cancel = getattr(self.provider, "cancel_order", None)
         if cancel is None:
@@ -4103,7 +4104,10 @@ class AppState:
             res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=pend["symbol"],
                               lots=0, order_id=pend["order_id"], status="UNKNOWN",
                               message=str(exc))
-        pend["cancel_sent"] = True
+        # Only a confirmed cancel request stops retries; a failed one is retried
+        # (at most every 5 s) so the protective exit isn't blocked for good.
+        pend["cancel_sent"] = bool(res is not None and res.ok)
+        pend["cancel_tried_at"] = time.time()
         self._persist_state()
         self._event("GAPUP_TARGET_CANCEL_SENT", pend, res, note=reason)
 
