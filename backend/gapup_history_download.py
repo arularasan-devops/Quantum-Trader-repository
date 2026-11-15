@@ -138,7 +138,15 @@ def main() -> None:
     print(f"{len(roots)} names, {start}..{today}, out={out}", flush=True)
 
     eq, opts = _scrip(set(roots))
-    smart = ah.login_smart()
+    for wait in (30, 60, 120, 300, 0):  # Angel login can time out during outages/maintenance
+        try:
+            smart = ah.login_smart()
+            break
+        except Exception as exc:
+            if not wait:
+                raise SystemExit(f"Angel login failed: {type(exc).__name__} - try again later (no orders placed)")
+            print(f"Angel login failed ({type(exc).__name__}), retry in {wait}s", flush=True)
+            time.sleep(wait)
     pacer = Pacer(a.pace)
     summary = []
     for n, root in enumerate(roots, 1):
