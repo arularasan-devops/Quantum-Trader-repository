@@ -172,6 +172,30 @@ class Settings(BaseSettings):
     # Bid at/below the floor this long with no exchange fill (e.g. it gapped
     # through the limit) -> cancel the resting order and send the market exit.
     live_exchange_trail_stop_fallback_sec: float = 5.0
+    # --- Gap-up morning mode (off by default). When ON it REPLACES normal auto
+    # entries: on a gap-up open (gap = today's open vs previous close) buy the
+    # ATM CE inside the morning window, target = entry + fixed points, stop at
+    # market. See app/engine/gapup.py.
+    gapup_mode: bool = False
+    gapup_min_gap_pct: float = 0.5
+    gapup_max_gap_pct: float = 2.0
+    gapup_lots: int = 2
+    gapup_capital: float = 200000.0
+    # Lot size at/above this counts as "high quantity" (1-point target).
+    gapup_hq_lot: int = 1000
+    gapup_target_pts_hq: float = 1.0
+    gapup_target_pts_lq: float = 5.0
+    gapup_stop_pct: float = 15.0
+    # No re-buy of the same instrument for this long after a gap-up exit.
+    gapup_cooldown_sec: float = 3600.0
+    # Day profit lock over all gap-up trades: first lock, then +step raises it.
+    gapup_lock_first: float = 5000.0
+    gapup_lock_step: float = 2000.0
+    gapup_stop_new_after_lock: bool = True
+    gapup_window_nse: str = "09:15-09:45"
+    gapup_window_mcx: str = "09:00-09:45"
+    # LIVE: rest the target at Angel as a LIMIT SELL (cancelled before any stop sell).
+    gapup_exchange_target: bool = True
     risk_per_trade_pct: float = 2.0      # % of capital risked per trade
     # Journal v2 simulated account + OBSERVATIONAL sizing comparison. These never
     # change the engine's actual quantity (see app/journal/sizing.py).

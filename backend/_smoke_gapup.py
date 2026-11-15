@@ -1,0 +1,76 @@
+"""Smoke: gap-up mode rules (app/engine/gapup.py) — lock ladder, cooldown,
+no-buy-after-lock, restart persistence and the morning window."""
+import datetime as dt
+import os
+import tempfile
+
+os.environ.setdefault("QT_DATA_DIR", tempfile.mkdtemp())
+
+from app.config import settings  # noqa: E402
+from app.engine import gapup  # noqa: E402
+
+FAIL = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    print(f"{'PASS' if cond else 'FAIL'}  {name}{(' — ' + detail) if detail else ''}")
+    if not cond:
+        FAIL.append(name)
+
+
+def ist(h: int, m: int) -> float:
+    return dt.datetime(2026, 11, 16, h, m, tzinfo=gapup.IST).timestamp()  # a Monday
+
+
+check("gap % from prev close", round(gapup.gap_pct(101.0, 100.0), 6) == 1.0)
+check("no gap without prev close", gapup.gap_pct(101.0, None) is None)
+check("NSE window open 09:15", gapup.in_window("NSE", ist(9, 15)))
+check("NSE closed 09:10", not gapup.in_window("NSE", ist(9, 10)))
+check("NSE closed 09:45", not gapup.in_window("NSE", ist(9, 45)))
+check("MCX window open 09:00", gapup.in_window("MCX", ist(9, 0)))
+check("high-qty target 1 pt", gapup.target_points(1500) == settings.gapup_target_pts_hq == 1.0)
+check("low-qty target 5 pts", gapup.target_points(250) == settings.gapup_target_pts_lq == 5.0)
+
+check("no lock below 5k", gapup.lock_floor(4999) is None)
+check("lock 5k at 5k", gapup.lock_floor(5000) == 5000)
+check("still 5k at 6.9k", gapup.lock_floor(6999) == 5000)
+check("lock 7k at 7k", gapup.lock_floor(7000) == 7000)
+check("lock 9k at 9.5k", gapup.lock_floor(9500) == 9000)
+
+t = ist(9, 16)
+b = gapup.DayBook()
+check("fresh book allows entry", b.entry_block("SBIN", t) is None)
+b.open_trade("SBIN", {"symbol": "SBIN-CE", "lots": 2, "notional": 50000}, t)
+check("open trade blocks a second buy", b.entry_block("SBIN", t) is not None)
+b.mark("SBIN", 3000, t)
+check("3k MTM: no lock", b.floor is None and not b.breached(t))
+b.close_trade("SBIN", 3000, t + 60)
+check("60-min cooldown after exit", "cooldown" in (b.entry_block("SBIN", t + 120) or ""))
+check("cooldown over after 60 min", b.entry_block("SBIN", t + 60 + 3601) is None)
+check("other names unaffected", b.entry_block("ITC", t + 120) is None)
+b.open_trade("ITC", {"symbol": "ITC-CE", "lots": 2}, t + 120)
+b.mark("ITC", 2500, t + 130)  # 3000 + 2500 = 5500
+check("5.5k day: lock 5k", b.floor == 5000, str(b.floor))
+check("no new buys once locked", "lock" in (b.entry_block("TCS", t + 140) or ""))
+b.mark("ITC", 4200, t + 150)  # 7200
+check("7.2k day: lock 7k", b.floor == 7000, str(b.floor))
+b.mark("ITC", 4100, t + 160)  # 7100
+check("7.1k: not breached", not b.breached(t + 160))
+b.mark("ITC", 3900, t + 170)  # 6900
+check("6.9k: lock 7k breached -> sell all", b.breached(t + 170))
+check("lock never steps down", b.floor == 7000)
+
+b2 = gapup.DayBook()  # restart: reload from the order ledger
+snap = b2.snapshot()
+check("restart keeps lock", snap["lock"] == 7000, str(snap["lock"]))
+check("restart keeps halt", "lock" in (b2.entry_block("TCS", t + 300) or ""))
+check("restart keeps cooldown", "SBIN" in snap["last_exit"])
+check("restart keeps open trade", b2.trade("ITC") is not None)
+check("next day resets lock + cooldown",
+      b2.entry_block("SBIN", t + 86400) is None and b2.floor is None)
+b2.open_trade("NIFTY", {"symbol": "X"}, t + 86400)
+b2.discard_trade("NIFTY")
+check("rejected buy leaves no cooldown", b2.entry_block("NIFTY", t + 86401) is None)
+
+print("ALL PASS" if not FAIL else f"FAILED: {FAIL}")
+raise SystemExit(1 if FAIL else 0)

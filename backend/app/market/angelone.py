@@ -2240,6 +2240,43 @@ class AngelOneProvider(MarketDataProvider):
                            message="Stop order acknowledged" if order_id else
                            "Stop order rejected")
 
+    def place_limit_sell(self, option_symbol: str, lots: int, price: float,
+                         product: str | None = None) -> OrderResult:
+        """Resting LIMIT SELL (gap-up target). Acknowledgement only; fills via
+        order_status(). Cancel with cancel_order(order_id, "NORMAL")."""
+        safety.assert_order_allowed("angelone.place_limit_sell", option_symbol, "SELL", lots)
+        inst = next((o for o in self._options if o.symbol == option_symbol), None)
+        if inst is None:
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=option_symbol,
+                               lots=lots, status="NOT_SENT",
+                               message=f"Unknown option {option_symbol}")
+        params = {
+            "variety": "NORMAL",
+            "tradingsymbol": inst.symbol,
+            "symboltoken": inst.token,
+            "transactiontype": "SELL",
+            "exchange": self._exchange,
+            "ordertype": "LIMIT",
+            "producttype": product or settings.angel_product,
+            "duration": "DAY",
+            "price": f"{price:.2f}",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(max(1, lots) * max(1, inst.lot_size)),
+        }
+        try:
+            resp = self._order_smart().placeOrder(params)
+        except Exception as exc:  # pragma: no cover - live API
+            return OrderResult(ok=False, mode="live", side="SELL", option_symbol=option_symbol,
+                               lots=lots, message=f"Target order error: {exc}",
+                               status="NOT_SENT" if order_not_sent(exc) else "UNKNOWN")
+        order_id = str(resp) if resp else None
+        return OrderResult(ok=bool(order_id), mode="live", side="SELL",
+                           option_symbol=option_symbol, lots=lots, order_id=order_id,
+                           status="ACKNOWLEDGED" if order_id else "REJECTED",
+                           message="Target order acknowledged" if order_id else
+                           "Target order rejected")
+
     def modify_stop_order(self, order_id: str, option_symbol: str, lots: int, trigger: float,
                           limit: float, product: str | None = None) -> OrderResult:
         safety.assert_order_allowed("angelone.modify_stop_order", option_symbol, "SELL", lots)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import contextlib
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -1831,6 +1832,11 @@ class AppState:
             self.today_profit += pnl
         else:
             self.today_loss += -pnl
+        if not partial:
+            with contextlib.suppress(Exception):
+                from app.engine import gapup
+                if gapup.book.trade(self._instrument):
+                    gapup.book.close_trade(self._instrument, pnl, time.time())
         # A stop-out is recorded as such: the account governor cools an
         # instrument down for longer after a stop than after a target, because
         # the view has been refused rather than completed.
@@ -2917,6 +2923,11 @@ class AppState:
         live = self._auto_live_armed() or manage_only
         if in_pos and self._broker_closed():
             return  # closed in Angel: no exits on a position that no longer exists
+        if settings.gapup_mode:
+            from app.engine import gapup
+            if not in_pos or gapup.book.trade(self._instrument):
+                self._gapup_trade(in_pos, now, live, manage_only)
+                return
 
         # --- manage an open auto-position ---
         # Two exit styles:
@@ -3289,7 +3300,7 @@ class AppState:
                 self._auto_last_action_ts = now
                 self._reset_auto_trade_marks()
             return
-        if manage_only:
+        if manage_only or settings.gapup_mode:
             return
 
         # --- consider a fresh auto-entry ---
@@ -3937,6 +3948,193 @@ class AppState:
             # fill is managed (stop/targets/trail) instead of left unmanaged.
             self._pending_order["auto"] = levels
             self._persist_state()
+
+    # ------------------------------------------------------------ gap-up mode
+    def _gapup_skip(self, msg: str, now: float) -> None:
+        if self._auto_last_action != msg:
+            self._auto_last_action = msg
+            self._auto_last_action_ts = now
+
+    def _gapup_trade(self, in_pos: bool, now: int, live: bool, manage_only: bool) -> None:
+        """QT_GAPUP_MODE: buy the ATM CE on a gap-up open, exit at entry + fixed
+        points (resting LIMIT at Angel when live) or at market on the stop or the
+        day profit lock. See app/engine/gapup.py."""
+        from app.engine import gapup
+        inst = self._instrument
+        spec = get_spec(inst)
+        book = gapup.book
+        rec = book.trade(inst)
+        p = self.position
+        if (rec and not p.option_symbol and not self._pending_order
+                and not self._pending_exit and rec.get("entry")):
+            # Closed outside the bot's exit path (e.g. squared off in the Angel app).
+            book.close_trade(inst, float(getattr(self, "_gapup_last_mtm", 0.0) or 0.0), now)
+            rec = None
+        if rec and not p.option_symbol and not self._pending_order and not rec.get("entry"):
+            book.discard_trade(inst)  # the buy never became a position
+            rec = None
+
+        if in_pos:
+            if not rec:
+                return
+            prem = p.current_premium
+            if prem is None:
+                return
+            if not rec.get("entry"):
+                # Late (delayed) live fill: arm the target and stop from the broker fill.
+                entry = float(p.entry_premium or 0.0)
+                if entry <= 0:
+                    return
+                rec = self._gapup_levels(rec, entry, spec.lot_size)
+                book.update_trade(inst, **rec)
+            mtm = float(p.net_pnl or 0.0)
+            self._gapup_last_mtm = mtm
+            book.mark(inst, mtm, now)
+            bid = self._own_bid() if live else None
+            px = float(bid if bid is not None else prem)
+            es = self._exch_stop
+            resting = bool(es and es.get("kind") == "target")
+            reason = None
+            if book.breached(now):
+                reason = f"GAPUP LOCK ₹{float(book.floor or 0):,.0f}"
+            elif px <= float(rec["stop"]):
+                reason = "GAPUP STOP"
+            elif live and self._live_squareoff_due(now):
+                reason = "GAPUP SQUARE-OFF"
+            elif px >= float(rec["target"]) and not resting:
+                reason = "GAPUP TARGET"
+            if reason is None:
+                if live and settings.gapup_exchange_target and not resting:
+                    self._gapup_rest_target(rec, px, now)
+                return
+            # sell() cancels the resting target and confirms it first, so the
+            # target and the stop can never both sell.
+            self._pending_exit_reason = reason
+            res = self.sell(confirm=live)
+            self._auto_last_action = (f"GAPUP EXIT {p.option_symbol or rec.get('symbol')} @ "
+                                      f"{px:.2f} · {reason}"
+                                      + ("" if res.ok else f" · {res.message}"))
+            self._auto_last_action_ts = now
+            if not self.position.option_symbol:
+                self._reset_auto_trade_marks()
+            return
+
+        if manage_only or rec or self._pending_order or self._pending_exit:
+            return
+        if not gapup.in_window(spec.exchange, now):
+            return
+        block = book.entry_block(inst, now)
+        if block:
+            self._gapup_skip(f"GAPUP SKIP {inst}: {block}", now)
+            return
+        if live and (live_control.kill_switch_engaged() or self._live_squareoff_due(now)):
+            return
+        if not self._feed_ready():
+            return
+        ohlc = self.provider.day_ohlc() or {}
+        g = gapup.gap_pct(ohlc.get("open"), ohlc.get("prev_close"))
+        if g is None or g < settings.gapup_min_gap_pct or g > settings.gapup_max_gap_pct:
+            return
+        try:
+            atm = self._atm_pair(self.provider.option_chain(), self.provider.futures_price())
+        except Exception:
+            return
+        sym, prem = atm.get("atm_ce_symbol"), atm.get("atm_ce_premium")
+        if not sym or not prem:
+            return
+        lots = max(1, int(settings.gapup_lots))
+        lot_size = int(spec.lot_size or 1)
+        notional = float(prem) * lot_size * lots
+        if book.open_notional() + notional > settings.gapup_capital:
+            self._gapup_skip(f"GAPUP SKIP {sym}: ₹{notional:,.0f} would exceed gap-up "
+                             f"capital ₹{settings.gapup_capital:,.0f}", now)
+            return
+        # Record the intent BEFORE the order so a restart cannot re-buy it.
+        if not book.open_trade(inst, {"symbol": sym, "lots": lots, "ts": float(now),
+                                      "gap": round(g, 2), "notional": round(notional, 0)},
+                               now):
+            return
+        res = self.buy(sym, lots=lots, confirm=live, manual=False)
+        if not res.ok and not self._pending_order:
+            book.discard_trade(inst)
+            self._gapup_skip(f"GAPUP BUY {sym} failed: {res.message}", now)
+            return
+        if not res.ok:
+            return  # live order pending at Angel: armed when the fill arrives
+        entry = float(res.fill_premium or self.position.entry_premium or 0.0)
+        if entry > 0:
+            rec = self._gapup_levels(dict(book.trade(inst) or {}), entry, lot_size)
+            book.update_trade(inst, **rec)
+            self._arm_auto_entry({"option": sym, "stop": rec["stop"], "t1": rec["target"],
+                                  "t2": None, "t3": None, "strike": None, "conf": None},
+                                 entry, lots, live, now)
+            self._auto_last_action = (f"GAPUP BUY {sym} x{lots} @ {entry:.2f} · gap {g:.2f}% · "
+                                      f"target {rec['target']:.2f} · stop {rec['stop']:.2f}")
+            self._auto_last_action_ts = now
+
+    @staticmethod
+    def _gapup_levels(rec: dict, entry: float, lot_size: int) -> dict:
+        from app.engine import gapup
+        rec = dict(rec)
+        rec["entry"] = round(entry, 2)
+        rec["target"] = round(entry + gapup.target_points(lot_size), 2)
+        rec["stop"] = round(max(0.05, entry * (1.0 - settings.gapup_stop_pct / 100.0)), 2)
+        return rec
+
+    def _gapup_rest_target(self, rec: dict, bid: float, now: float) -> None:
+        """LIVE: rest the target at Angel as a LIMIT SELL, held in the same slot as
+        the exchange stop so every other SELL cancels and confirms it first."""
+        place = getattr(self.provider, "place_limit_sell", None)
+        p = self.position
+        if (not self.is_live or place is None or not p.option_symbol or self._exch_stop
+                or now < self._exch_stop_retry_at or self._pending_order
+                or self._pending_exit or self._order_recovery or self._persist_error):
+            return
+        sym = p.option_symbol
+        tick = self._exch_tick(sym)
+        price = round(math.ceil(float(rec["target"]) / tick - 1e-9) * tick, 2)
+        lots = int(p.quantity_lots)
+        es = {"order_id": None, "symbol": sym, "lots": lots, "trigger": price, "limit": price,
+              "variety": "NORMAL", "ts": now, "moved": now, "kind": "target",
+              "reason": "GAPUP TARGET (exchange limit)"}
+        self._exch_stop = es
+        if not (self._persist_state() and self._event("GAPUP_TARGET_INTENT", {"side": "SELL",
+                "symbol": sym, "lots": lots}, limit=price)):
+            self._exch_stop = None
+            self._persist_state()
+            return
+        from app.ai.safety import RealMoneyBlocked
+        prod = (self._ledger_position or {}).get("product")
+        try:
+            res = place(sym, lots, price, product=prod)
+        except RealMoneyBlocked:
+            self._exch_stop = None
+            self._exch_stop_retry_at = now + 300.0
+            self._persist_state()
+            return
+        except Exception as exc:
+            res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym, lots=lots,
+                              status="UNKNOWN", message=str(exc))
+        if res.ok and res.order_id:
+            es["order_id"] = res.order_id
+            self._persist_state()
+            self._event("GAPUP_TARGET_PLACED", {"order_id": res.order_id, "side": "SELL",
+                        "symbol": sym, "lots": lots}, res, limit=price)
+            return
+        if res.status == "UNKNOWN":
+            self._event("GAPUP_TARGET_UNKNOWN", {"side": "SELL", "symbol": sym, "lots": lots},
+                        res)
+            self._add_alert("GAPUP_TARGET_UNRESOLVED", f"Target order for {sym} may be resting "
+                            f"at Angel ({res.message}). Check the Angel order book: cancel any "
+                            "open LIMIT SELL, then POST /api/order-recovery clear_pending "
+                            "which=exch_stop. No bot SELL is sent until then.", "critical")
+            return
+        self._exch_stop = None
+        self._exch_stop_retry_at = now + 30.0
+        self._persist_state()
+        self._event("GAPUP_TARGET_REJECTED", {"side": "SELL", "symbol": sym, "lots": lots}, res)
+        self._add_alert("GAPUP_TARGET_REJECTED", f"Gap-up target for {sym} not placed: "
+                        f"{res.message} — the bot target exit still applies", "warning")
 
     def _arm_auto_entry(self, levels: dict, fill_premium: float | None, lots: int,
                         live: bool, now: float) -> None:
