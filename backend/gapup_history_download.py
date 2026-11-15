@@ -124,7 +124,9 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=180)
     ap.add_argument("--symbols", default="", help="comma list; default = all NSE/BSE registry names")
     ap.add_argument("--no-options", action="store_true")
-    ap.add_argument("--expiries", type=int, default=3, help="nearest N unexpired expiries per name")
+    ap.add_argument("--expiries", type=int, default=1, help="nearest N unexpired expiries per name")
+    ap.add_argument("--opt-days", type=int, default=100,
+                    help="only gap-up days within this many days before an expiry (contract lifetime)")
     ap.add_argument("--pace", type=float, default=ah._MIN_INTERVAL, help="seconds between Angel calls")
     a = ap.parse_args()
     roots = [s.strip().upper() for s in a.symbols.split(",") if s.strip()] or \
@@ -201,7 +203,7 @@ def _one(a, root, sx, stok, out, start, today, opts, smart, pacer):
             strikes = [x["strike"] for x in chain]
             need: dict[str, list[dt.date]] = {}
             for d, o in gapup.items():
-                if d > exp or not strikes:
+                if d > exp or d < exp - dt.timedelta(days=a.opt_days) or not strikes:
                     continue
                 i = min(range(len(strikes)), key=lambda j: abs(strikes[j] - o))
                 for x in chain[i:i + 2]:
