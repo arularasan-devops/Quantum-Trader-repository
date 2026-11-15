@@ -119,7 +119,18 @@ def _scrip(roots: set[str]):
     return eq, opts
 
 
+def _quiet_smartapi() -> None:
+    """SmartConnect logs request headers (API key, JWT) on errors; never write them to our log."""
+    try:
+        import logging
+        import logzero
+        logzero.loglevel(logging.CRITICAL)
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _quiet_smartapi()
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=180)
     ap.add_argument("--symbols", default="", help="comma list; default = all NSE/BSE registry names")
