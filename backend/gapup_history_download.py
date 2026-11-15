@@ -52,8 +52,17 @@ class Pacer:
         wait = self.pace - (time.time() - self.last)
         if wait > 0:
             time.sleep(wait)
-        rows = ah._fetch_chunk(smart, {"exchange": exch, "symboltoken": str(token), "interval": interval,
-                                       "fromdate": f"{d0:%Y-%m-%d} {t0}", "todate": f"{d1:%Y-%m-%d} {t1}"})
+        params = {"exchange": exch, "symboltoken": str(token), "interval": interval,
+                  "fromdate": f"{d0:%Y-%m-%d} {t0}", "todate": f"{d1:%Y-%m-%d} {t1}"}
+        for attempt, backoff in enumerate((10, 30, 60, 120, 0)):
+            try:
+                rows = ah._fetch_chunk(smart, params)
+                break
+            except Exception as exc:  # network timeouts / resets: wait and retry the same chunk
+                if not backoff:
+                    raise
+                print(f"   network error ({type(exc).__name__}), retry {attempt + 1} in {backoff}s", flush=True)
+                time.sleep(backoff)
         self.last = time.time()
         self.calls += 1
         out = []
@@ -140,75 +149,83 @@ def main() -> None:
             summary.append((root, "NO_TOKEN", 0, 0, 0))
             continue
         print(f"[{n}/{len(roots)}] {root} ({sx}:{stok})", flush=True)
-        p_day = os.path.join(out, f"{root}_daily.csv")
-        if os.path.exists(p_day):
-            with open(p_day, encoding="utf-8") as fh:
-                daily = [(dt.date.fromisoformat(r["date"]), float(r["open"]), float(r["close"]))
-                         for r in csv.DictReader(fh)]
-        else:
-            rows = pacer.fetch(smart, stok, sx, "ONE_DAY", start - dt.timedelta(days=10), today, "09:00", "15:30")
-            daily = [(t.date(), o, c) for _, t, o, h, l, c, v in rows]
-            _write(p_day, ["date", "open", "high", "low", "close", "volume"],
-                   [[t.date().isoformat(), o, h, l, c, v] for _, t, o, h, l, c, v in rows])
-        gapup = {}  # date -> session open
-        for (d0, _, c0), (d1, o1, _) in zip(daily, daily[1:]):
-            if d1 >= start and c0 > 0 and o1 > c0:
-                gapup[d1] = o1
-
-        p_1m = os.path.join(out, f"{root}_1m.csv.gz")
-        n1 = 0
-        if not os.path.exists(p_1m):
-            rows, cur = [], start
-            while cur <= today:
-                end = min(cur + dt.timedelta(days=CHUNK_1M - 1), today)
-                rows += [[ts, o, h, l, c, v] for ts, t, o, h, l, c, v in
-                         pacer.fetch(smart, stok, sx, "ONE_MINUTE", cur, end, "09:15", "10:45") if _in_window(t)]
-                cur = end + dt.timedelta(days=1)
-            _write(p_1m, ["ts", "open", "high", "low", "close", "volume"], rows)
-            n1 = len(rows)
-
-        p_opt = os.path.join(out, f"{root}_opt.csv.gz")
-        nopt = 0
-        if not a.no_options and gapup and not os.path.exists(p_opt):
-            legs = [x for x in opts.get(root, []) if x["expiry"] >= today]
-            exps = sorted({x["expiry"] for x in legs})[: a.expiries]
-            rows = []
-            for exp in exps:
-                chain = sorted((x for x in legs if x["expiry"] == exp), key=lambda x: x["strike"])
-                strikes = [x["strike"] for x in chain]
-                need: dict[str, list[dt.date]] = {}
-                for d, o in gapup.items():
-                    if d > exp or not strikes:
-                        continue
-                    i = min(range(len(strikes)), key=lambda j: abs(strikes[j] - o))
-                    for x in chain[i:i + 2]:
-                        need.setdefault(x["symbol"], []).append(d)
-                for x in chain:
-                    days = sorted(need.get(x["symbol"], []))
-                    if not days:
-                        continue
-                    dayset, i = set(days), 0
-                    while i < len(days):
-                        d0 = days[i]
-                        d1 = max(d for d in days if d <= d0 + dt.timedelta(days=CHUNK_1M - 1))
-                        for ts, t, o, h, l, c, v in pacer.fetch(smart, x["token"], x["seg"], "ONE_MINUTE",
-                                                                d0, d1, "09:15", "10:45"):
-                            if t.date() in dayset and _in_window(t):
-                                rows.append([root, exp.isoformat(), x["symbol"], x["strike"], "CE", x["lot"],
-                                             ts, o, h, l, c, v, "ANGEL_HISTORY"])
-                        i = days.index(d1) + 1
-            _write(p_opt, ["instrument", "expiry", "symbol", "strike", "option_type", "lot_size", "ts",
-                           "open", "high", "low", "close", "volume", "source"], rows)
-            nopt = len(rows)
-        summary.append((root, "OK", len(daily), len(gapup), n1, nopt))
-        print(f"   daily {len(daily)}  gap-up days {len(gapup)}  1m rows {n1}  option rows {nopt}  "
-              f"(Angel calls so far {pacer.calls})", flush=True)
+        try:
+            summary.append(_one(a, root, sx, stok, out, start, today, opts, smart, pacer))
+        except Exception as exc:  # one bad name never stops the run; rerun fetches what is missing
+            print(f"   FAILED {type(exc).__name__}: {str(exc)[:200]} (skipped, rerun to retry)", flush=True)
+            summary.append((root, "FAILED", 0, 0, 0, 0))
 
     print("\nDONE (no orders were placed)")
     for s in summary:
         print(" ", *s)
     print(f" files: {out}")
     print(" note: candles have no bid/ask; only unexpired option contracts can be fetched.")
+
+
+def _one(a, root, sx, stok, out, start, today, opts, smart, pacer):
+    p_day = os.path.join(out, f"{root}_daily.csv")
+    if os.path.exists(p_day):
+        with open(p_day, encoding="utf-8") as fh:
+            daily = [(dt.date.fromisoformat(r["date"]), float(r["open"]), float(r["close"]))
+                     for r in csv.DictReader(fh)]
+    else:
+        rows = pacer.fetch(smart, stok, sx, "ONE_DAY", start - dt.timedelta(days=10), today, "09:00", "15:30")
+        daily = [(t.date(), o, c) for _, t, o, h, l, c, v in rows]
+        _write(p_day, ["date", "open", "high", "low", "close", "volume"],
+               [[t.date().isoformat(), o, h, l, c, v] for _, t, o, h, l, c, v in rows])
+    gapup = {}  # date -> session open
+    for (d0, _, c0), (d1, o1, _) in zip(daily, daily[1:]):
+        if d1 >= start and c0 > 0 and o1 > c0:
+            gapup[d1] = o1
+
+    p_1m = os.path.join(out, f"{root}_1m.csv.gz")
+    n1 = 0
+    if not os.path.exists(p_1m):
+        rows, cur = [], start
+        while cur <= today:
+            end = min(cur + dt.timedelta(days=CHUNK_1M - 1), today)
+            rows += [[ts, o, h, l, c, v] for ts, t, o, h, l, c, v in
+                     pacer.fetch(smart, stok, sx, "ONE_MINUTE", cur, end, "09:15", "10:45") if _in_window(t)]
+            cur = end + dt.timedelta(days=1)
+        _write(p_1m, ["ts", "open", "high", "low", "close", "volume"], rows)
+        n1 = len(rows)
+
+    p_opt = os.path.join(out, f"{root}_opt.csv.gz")
+    nopt = 0
+    if not a.no_options and gapup and not os.path.exists(p_opt):
+        legs = [x for x in opts.get(root, []) if x["expiry"] >= today]
+        exps = sorted({x["expiry"] for x in legs})[: a.expiries]
+        rows = []
+        for exp in exps:
+            chain = sorted((x for x in legs if x["expiry"] == exp), key=lambda x: x["strike"])
+            strikes = [x["strike"] for x in chain]
+            need: dict[str, list[dt.date]] = {}
+            for d, o in gapup.items():
+                if d > exp or not strikes:
+                    continue
+                i = min(range(len(strikes)), key=lambda j: abs(strikes[j] - o))
+                for x in chain[i:i + 2]:
+                    need.setdefault(x["symbol"], []).append(d)
+            for x in chain:
+                days = sorted(need.get(x["symbol"], []))
+                if not days:
+                    continue
+                dayset, i = set(days), 0
+                while i < len(days):
+                    d0 = days[i]
+                    d1 = max(d for d in days if d <= d0 + dt.timedelta(days=CHUNK_1M - 1))
+                    for ts, t, o, h, l, c, v in pacer.fetch(smart, x["token"], x["seg"], "ONE_MINUTE",
+                                                            d0, d1, "09:15", "10:45"):
+                        if t.date() in dayset and _in_window(t):
+                            rows.append([root, exp.isoformat(), x["symbol"], x["strike"], "CE", x["lot"],
+                                         ts, o, h, l, c, v, "ANGEL_HISTORY"])
+                    i = days.index(d1) + 1
+        _write(p_opt, ["instrument", "expiry", "symbol", "strike", "option_type", "lot_size", "ts",
+                       "open", "high", "low", "close", "volume", "source"], rows)
+        nopt = len(rows)
+    print(f"   daily {len(daily)}  gap-up days {len(gapup)}  1m rows {n1}  option rows {nopt}  "
+          f"(Angel calls so far {pacer.calls})", flush=True)
+    return (root, "OK", len(daily), len(gapup), n1, nopt)
 
 
 if __name__ == "__main__":
