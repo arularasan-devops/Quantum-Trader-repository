@@ -3965,12 +3965,16 @@ class AppState:
         book = gapup.book
         rec = book.trade(inst)
         p = self.position
+        # After a restart a live fill waits in _ledger_position for adoption: keep
+        # its gap-up record so management, capital and the lock resume with it.
+        unadopted = bool(self._order_recovery or self._ledger_position) and not p.option_symbol
         if (rec and not p.option_symbol and not self._pending_order
-                and not self._pending_exit and rec.get("entry")):
+                and not self._pending_exit and rec.get("entry") and not unadopted):
             # Closed outside the bot's exit path (e.g. squared off in the Angel app).
             book.close_trade(inst, float(getattr(self, "_gapup_last_mtm", 0.0) or 0.0), now)
             rec = None
-        if rec and not p.option_symbol and not self._pending_order and not rec.get("entry"):
+        if (rec and not p.option_symbol and not self._pending_order and not rec.get("entry")
+                and not unadopted):
             book.discard_trade(inst)  # the buy never became a position
             rec = None
 
@@ -4013,6 +4017,7 @@ class AppState:
                 return
             # sell() cancels the resting target and confirms it first, so the
             # target and the stop can never both sell.
+            self._gapup_cancel_partial_target(reason)
             self._pending_exit_reason = reason
             res = self.sell(confirm=live)
             self._auto_last_action = (f"GAPUP EXIT {p.option_symbol or rec.get('symbol')} @ "
@@ -4075,6 +4080,32 @@ class AppState:
             self._auto_last_action = (f"GAPUP BUY {sym} x{lots} @ {entry:.2f} · gap {g:.2f}% · "
                                       f"target {rec['target']:.2f} · stop {rec['stop']:.2f}")
             self._auto_last_action_ts = now
+
+    def _gapup_cancel_partial_target(self, reason: str) -> None:
+        """A partly filled target LIMIT is tracked as _pending_exit, which sell()
+        only waits on. For a protective exit, cancel its rest once; sell() then
+        books the confirmed fills and sells the remainder at market."""
+        pend = self._pending_exit
+        if (not self.is_live or reason == "GAPUP TARGET" or not pend
+                or not pend.get("exchange_stop") or not pend.get("order_id")
+                or not str(pend.get("reason") or "").startswith("GAPUP TARGET")
+                or pend.get("cancel_sent")):
+            return
+        cancel = getattr(self.provider, "cancel_order", None)
+        if cancel is None:
+            return
+        from app.ai.safety import RealMoneyBlocked
+        try:
+            res = cancel(pend["order_id"], "NORMAL")
+        except RealMoneyBlocked:
+            return
+        except Exception as exc:
+            res = OrderResult(ok=False, mode="live", side="SELL", option_symbol=pend["symbol"],
+                              lots=0, order_id=pend["order_id"], status="UNKNOWN",
+                              message=str(exc))
+        pend["cancel_sent"] = True
+        self._persist_state()
+        self._event("GAPUP_TARGET_CANCEL_SENT", pend, res, note=reason)
 
     @staticmethod
     def _gapup_levels(rec: dict, entry: float, lot_size: int) -> dict:
