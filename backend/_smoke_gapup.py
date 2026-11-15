@@ -69,6 +69,17 @@ check("restart keeps lock", snap["lock"] == 7000, str(snap["lock"]))
 check("restart keeps halt", "lock" in (b2.entry_block("TCS", t + 300) or ""))
 check("restart keeps cooldown", "SBIN" in snap["last_exit"])
 check("restart keeps open trade", b2.trade("ITC") is not None)
+b2.update_trade("ITC", entry=1.0)
+b2.open_trade("TCS", {"symbol": "TCS-CE", "entry": 1.0}, t + 400)
+b4 = gapup.DayBook()  # restart: realised 3k + ITC (unknown yet) + TCS, floor 7k
+b4.mark("TCS", 0, t + 410)
+check("restart: no false lock exit before every trade ticked", not b4.breached(t + 410))
+b4.mark("ITC", 3900, t + 420)  # 3000 + 3900 + 0 = 6900 <= 7000
+check("restart: lock exit once all trades ticked", b4.breached(t + 420))
+b5 = gapup.DayBook()
+b5.mark("TCS", 0, t + 500)
+check("restart: grace ends after 2 min", b5.breached(t + 500 + 121))
+b2 = gapup.DayBook()
 check("next day resets lock + cooldown",
       b2.entry_block("SBIN", t + 86400) is None and b2.floor is None)
 b2.open_trade("NIFTY", {"symbol": "X"}, t + 86400)

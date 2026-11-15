@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 BOOK_KEY = "__GAPUP__"
+# After a restart, wait this long for every open trade to report MTM before
+# judging the profit lock.
+RESTART_MARK_GRACE_SEC = 120.0
 
 
 def gap_pct(open_: float | None, prev_close: float | None) -> float | None:
@@ -75,6 +78,7 @@ class DayBook:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._loaded = False
+        self._loaded_at: float | None = None
         self.day = ""
         self.realised = 0.0
         self.peak = 0.0
@@ -89,6 +93,7 @@ class DayBook:
         if self._loaded:
             return
         self._loaded = True
+        self._loaded_at = None
         try:
             rec = order_ledger.load(BOOK_KEY)
         except Exception as exc:  # a broken ledger must not crash the tick
@@ -116,6 +121,8 @@ class DayBook:
 
     def _roll(self, now: float) -> None:
         self._load()
+        if self._loaded_at is None:
+            self._loaded_at = float(now)
         today = _today(now)
         if self.day != today:
             # Cooldowns (60 min) never span a night; open trades carry over.
@@ -146,6 +153,11 @@ class DayBook:
         with self._lock:
             self._roll(now)
             if self.floor is None or self.total() > self.floor:
+                return False
+            # Fresh after a restart the open trades' MTM is unknown until each has
+            # ticked once; an unmarked winner must not trip a false lock exit.
+            if now - float(self._loaded_at or now) < RESTART_MARK_GRACE_SEC and any(
+                    k not in self._mtm for k, r in self.positions.items() if r.get("entry")):
                 return False
             if not self.halted:
                 self.halted = f"profit lock ₹{self.floor:,.0f} hit"
