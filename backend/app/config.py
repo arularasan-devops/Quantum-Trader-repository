@@ -198,6 +198,8 @@ class Settings(BaseSettings):
     live_reject_cooldown_sec: float = 3600.0
     live_funds_buffer_pct: float = 2.0
     live_funds_buffer_inr: float = 100.0
+    # After an Angel insufficient-funds reject, no live auto buy on any name.
+    live_funds_reject_block_sec: float = 900.0
     # Day profit lock over all gap-up trades: first lock, then +step raises it.
     gapup_lock_first: float = 5000.0
     gapup_lock_step: float = 2000.0

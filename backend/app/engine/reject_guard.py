@@ -2,6 +2,8 @@
 
 * A name whose auto buy Angel rejected waits ``live_reject_cooldown_sec``.
 * An RMS "limit set: 0" reject blocks that exchange for the rest of the IST day.
+* An insufficient-funds reject pauses every auto buy for
+  ``live_funds_reject_block_sec``.
 * A buy whose premium x quantity (+ buffer) exceeds Angel's available cash is
   never sent.
 
@@ -21,6 +23,7 @@ _FUNDS = re.compile(r"insufficient|require[sd]?\s.*funds|margin\s+shortfall", re
 _lock = threading.Lock()
 _name_until: dict[str, float] = {}
 _exch_day: dict[str, str] = {}
+_funds_until = 0.0
 
 
 def block_reason(instrument: str, exchange: str, now: float) -> str | None:
@@ -30,6 +33,10 @@ def block_reason(instrument: str, exchange: str, now: float) -> str | None:
             return (f"Angel RMS position limit is 0 for {exch} today — "
                     f"{exch} entries not sent until tomorrow.")
         until = _name_until.get(inst, 0.0)
+        funds_until = _funds_until
+    if now < funds_until:
+        return (f"Angel rejected a buy for insufficient funds — no auto buys for "
+                f"{int((funds_until - now) // 60) + 1} min.")
     if now < until:
         return (f"Angel rejected the last {inst} buy — not re-sending for "
                 f"{int((until - now) // 60) + 1} min.")
@@ -37,8 +44,12 @@ def block_reason(instrument: str, exchange: str, now: float) -> str | None:
 
 
 def record_reject(instrument: str, exchange: str, message: str, now: float) -> None:
+    global _funds_until
     inst, exch = (instrument or "").upper(), (exchange or "").upper()
     with _lock:
+        if is_funds_reject(message):
+            # Any name would be refused too (e.g. a zero balance read as unknown).
+            _funds_until = float(now) + float(settings.live_funds_reject_block_sec)
         _name_until[inst] = float(now) + float(settings.live_reject_cooldown_sec)
         if exch and _ZERO_LIMIT.search(message or ""):
             _exch_day[exch] = _today(now)
@@ -62,6 +73,8 @@ def is_funds_reject(message: str) -> bool:
 
 
 def reset() -> None:
+    global _funds_until
     with _lock:
+        _funds_until = 0.0
         _name_until.clear()
         _exch_day.clear()

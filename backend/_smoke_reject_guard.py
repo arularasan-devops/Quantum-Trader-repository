@@ -29,5 +29,10 @@ check("unknown balance -> Angel decides", g.funds_shortfall(170.0, 750, None) is
 check("funds reject recognised",
       g.is_funds_reject("You require Rs. 128881 funds to execute this order"))
 g.reset()
+g.record_reject("SBIN", "NFO", "You require Rs. 128881 funds to execute this order", t)
+check("funds reject pauses every name",
+      g.block_reason("ITC", "BSE", t + 60) is not None)
+check("funds pause ends after 15 min", g.block_reason("ITC", "BSE", t + 901) is None)
+g.reset()
 print("ALL PASS" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)
