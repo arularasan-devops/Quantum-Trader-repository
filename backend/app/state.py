@@ -4032,6 +4032,9 @@ class AppState:
             return
         if not gapup.in_window(spec.exchange, now):
             return
+        _only = {s.strip().upper() for s in (settings.auto_trade_instruments or "").split(",") if s.strip()}
+        if _only and (inst or "").upper() not in _only:
+            return
         block = book.entry_block(inst, now)
         if block:
             self._gapup_skip(f"GAPUP SKIP {inst}: {block}", now)
@@ -4065,8 +4068,9 @@ class AppState:
             return
         res = self.buy(sym, lots=lots, confirm=live, manual=False)
         if not res.ok and not self._pending_order:
-            book.discard_trade(inst)
-            self._gapup_skip(f"GAPUP BUY {sym} failed: {res.message}", now)
+            book.reject_trade(inst, now)
+            self._gapup_skip(f"GAPUP BUY {sym} failed (no retry for "
+                             f"{int(settings.gapup_cooldown_sec) // 60} min): {res.message}", now)
             return
         if not res.ok:
             return  # live order pending at Angel: armed when the fill arrives

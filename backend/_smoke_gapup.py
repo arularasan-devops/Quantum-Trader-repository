@@ -84,7 +84,12 @@ check("next day resets lock + cooldown",
       b2.entry_block("SBIN", t + 86400) is None and b2.floor is None)
 b2.open_trade("NIFTY", {"symbol": "X"}, t + 86400)
 b2.discard_trade("NIFTY")
-check("rejected buy leaves no cooldown", b2.entry_block("NIFTY", t + 86401) is None)
+check("discarded intent leaves no cooldown", b2.entry_block("NIFTY", t + 86401) is None)
+b2.open_trade("NIFTY", {"symbol": "X"}, t + 86402)
+b2.reject_trade("NIFTY", t + 86402)
+check("broker-rejected buy starts cooldown", b2.entry_block("NIFTY", t + 86403) is not None
+      and "NIFTY" not in b2.positions)
+check("rejected cooldown ends after 60 min", b2.entry_block("NIFTY", t + 86402 + 3601) is None)
 
 print("ALL PASS" if not FAIL else f"FAILED: {FAIL}")
 raise SystemExit(1 if FAIL else 0)

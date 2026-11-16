@@ -195,6 +195,17 @@ class DayBook:
             self._load()
             return sum(float(r.get("notional") or 0.0) for r in self.positions.values())
 
+    def reject_trade(self, inst: str, now: float) -> None:
+        """Broker rejected the buy: drop the intent and start the cooldown so the
+        same order is not re-sent on every tick."""
+        with self._lock:
+            self._roll(now)
+            key = inst.upper()
+            self.positions.pop(key, None)
+            self._mtm.pop(key, None)
+            self.last_exit[key] = float(now)
+            self._save()
+
     def close_trade(self, inst: str, pnl: float, now: float) -> None:
         with self._lock:
             self._roll(now)
