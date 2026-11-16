@@ -34,6 +34,18 @@ def gap_pct(open_: float | None, prev_close: float | None) -> float | None:
     return (float(open_) - float(prev_close)) / float(prev_close) * 100.0
 
 
+def gap_side(g: float | None) -> str | None:
+    """'CE' for a qualifying gap-up, 'PE' for a qualifying gap-down, else None."""
+    if g is None:
+        return None
+    lo, hi = float(settings.gapup_min_gap_pct), float(settings.gapup_max_gap_pct)
+    if lo <= g <= hi:
+        return "CE"
+    if settings.gapup_trade_gapdown and lo <= -g <= hi:
+        return "PE"
+    return None
+
+
 def _minutes(hhmm: str) -> int:
     h, m = hhmm.strip().split(":")
     return int(h) * 60 + int(m)

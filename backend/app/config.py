@@ -179,6 +179,8 @@ class Settings(BaseSettings):
     gapup_mode: bool = False
     gapup_min_gap_pct: float = 0.5
     gapup_max_gap_pct: float = 2.0
+    # Gap-down opens buy the ATM PE with the same targets, stop, lock and cooldown.
+    gapup_trade_gapdown: bool = True
     gapup_lots: int = 2
     gapup_capital: float = 200000.0
     # Lot size at/above this counts as "high quantity" (2-point target).

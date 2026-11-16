@@ -26,6 +26,10 @@ def ist(h: int, m: int) -> float:
 
 check("gap % from prev close", round(gapup.gap_pct(101.0, 100.0), 6) == 1.0)
 check("no gap without prev close", gapup.gap_pct(101.0, None) is None)
+check("gap-up 1% -> CE", gapup.gap_side(1.0) == "CE")
+check("gap-down 1% -> PE", gapup.gap_side(-1.0) == "PE")
+check("gap 0.3% -> none", gapup.gap_side(0.3) is None and gapup.gap_side(-0.3) is None)
+check("no gap -> none", gapup.gap_side(None) is None)
 check("smoke uses a temp data dir", settings.data_dir != "/app/data", settings.data_dir)
 check("NSE window open 09:15", gapup.in_window("NSE", ist(9, 15)))
 check("NSE closed 09:10", not gapup.in_window("NSE", ist(9, 10)))

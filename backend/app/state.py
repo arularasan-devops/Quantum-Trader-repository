@@ -3956,7 +3956,7 @@ class AppState:
             self._auto_last_action_ts = now
 
     def _gapup_trade(self, in_pos: bool, now: int, live: bool, manage_only: bool) -> None:
-        """QT_GAPUP_MODE: buy the ATM CE on a gap-up open, exit at entry + fixed
+        """QT_GAPUP_MODE: buy the ATM CE on a gap-up open (ATM PE on a gap-down), exit at entry + fixed
         points (resting LIMIT at Angel when live) or at market on the stop or the
         day profit lock. See app/engine/gapup.py."""
         from app.engine import gapup
@@ -4045,13 +4045,15 @@ class AppState:
             return
         ohlc = self.provider.day_ohlc() or {}
         g = gapup.gap_pct(ohlc.get("open"), ohlc.get("prev_close"))
-        if g is None or g < settings.gapup_min_gap_pct or g > settings.gapup_max_gap_pct:
+        side = gapup.gap_side(g)
+        if side is None:
             return
         try:
             atm = self._atm_pair(self.provider.option_chain(), self.provider.futures_price())
         except Exception:
             return
-        sym, prem = atm.get("atm_ce_symbol"), atm.get("atm_ce_premium")
+        leg = side.lower()
+        sym, prem = atm.get(f"atm_{leg}_symbol"), atm.get(f"atm_{leg}_premium")
         if not sym or not prem:
             return
         lots = max(1, int(settings.gapup_lots))
@@ -4063,7 +4065,8 @@ class AppState:
             return
         # Record the intent BEFORE the order so a restart cannot re-buy it.
         if not book.open_trade(inst, {"symbol": sym, "lots": lots, "ts": float(now),
-                                      "gap": round(g, 2), "notional": round(notional, 0)},
+                                      "gap": round(g, 2), "side": side,
+                                      "notional": round(notional, 0)},
                                now):
             return
         res = self.buy(sym, lots=lots, confirm=live, manual=False)
