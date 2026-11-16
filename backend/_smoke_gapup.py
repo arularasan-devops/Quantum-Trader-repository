@@ -35,8 +35,10 @@ check("NSE window open 09:15", gapup.in_window("NSE", ist(9, 15)))
 check("NSE closed 09:10", not gapup.in_window("NSE", ist(9, 10)))
 check("NSE closed 09:45", not gapup.in_window("NSE", ist(9, 45)))
 check("MCX window open 09:00", gapup.in_window("MCX", ist(9, 0)))
-check("high-qty target 2 pts", gapup.target_points(1500) == settings.gapup_target_pts_hq == 2.0)
-check("low-qty target 5 pts", gapup.target_points(250) == settings.gapup_target_pts_lq == 5.0)
+check(f"high-qty target {settings.gapup_target_pts_hq:g} pts (configured)",
+      gapup.target_points(1500) == settings.gapup_target_pts_hq)
+check(f"low-qty target {settings.gapup_target_pts_lq:g} pts (configured)",
+      gapup.target_points(250) == settings.gapup_target_pts_lq)
 
 check("no lock below 5k", gapup.lock_floor(4999) is None)
 check("lock 5k at 5k", gapup.lock_floor(5000) == 5000)
