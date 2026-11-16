@@ -674,6 +674,10 @@ class AppState:
                     reject_guard.record_reject(self._instrument,
                                                get_spec(self._instrument).exchange,
                                                res.message, time.time())
+                elif not manual and self._pending_order:
+                    # A later broker reject of this still-working order is recorded too.
+                    self._pending_order["auto_entry"] = True
+                    self._persist_state()
                 return res
             # Broker-confirmed average price and lots only; never the quote LTP.
             entry = float(res.fill_premium)
@@ -884,6 +888,11 @@ class AppState:
             if status in ("REJECTED", "CANCELLED"):
                 self._add_alert("ORDER_REJECTED", f"{pend['side']} {pend['symbol']}: {status} "
                                 f"{st.message}", "critical")
+                if attr == "_pending_order" and pend.get("auto_entry") and not total:
+                    from app.engine import reject_guard
+                    reject_guard.record_reject(self._instrument,
+                                               get_spec(self._instrument).exchange,
+                                               st.message, time.time())
             return None
         done = int(pend.get("filled_lots") or 0)
         return OrderResult(
