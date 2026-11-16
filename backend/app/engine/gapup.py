@@ -80,6 +80,15 @@ def lock_floor(peak: float) -> float | None:
     return first + int((peak - first) // step) * step
 
 
+def stop_price(entry: float, quantity: int) -> float:
+    """Tighter of the percent stop and the rupee loss cap on ``quantity`` units."""
+    stop = entry * (1.0 - float(settings.gapup_stop_pct) / 100.0)
+    cap = float(settings.gapup_max_loss_inr)
+    if cap > 0 and quantity > 0:
+        stop = max(stop, entry - cap / quantity)
+    return round(max(0.05, stop), 2)
+
+
 def _today(now: float) -> str:
     return dt.datetime.fromtimestamp(now, IST).date().isoformat()
 

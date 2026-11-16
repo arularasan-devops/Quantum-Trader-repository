@@ -188,8 +188,16 @@ class Settings(BaseSettings):
     gapup_target_pts_hq: float = 2.0
     gapup_target_pts_lq: float = 5.0
     gapup_stop_pct: float = 15.0
+    # Rupee cap on a gap-up stop: the stop is the tighter of gapup_stop_pct and
+    # this loss on the whole trade (0 = percent only).
+    gapup_max_loss_inr: float = 1500.0
     # No re-buy of the same instrument for this long after a gap-up exit.
     gapup_cooldown_sec: float = 3600.0
+    # Live auto entries Angel rejects: per-name wait before another is sent, and
+    # the funds pre-check margin (premium x qty x (1+pct) + inr) for charges.
+    live_reject_cooldown_sec: float = 3600.0
+    live_funds_buffer_pct: float = 2.0
+    live_funds_buffer_inr: float = 100.0
     # Day profit lock over all gap-up trades: first lock, then +step raises it.
     gapup_lock_first: float = 5000.0
     gapup_lock_step: float = 2000.0

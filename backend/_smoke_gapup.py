@@ -95,5 +95,14 @@ check("broker-rejected buy starts cooldown", b2.entry_block("NIFTY", t + 86403) 
       and "NIFTY" not in b2.positions)
 check("rejected cooldown ends after 60 min", b2.entry_block("NIFTY", t + 86402 + 3601) is None)
 
+_cap, _pct = settings.gapup_max_loss_inr, settings.gapup_stop_pct
+settings.gapup_max_loss_inr, settings.gapup_stop_pct = 1500.0, 15.0
+check("HQ stop capped at Rs1500 (17.38 x 1650)",
+      gapup.stop_price(17.38, 1650) == round(17.38 - 1500 / 1650, 2))
+check("LQ stop stays 15% when tighter (20 x 150)", gapup.stop_price(20.0, 150) == 17.0)
+settings.gapup_max_loss_inr = 0.0
+check("cap 0 -> percent only", gapup.stop_price(17.38, 1650) == round(17.38 * 0.85, 2))
+settings.gapup_max_loss_inr, settings.gapup_stop_pct = _cap, _pct
+
 print("ALL PASS" if not FAIL else f"FAILED: {FAIL}")
 raise SystemExit(1 if FAIL else 0)

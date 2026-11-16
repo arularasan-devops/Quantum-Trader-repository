@@ -648,6 +648,12 @@ class AppState:
             return OrderResult(ok=False, mode="live" if self.is_live else "paper", side="BUY",
                                option_symbol=q.symbol, lots=lots, message=f"Risk limit: {reason}")
 
+        if adopted is None and self.is_live and not manual:
+            refused = self._broker_reject_guard(q, lots)
+            if refused:
+                return OrderResult(ok=False, mode="live", side="BUY", option_symbol=q.symbol,
+                                   lots=lots, status="BLOCKED", message=refused)
+
         entry = q.premium
         # Paper fills pay the ask when a two-sided book exists (never LTP/mid).
         if adopted is None and not self.is_live and q.bid and q.ask and 0 < q.bid <= q.ask:
@@ -662,6 +668,12 @@ class AppState:
                                    lots=lots, message="Confirmation required for a live order.")
             res = self._submit_live("_pending_order", q.symbol, "BUY", lots)
             if not res.ok:
+                if (not manual and not self._pending_order
+                        and res.status in ("REJECTED", "CANCELLED")):
+                    from app.engine import reject_guard
+                    reject_guard.record_reject(self._instrument,
+                                               get_spec(self._instrument).exchange,
+                                               res.message, time.time())
                 return res
             # Broker-confirmed average price and lots only; never the quote LTP.
             entry = float(res.fill_premium)
@@ -1466,6 +1478,25 @@ class AppState:
         if self._persist_state():
             self._persist_error = None
             self._event("PERSISTENCE_RESTORED", note=prev)
+
+    def _broker_reject_guard(self, q, lots: int) -> str | None:
+        """Refuse (without sending) an auto buy Angel is known to reject."""
+        from app.engine import reject_guard
+
+        spec = get_spec(self._instrument)
+        refused = reject_guard.block_reason(self._instrument, spec.exchange, time.time())
+        if refused is None:
+            try:
+                from app.market import angelone
+
+                cash = angelone.available_cash(ttl=5.0)
+            except Exception:
+                cash = None
+            price = float(q.ask) if q.ask and q.ask > 0 else float(q.premium or 0.0)
+            refused = reject_guard.funds_shortfall(price, int(lots) * int(spec.lot_size), cash)
+        if refused:
+            self._add_alert("ORDER_NOT_SENT", f"BUY {q.symbol}: {refused}", "warning")
+        return refused
 
     def _live_entry_block(self) -> str | None:
         if self._order_recovery:
@@ -4124,7 +4155,8 @@ class AppState:
         rec = dict(rec)
         rec["entry"] = round(entry, 2)
         rec["target"] = round(entry + gapup.target_points(lot_size), 2)
-        rec["stop"] = round(max(0.05, entry * (1.0 - settings.gapup_stop_pct / 100.0)), 2)
+        lots = int(rec.get("lots") or settings.gapup_lots)
+        rec["stop"] = gapup.stop_price(entry, lots * int(lot_size))
         return rec
 
     def _gapup_rest_target(self, rec: dict, bid: float, now: float) -> None:
