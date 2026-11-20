@@ -327,6 +327,8 @@ class AppState:
         self._exch_stop_retry_at = 0.0
         self._exch_stop_breach_at: float | None = None
         self._broker_flat_seen = 0
+        self._exch_stop_dropped_sym: str | None = None
+        self._sell_rejected: tuple[str, float] | None = None
         self._restore_live_ledger()
         self._paper_pos_saved_at = 0.0
         self._paper_pos_saved = False
@@ -1114,6 +1116,18 @@ class AppState:
             return row
         return None
 
+    def _exit_needs_broker_check(self, sym: str) -> bool:
+        """A bot SELL is about to go out with no resting exchange stop to cancel
+        first (it was dropped), or right after Angel rejected a SELL for this
+        symbol: both happen when the position was already closed in Angel."""
+        if not settings.live_exit_broker_check:
+            return False
+        if self._exch_stop_dropped_sym == sym and not self._exch_stop:
+            return True
+        rej = self._sell_rejected
+        return bool(rej and rej[0] == sym
+                    and time.time() - rej[1] <= settings.live_exit_reject_window_sec)
+
     def _sync_angel_close(self, sym: str, px: float, why: str) -> OrderResult:
         """The position was closed in the Angel app: book it at Angel's sell
         average so the journal matches Angel. Only a resting exchange stop is
@@ -1353,6 +1367,7 @@ class AppState:
             self._event("EXCH_STOP_DROPPED", {"order_id": es["order_id"], "side": "SELL",
                         "symbol": es.get("symbol"), "lots": es.get("lots")}, st)
             self._exch_stop = None
+            self._exch_stop_dropped_sym = es.get("symbol")
             self._exch_stop_retry_at = now + 30.0
             self._persist_state()
             self._add_alert("EXCH_STOP_DROPPED", f"Exchange stop {es['order_id']} "
@@ -1821,10 +1836,13 @@ class AppState:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Angel shows this position already "
                                    "closed — no SELL sent. Confirm flat via /api/order-recovery.")
-            if check_broker and not partial:
+            auto_check = self._exit_needs_broker_check(sym)
+            if (check_broker and not partial) or auto_check:
                 row = self._angel_closed_row(sym)
                 if row:
-                    return self._sync_angel_close(sym, float(row["sell_avg"]), "Exit now")
+                    return self._sync_angel_close(sym, float(row["sell_avg"]),
+                                                  "Exit now" if check_broker else
+                                                  "closed in Angel before the bot exit")
             held_up = self._release_exch_stop()
             if held_up is not None:
                 return held_up
@@ -1835,6 +1853,8 @@ class AppState:
                                    message="Last SELL never reached Angel; retrying shortly.")
             res = self._submit_live("_pending_exit", sym, "SELL", lots)
             if not res.ok:
+                if res.status == "REJECTED":
+                    self._sell_rejected = (sym, now)
                 if res.status == "NOT_SENT" and not self._pending_exit:
                     self._exit_retry_at = now + settings.live_exit_retry_sec
                 return res
