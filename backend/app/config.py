@@ -149,6 +149,11 @@ class Settings(BaseSettings):
     # A live position Angel shows closed (netqty 0 with a sell average) is booked
     # in the journal at Angel's sell average; no order is sent.
     live_auto_sync_angel_close: bool = True
+    # Before a bot exit SELL whose exchange stop was dropped, or that follows a
+    # rejected SELL, read Angel's position: if it is already flat, book it from
+    # Angel instead of sending a SELL (which Angel treats as a fresh short).
+    live_exit_broker_check: bool = True
+    live_exit_reject_window_sec: float = 120.0
     # After a live SELL that never reached Angel, wait this long before retrying.
     live_exit_retry_sec: float = 5.0
     # A live BUY Angel acknowledged but whose fill can't be read from the order
