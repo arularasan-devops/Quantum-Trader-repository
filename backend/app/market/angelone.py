@@ -1205,11 +1205,15 @@ def account_info() -> dict:
     total_open_pnl = 0.0
     total_realised = 0.0
     positions_out: list[dict] = []
+    seen_clients: set[str] = set()
 
     for i, shard in enumerate(shards):
         smart = shard.smart
         client = getattr(smart, "_qt_client", None) or f"account_{i + 1}"
         acct: dict = {"client_masked": _mask(client)}
+        # Several API keys can log in to the same client: its P&L is counted once.
+        acct["duplicate_client"] = client in seen_clients
+        seen_clients.add(client)
         try:
             rms = smart.rmsLimit() or {}
             d = rms.get("data") or {}
@@ -1227,10 +1231,14 @@ def account_info() -> dict:
 
         try:
             pos = smart.position() or {}
+            if not isinstance(pos, dict) or pos.get("status") is False:
+                raise RuntimeError(str((pos or {}).get("message") or "position() failed"))
             rows = pos.get("data") or []
+            acct["day_pnl"] = 0.0
             for r in rows:
                 unreal = _to_float(r.get("unrealised")) or 0.0
                 real = _to_float(r.get("realised")) or 0.0
+                acct["day_pnl"] += unreal + real
                 total_open_pnl += unreal
                 total_realised += real
                 positions_out.append({
@@ -1275,11 +1283,11 @@ def broker_day_pnl(ttl: float = 10.0) -> float | None:
             return _pnl_cache["value"]
     try:
         info = account_info()
-        if any("positions_error" in a for a in info.get("accounts") or []):
+        accts = info.get("accounts") or []
+        if not accts or any("positions_error" in a or "day_pnl" not in a for a in accts):
             val = None
         else:
-            t = info.get("totals") or {}
-            val = float(t.get("open_pnl") or 0.0) + float(t.get("realised_pnl_today") or 0.0)
+            val = sum(float(a["day_pnl"]) for a in accts if not a.get("duplicate_client"))
     except Exception:
         val = None
     with _cash_lock:

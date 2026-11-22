@@ -910,6 +910,14 @@ class Settings(BaseSettings):
     first_hour_lockout_exempt: list[str] = ["NIFTY", "SENSEX"]
     first_hour_lockout_session_start_ist: str = "09:15"
     first_hour_lockout_until_ist: str = "10:15"
+    # Late-entry check (app/execution/late_entry.py): "off" | "log" (record only)
+    # | "enforce" (skip the BUY). LIVE enforces only with late_entry_live=True.
+    late_entry_mode: str = "off"
+    late_entry_live: bool = False
+    late_entry_max_prem_rise_pct: dict[str, float] = {"10": 10.0}
+    late_entry_max_underlying_move_pct: float = 0.0
+    late_entry_min_reward_risk: float = 1.0
+    late_entry_max_spread_pct: float = 0.0
     dyn_sizing_mode: str = "off"
     dyn_sizing_live: bool = False
     dyn_sizing_instruments: list[str] = ["NIFTY", "SENSEX"]

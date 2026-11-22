@@ -2904,8 +2904,28 @@ class AppState:
             return tool
         return float(broker) - float(account_risk.account.day_pnl)
 
+    def _late_entry_check(self, decision: Decision, opt: str) -> dict:
+        from app.execution import late_entry
+
+        ask = self._live_entry_ask(opt) or float(decision.current_premium or 0.0)
+        bid = None
+        with contextlib.suppress(Exception):
+            q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+            bid = float(q.bid) if q is not None and q.bid else None
+        oc: list[float] = []
+        uc: list[float] = []
+        with contextlib.suppress(Exception):
+            oc = [float(c.close) for c in (self.provider.option_candles(opt, limit=15) or [])]
+        with contextlib.suppress(Exception):
+            uc = [float(c.close) for c in (self.provider.futures_candles(limit=15) or [])]
+        return late_entry.assess(
+            call=decision.option_type == OptionType.CALL, ask=float(ask), bid=bid,
+            signal_premium=decision.current_premium, stop=decision.stop_loss,
+            target=decision.target1, option_closes=oc, underlying_closes=uc)
+
     def _dynamic_size(self, decision: Decision, opt: str, lot_size: int, live: bool,
-                      deployed: float, deployed_self: float, open_positions: int) -> dict:
+                      deployed: float, deployed_self: float, open_positions: int,
+                      path_caps: dict[str, int] | None = None) -> dict:
         """Inputs for app.execution.dynamic_sizing.compute: entry at the ask, the
         stop that will be applied after fill, and FRESH funds/margin (LIVE: read
         from Angel now, uncached; PAPER: configured capital and premium x lot)."""
@@ -2936,7 +2956,9 @@ class AppState:
             funds = {"value": max(0.0, settings.capital - deployed), "ts": t,
                      "source": "paper_capital"}
             margin = {"value": entry * lot_size, "ts": t, "source": "paper_premium"}
-        extra: dict[str, int] = {}
+        # Caps the existing path already applied (free capital, per-trade /
+        # post-lock loss budget) still bind when dynamic sizing is enforced.
+        extra: dict[str, int] = {k: int(v) for k, v in (path_caps or {}).items()}
         if live and entry > 0 and lot_size > 0:
             extra["live_order_value_cap"] = int(
                 settings.auto_trade_live_max_order_value // (entry * lot_size))
@@ -3095,6 +3117,13 @@ class AppState:
             return  # closed in Angel: no exits on a position that no longer exists
         if settings.gapup_mode:
             from app.engine import gapup
+            if not in_pos and settings.first_hour_lockout and not manage_only:
+                from app.engine import first_hour
+
+                if first_hour.blocked(self._instrument, time.time()):
+                    self._auto_last_action = "AUTO SKIP gap-up: first-hour re-entry lockout"
+                    self._auto_last_action_ts = now
+                    return
             if not in_pos or gapup.book.trade(self._instrument):
                 self._gapup_trade(in_pos, now, live, manage_only)
                 return
@@ -3841,7 +3870,6 @@ class AppState:
                 self._auto_last_action = (
                     f"AUTO SKIP {opt}: first-hour re-entry lockout until {until} IST")
                 self._auto_last_action_ts = now
-                self._auto_last_key = key
                 exec_funnel.blocked(
                     "RISK", "FIRST_HOUR_LOCKOUT", instrument=self._instrument, option=opt,
                     where="state.py:_auto_trade",
@@ -3987,9 +4015,11 @@ class AppState:
                         budget = min(settings.capital, live_cash * frac)
                 except Exception:
                     pass
+        path_caps: dict[str, int] = {}
         if cost_per_lot > 0 and budget > 0:
             remaining = max(0.0, budget - used)
             affordable = int(remaining // cost_per_lot)
+            path_caps["capital_budget"] = affordable
             if affordable < 1:
                 self._auto_last_action = (
                     f"AUTO SKIP {decision.recommended_option}: capital used "
@@ -4053,6 +4083,7 @@ class AppState:
                 stop_est = max(stop_est, entry_est * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
             if budget is not None and entry_est > 0:
                 fit = account_risk.lots_for_budget(budget, entry_est, stop_est, lot_size)
+                path_caps["loss_budget"] = int(fit)
                 if fit < 1:
                     self._auto_last_action = (
                         f"AUTO SKIP {decision.recommended_option}: 1 lot risks more than "
@@ -4095,13 +4126,29 @@ class AppState:
 
         if self._stock_hold_active(live):
             lots = 1
+        if settings.late_entry_mode in ("log", "enforce") and lots >= 1:
+            le = self._late_entry_check(decision, opt)
+            le_enforce = settings.late_entry_mode == "enforce" and (
+                not live or settings.late_entry_live)
+            le["mode"] = "enforce" if le_enforce else "log"
+            self._sizing_event("LATE_ENTRY_CHECK", le, live)
+            if le_enforce and le["late"]:
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: late entry ({'; '.join(le['reasons'])[:160]})")
+                self._auto_last_action_ts = now
+                self._auto_last_key = key
+                exec_funnel.blocked(
+                    "RISK", "LATE_ENTRY", instrument=self._instrument, option=opt,
+                    where="state.py:_auto_trade", reason="; ".join(le["reasons"])[:200],
+                )
+                return
         dyn = None
         if settings.dyn_sizing_mode in ("log", "enforce") and lots >= 1:
             # Dynamic capital-based sizing, recalculated right before submission
             # from fresh funds/margin. Enforced only in PAPER unless dyn_sizing_live.
             enforce = settings.dyn_sizing_mode == "enforce" and (not live or settings.dyn_sizing_live)
             dyn = self._dynamic_size(decision, opt, lot_size, live, deployed, deployed_self,
-                                     open_positions)
+                                     open_positions, path_caps)
             dyn["mode"] = "enforce" if enforce else "log"
             dyn["path_lots"] = int(lots)
             self._sizing_event("SIZING_DECISION", dyn, live)
