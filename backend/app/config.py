@@ -905,6 +905,11 @@ class Settings(BaseSettings):
     # PAPER T1 scale-out books the executable bid (like a LIVE MARKET sell), not
     # max(price, T1). False restores the old resting-limit-at-T1 paper fill.
     paper_t1_fill_at_bid: bool = True
+    # First-hour re-entry lockout (app/engine/first_hour.py). Off by default.
+    first_hour_lockout: bool = False
+    first_hour_lockout_exempt: list[str] = ["NIFTY", "SENSEX"]
+    first_hour_lockout_session_start_ist: str = "09:15"
+    first_hour_lockout_until_ist: str = "10:15"
     dyn_sizing_mode: str = "off"
     dyn_sizing_live: bool = False
     dyn_sizing_instruments: list[str] = ["NIFTY", "SENSEX"]

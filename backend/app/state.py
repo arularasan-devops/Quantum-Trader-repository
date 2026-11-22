@@ -1895,6 +1895,10 @@ class AppState:
             self.today_loss += -pnl
         if not partial:
             with contextlib.suppress(Exception):
+                from app.engine import first_hour
+                first_hour.record_full_exit(
+                    self._instrument, (self._entry_context or {}).get("entry_time"), time.time())
+            with contextlib.suppress(Exception):
                 from app.engine import gapup
                 if gapup.book.trade(self._instrument):
                     gapup.book.close_trade(self._instrument, pnl, time.time())
@@ -3828,6 +3832,22 @@ class AppState:
         # trade cap, loss streak, max concurrent and the manual kill switch.
         with contextlib.suppress(Exception):
             account_risk.account.note_equity(now, self._lock_open_mtm(live))
+        if settings.first_hour_lockout:
+            from app.engine import first_hour
+
+            fh = first_hour.blocked(self._instrument, time.time())
+            if fh:
+                until = time.strftime("%H:%M", time.gmtime(int(fh["lockout_until_ts"]) + 19800))
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: first-hour re-entry lockout until {until} IST")
+                self._auto_last_action_ts = now
+                self._auto_last_key = key
+                exec_funnel.blocked(
+                    "RISK", "FIRST_HOUR_LOCKOUT", instrument=self._instrument, option=opt,
+                    where="state.py:_auto_trade",
+                    reason="first BUY-to-full-EXIT of the first hour already done",
+                )
+                return
         can, _reason = self.risk.can_open(time.time())
         if can and live and live_control.kill_switch_engaged():
             can, _reason = False, "kill switch engaged (live)"
