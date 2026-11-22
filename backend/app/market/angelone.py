@@ -1205,11 +1205,15 @@ def account_info() -> dict:
     total_open_pnl = 0.0
     total_realised = 0.0
     positions_out: list[dict] = []
+    seen_clients: set[str] = set()
 
     for i, shard in enumerate(shards):
         smart = shard.smart
         client = getattr(smart, "_qt_client", None) or f"account_{i + 1}"
         acct: dict = {"client_masked": _mask(client)}
+        # Several API keys can log in to the same client: its P&L is counted once.
+        acct["duplicate_client"] = client in seen_clients
+        seen_clients.add(client)
         try:
             rms = smart.rmsLimit() or {}
             d = rms.get("data") or {}
@@ -1227,10 +1231,14 @@ def account_info() -> dict:
 
         try:
             pos = smart.position() or {}
+            if not isinstance(pos, dict) or pos.get("status") is False:
+                raise RuntimeError(str((pos or {}).get("message") or "position() failed"))
             rows = pos.get("data") or []
+            acct["day_pnl"] = 0.0
             for r in rows:
                 unreal = _to_float(r.get("unrealised")) or 0.0
                 real = _to_float(r.get("realised")) or 0.0
+                acct["day_pnl"] += unreal + real
                 total_open_pnl += unreal
                 total_realised += real
                 positions_out.append({
@@ -1260,6 +1268,32 @@ def account_info() -> dict:
         },
         "positions": positions_out,
     }
+
+
+_pnl_cache: dict[str, float | None] = {"value": None, "ts": 0.0}
+
+
+def broker_day_pnl(ttl: float = 10.0) -> float | None:
+    """READ-ONLY: today's account P&L in Angel (realised + open MTM, every
+    position row, so manual trades count too), cached ``ttl`` s. None when any
+    funds or positions read failed: a partial figure is never returned."""
+    now = time.time()
+    with _cash_lock:
+        if _pnl_cache["ts"] and now - float(_pnl_cache["ts"] or 0) < ttl:
+            return _pnl_cache["value"]
+    try:
+        info = account_info()
+        accts = info.get("accounts") or []
+        if not accts or any("positions_error" in a or "day_pnl" not in a for a in accts):
+            val = None
+        else:
+            val = sum(float(a["day_pnl"]) for a in accts if not a.get("duplicate_client"))
+    except Exception:
+        val = None
+    with _cash_lock:
+        _pnl_cache["value"] = val
+        _pnl_cache["ts"] = now
+    return val
 
 
 _cash_cache: dict[str, float] = {"value": 0.0, "ts": 0.0}
@@ -2349,6 +2383,39 @@ class AngelOneProvider(MarketDataProvider):
             fill_premium=round(avg, 2) if avg else None, order_id=str(order_id),
             status=status, message=str(row.get("text") or row.get("status") or ""),
         )
+
+    def sizing_snapshot(self, option_symbol: str, price: float) -> dict | None:
+        """Read-only and uncached: available cash of the order account (rmsLimit)
+        and Angel's margin for a 1-lot BUY of ``option_symbol`` (margin API).
+        Each part is ``{"value", "ts", "source"}`` or None when it can't be read.
+        Never places or modifies an order."""
+        inst = next((o for o in self._options if o.symbol == option_symbol), None)
+        if inst is None or not price or price <= 0:
+            return None
+        smart = self._order_smart()
+        out: dict = {"funds": None, "margin_per_lot": None}
+        try:
+            d = (smart.rmsLimit() or {}).get("data") or {}
+            avail = _to_float(d.get("availablecash"))
+            if avail is not None:
+                out["funds"] = {"value": float(avail), "ts": time.time(), "source": "angel_rms"}
+        except Exception:
+            pass
+        try:
+            params = {"positions": [{
+                "exchange": self._exchange, "qty": int(inst.lot_size), "price": float(price),
+                "productType": settings.angel_product, "token": inst.token,
+                "tradeType": "BUY", "orderType": settings.angel_order_type,
+            }]}
+            d = (smart.getMarginApi(params) or {}).get("data") or {}
+            req = _to_float(d.get("totalMarginRequired"))
+            if req is not None and req > 0:
+                # An option BUY blocks the full premium; never size on less.
+                out["margin_per_lot"] = {"value": max(float(req), float(price) * inst.lot_size),
+                                         "ts": time.time(), "source": "angel_margin_api"}
+        except Exception:
+            pass
+        return out
 
     def broker_position(self, option_symbol: str) -> dict | None:
         """Read-only: today's Angel position row for ``option_symbol`` from the

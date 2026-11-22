@@ -12,6 +12,7 @@ import logging
 import contextlib
 import math
 import threading
+import json
 import time
 from datetime import datetime, timezone
 
@@ -1894,6 +1895,10 @@ class AppState:
             self.today_loss += -pnl
         if not partial:
             with contextlib.suppress(Exception):
+                from app.engine import first_hour
+                first_hour.record_full_exit(
+                    self._instrument, (self._entry_context or {}).get("entry_time"), time.time())
+            with contextlib.suppress(Exception):
                 from app.engine import gapup
                 if gapup.book.trade(self._instrument):
                     gapup.book.close_trade(self._instrument, pnl, time.time())
@@ -2875,6 +2880,155 @@ class AppState:
             return False
         return account_risk.ist_minutes(now) >= h * 60 + m
 
+    def _lock_open_mtm(self, live: bool) -> float:
+        """The open-MTM term of the day equity used by the profit lock and the
+        post-lock loss budget. With daily_lock_equity_source="angel" (LIVE) it is
+        chosen so day_pnl + term == Angel's account P&L for today, manual trades
+        included; if Angel can't be read, the tool's own open MTM is used."""
+        tool = sum(o._liq_pnl() for o in registry.active() if o.position.option_symbol)
+        if not (live and settings.daily_lock_equity_source == "angel"):
+            return tool
+        broker = None
+        try:
+            from app.market import angelone
+
+            broker = angelone.broker_day_pnl(ttl=settings.daily_lock_broker_pnl_ttl_sec)
+        except Exception:
+            broker = None
+        if broker is None:
+            t = time.time()
+            if t - float(getattr(self, "_lock_pnl_alert_ts", 0.0) or 0.0) > 300:
+                self._lock_pnl_alert_ts = t
+                self._add_alert("LOCK_BROKER_PNL", "Angel day P&L unreadable — profit lock "
+                                "is using the tool's own P&L", "warning")
+            return tool
+        return float(broker) - float(account_risk.account.day_pnl)
+
+    def _entry_stop(self, decision: Decision, entry: float) -> float | None:
+        """The hard stop _arm_auto_entry will apply for a fill at ``entry``."""
+        stop = float(decision.stop_loss) if decision.stop_loss is not None else None
+        pts = settings.auto_trade_stop_points.get(self._instrument)
+        if pts and pts > 0 and entry > 0:
+            return max(0.05, entry - float(pts))
+        if stop is not None and entry > 0 and settings.auto_trade_max_stop_pct > 0:
+            stop = max(stop, entry * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
+        return stop
+
+    def _pullback_quality(self, decision: Decision, opt: str) -> dict:
+        from app.execution import pullback_quality
+
+        n = int(pullback_quality._p("window"))
+        oc: list[float] = []
+        with contextlib.suppress(Exception):
+            oc = [float(c.close) for c in (self.provider.option_candles(opt, limit=n) or [])]
+        ask = float(self._live_entry_ask(opt) or decision.current_premium or 0.0)
+        return pullback_quality.classify(
+            call=decision.option_type == OptionType.CALL,
+            candles=self.provider.futures_candles(limit=n) or [], option_closes=oc,
+            ask=ask, stop=self._entry_stop(decision, ask), target=decision.target1)
+
+    def _late_entry_check(self, decision: Decision, opt: str) -> dict:
+        from app.execution import late_entry
+
+        ask = self._live_entry_ask(opt) or float(decision.current_premium or 0.0)
+        bid = None
+        with contextlib.suppress(Exception):
+            q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
+            bid = float(q.bid) if q is not None and q.bid else None
+        oc: list[tuple[int, float]] = []
+        uc: list[tuple[int, float]] = []
+        n = max(late_entry.windows()) + 5
+        with contextlib.suppress(Exception):
+            oc = [(int(c.time), float(c.close))
+                  for c in (self.provider.option_candles(opt, limit=n) or [])]
+        with contextlib.suppress(Exception):
+            uc = [(int(c.time), float(c.close))
+                  for c in (self.provider.futures_candles(limit=n) or [])]
+        return late_entry.assess(
+            call=decision.option_type == OptionType.CALL, ask=float(ask), bid=bid,
+            signal_premium=decision.current_premium,
+            stop=self._entry_stop(decision, float(ask)), target=decision.target1,
+            option_bars=oc, underlying_bars=uc, now=time.time())
+
+    def _dynamic_size(self, decision: Decision, opt: str, lot_size: int, live: bool,
+                      deployed: float, deployed_self: float, open_positions: int,
+                      path_caps: dict[str, int] | None = None) -> dict:
+        """Inputs for app.execution.dynamic_sizing.compute: entry at the ask, the
+        stop that will be applied after fill, and FRESH funds/margin (LIVE: read
+        from Angel now, uncached; PAPER: configured capital and premium x lot)."""
+        from app.execution import dynamic_sizing
+
+        ask = self._live_entry_ask(opt)
+        entry = max(float(decision.current_premium or 0.0),
+                    float(getattr(self, "_auto_entry_ask", 0.0) or 0.0), ask)
+        stop = self._entry_stop(decision, entry)
+        t = time.time()
+        funds = margin = None
+        if live:
+            fn = getattr(self.provider, "sizing_snapshot", None)
+            snap = None
+            if callable(fn) and entry > 0:
+                try:
+                    snap = fn(opt, entry)
+                except Exception:
+                    snap = None
+            funds = (snap or {}).get("funds")
+            margin = (snap or {}).get("margin_per_lot")
+        elif entry > 0:
+            funds = {"value": max(0.0, settings.capital - deployed), "ts": t,
+                     "source": "paper_capital"}
+            margin = {"value": entry * lot_size, "ts": t, "source": "paper_premium"}
+        # Caps the existing path already applied (free capital, per-trade /
+        # post-lock loss budget) still bind when dynamic sizing is enforced.
+        extra: dict[str, int] = {k: int(v) for k, v in (path_caps or {}).items()}
+        if live and entry > 0 and lot_size > 0:
+            extra["live_order_value_cap"] = int(
+                settings.auto_trade_live_max_order_value // (entry * lot_size))
+        try:
+            day_pnl = float(account_risk.account.day_pnl)
+        except Exception:
+            day_pnl = 0.0
+        rec = dynamic_sizing.compute(
+            instrument=self._instrument, entry=entry, stop=stop, lot_size=lot_size,
+            funds=funds, margin_per_lot=margin, pending_reserve=self._pending_buy_reserve(t),
+            deployed_instrument=deployed_self, deployed_portfolio=deployed,
+            open_positions=open_positions, day_pnl=day_pnl, extra_caps=extra,
+            now=time.time())
+        rec["option_symbol"] = opt
+        return rec
+
+    def _pending_buy_reserve(self, now: float) -> float:
+        """Value of other instruments' BUYs sent within dyn_sizing_pending_reserve_sec:
+        they may not be reflected in Angel's available cash yet. Older ones are
+        already blocked there, so they are not counted twice."""
+        total = 0.0
+        for other in registry.active():
+            if other is self:
+                continue
+            pend = getattr(other, "_pending_order", None)
+            if not pend or pend.get("side") != "BUY":
+                continue
+            if now - float(pend.get("ts") or now) > settings.dyn_sizing_pending_reserve_sec:
+                continue
+            try:
+                ls = get_spec(other.instrument).lot_size
+            except Exception:
+                ls = 0
+            remaining = max(0, int(pend.get("lots") or 0) - int(pend.get("filled_lots") or 0))
+            total += other._live_entry_ask(pend.get("symbol")) * ls * remaining
+        return total
+
+    def _sizing_event(self, kind: str, rec: dict, live: bool) -> None:
+        """Durable sizing record in the order audit log (PAPER entries tagged mode=paper)."""
+        flat = {k: v for k, v in rec.items() if k not in ("limits", "constraints")}
+        flat["sizing_limits"] = json.dumps(rec.get("limits")) if rec.get("limits") else None
+        flat["sizing_constraints"] = (json.dumps(rec.get("constraints"))
+                                      if rec.get("constraints") else None)
+        flat.pop("mode", None)
+        flat.pop("instrument", None)
+        self._event(kind, None, mode="live" if live else "paper",
+                    sizing_mode=rec.get("mode"), **flat)
+
     def _live_entry_ask(self, opt: str | None) -> float:
         """Current ask of ``opt`` from the feed (0 when unknown). Read-only."""
         try:
@@ -2985,6 +3139,13 @@ class AppState:
             return  # closed in Angel: no exits on a position that no longer exists
         if settings.gapup_mode:
             from app.engine import gapup
+            if not in_pos and settings.first_hour_lockout and not manage_only:
+                from app.engine import first_hour
+
+                if first_hour.blocked(self._instrument, time.time()):
+                    self._auto_last_action = "AUTO SKIP gap-up: first-hour re-entry lockout"
+                    self._auto_last_action_ts = now
+                    return
             if not in_pos or gapup.book.trade(self._instrument):
                 self._gapup_trade(in_pos, now, live, manage_only)
                 return
@@ -3024,9 +3185,7 @@ class AppState:
                     and self._auto_entry_prem is not None):
                 with contextlib.suppress(Exception):
                     acct = account_risk.account
-                    equity = acct.day_pnl + sum(
-                        o._liq_pnl() for o in registry.active() if o.position.option_symbol
-                    )
+                    equity = acct.day_pnl + self._lock_open_mtm(live)
                     if acct.must_flatten(equity):
                         self._pending_exit_reason = "PROFIT LOCK"
                         self.sell(confirm=live)
@@ -3162,7 +3321,7 @@ class AppState:
                         )
                         self._pending_exit_reason = "SCALE-OUT T1"
                         res = self.sell(confirm=live, lots=book,
-                                        fill_px=(max(prem, t1) if not live else None))
+                                        fill_px=(max(prem, t1) if not live and not settings.paper_t1_fill_at_bid else None))
                         if res.ok:
                             self._auto_scaled_out = True
                             self._auto_stop = max(
@@ -3723,9 +3882,22 @@ class AppState:
         # daily loss, daily profit target, giveback from the day's equity peak,
         # trade cap, loss streak, max concurrent and the manual kill switch.
         with contextlib.suppress(Exception):
-            account_risk.account.note_equity(
-                now, sum(o._liq_pnl() for o in registry.active()
-                         if o.position.option_symbol))
+            account_risk.account.note_equity(now, self._lock_open_mtm(live))
+        if settings.first_hour_lockout:
+            from app.engine import first_hour
+
+            fh = first_hour.blocked(self._instrument, time.time())
+            if fh:
+                until = time.strftime("%H:%M", time.gmtime(int(fh["lockout_until_ts"]) + 19800))
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: first-hour re-entry lockout until {until} IST")
+                self._auto_last_action_ts = now
+                exec_funnel.blocked(
+                    "RISK", "FIRST_HOUR_LOCKOUT", instrument=self._instrument, option=opt,
+                    where="state.py:_auto_trade",
+                    reason="first BUY-to-full-EXIT of the first hour already done",
+                )
+                return
         can, _reason = self.risk.can_open(time.time())
         if can and live and live_control.kill_switch_engaged():
             can, _reason = False, "kill switch engaged (live)"
@@ -3865,9 +4037,11 @@ class AppState:
                         budget = min(settings.capital, live_cash * frac)
                 except Exception:
                     pass
+        path_caps: dict[str, int] = {}
         if cost_per_lot > 0 and budget > 0:
             remaining = max(0.0, budget - used)
             affordable = int(remaining // cost_per_lot)
+            path_caps["capital_budget"] = affordable
             if affordable < 1:
                 self._auto_last_action = (
                     f"AUTO SKIP {decision.recommended_option}: capital used "
@@ -3914,8 +4088,7 @@ class AppState:
         if ((not live or settings.auto_trade_live_loss_budget)
                 and lots >= 1 and decision.stop_loss is not None):
             acct = account_risk.account
-            equity = acct.day_pnl + sum(
-                o._liq_pnl() for o in registry.active() if o.position.option_symbol)
+            equity = acct.day_pnl + self._lock_open_mtm(live)
             budget = account_risk.entry_loss_budget(
                 acct.day_peak_equity, equity,
                 per_trade_cap=settings.auto_trade_max_loss_rupees,
@@ -3932,6 +4105,7 @@ class AppState:
                 stop_est = max(stop_est, entry_est * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
             if budget is not None and entry_est > 0:
                 fit = account_risk.lots_for_budget(budget, entry_est, stop_est, lot_size)
+                path_caps["loss_budget"] = int(fit)
                 if fit < 1:
                     self._auto_last_action = (
                         f"AUTO SKIP {decision.recommended_option}: 1 lot risks more than "
@@ -3974,10 +4148,60 @@ class AppState:
 
         if self._stock_hold_active(live):
             lots = 1
+        if settings.pullback_quality_mode == "log" and lots >= 1:
+            with contextlib.suppress(Exception):
+                self._sizing_event("PULLBACK_QUALITY", self._pullback_quality(decision, opt), live)
+        if settings.late_entry_mode in ("log", "enforce") and lots >= 1:
+            le = self._late_entry_check(decision, opt)
+            le_enforce = settings.late_entry_mode == "enforce" and (
+                not live or settings.late_entry_live)
+            le["mode"] = "enforce" if le_enforce else "log"
+            self._sizing_event("LATE_ENTRY_CHECK", le, live)
+            if le_enforce and le["late"]:
+                self._auto_last_action = (
+                    f"AUTO SKIP {opt}: late entry ({'; '.join(le['reasons'])[:160]})")
+                self._auto_last_action_ts = now
+                self._auto_last_key = key
+                exec_funnel.blocked(
+                    "RISK", "LATE_ENTRY", instrument=self._instrument, option=opt,
+                    where="state.py:_auto_trade", reason="; ".join(le["reasons"])[:200],
+                )
+                return
+        dyn = None
+        if settings.dyn_sizing_mode in ("log", "enforce") and lots >= 1:
+            # Dynamic capital-based sizing, recalculated right before submission
+            # from fresh funds/margin. Enforced only in PAPER unless dyn_sizing_live.
+            enforce = settings.dyn_sizing_mode == "enforce" and (not live or settings.dyn_sizing_live)
+            dyn = self._dynamic_size(decision, opt, lot_size, live, deployed, deployed_self,
+                                     open_positions, path_caps)
+            dyn["mode"] = "enforce" if enforce else "log"
+            dyn["path_lots"] = int(lots)
+            self._sizing_event("SIZING_DECISION", dyn, live)
+            if enforce:
+                if dyn["lots"] < 1:
+                    self._auto_last_action = (
+                        f"AUTO SKIP {opt}: dynamic sizing {dyn['reject']}")
+                    self._auto_last_action_ts = now
+                    self._auto_last_key = key
+                    exec_funnel.blocked(
+                        "RISK", "DYNAMIC_SIZING", instrument=self._instrument, option=opt,
+                        value=dyn.get("binding"), where="state.py:_auto_trade",
+                        reason=str(dyn["reject"]),
+                    )
+                    return
+                lots = int(dyn["lots"])
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")
         res = self.buy(decision.recommended_option, lots=lots, confirm=live,
                        manual=False)
+        if dyn is not None:
+            self._sizing_event("SIZING_RESULT", {
+                "mode": dyn["mode"], "calculated_lots": dyn["lots"], "requested_lots": int(lots),
+                "accepted": bool(res.ok), "accepted_lots": int(res.lots or 0) if res.ok else 0,
+                "filled_lots": int(res.filled_lots or 0), "order_status": res.status,
+                "order_id": res.order_id, "fill_premium": res.fill_premium,
+                "message": (res.message or "")[:200],
+            }, live)
         self._auto_last_key = key
         self._auto_key_traded_ts = float(now) if res.ok else None
         prev_key, tries = getattr(self, "_auto_unsent", (None, 0))

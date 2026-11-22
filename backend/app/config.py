@@ -822,6 +822,12 @@ class Settings(BaseSettings):
     # keeps that % of the peak (20k peak -> 10k locked). Empty = the single
     # daily_profit_target / daily_lock_keep_pct rule. daily_profit_target 0 = off.
     daily_lock_steps: str = "15000:50,30000:75,60000:85"
+    # Day equity for the profit lock and the post-lock loss budget. "tool" = the
+    # bot's own trades (default); "angel" = today's Angel account P&L (realised +
+    # open MTM of every position, manual trades included), LIVE only. When Angel
+    # can't be read the tool figure is used and an alert is raised.
+    daily_lock_equity_source: str = "tool"
+    daily_lock_broker_pnl_ttl_sec: float = 10.0
     # Equity under the lock: pause new buys this long (0 = stop for the day),
     # then resume with a floor this many ₹ below equity that trails new highs,
     # so post-lock trades are sized from that small room. Resumes per day.
@@ -889,6 +895,52 @@ class Settings(BaseSettings):
     # judged on the bid, profit-lock flatten.
     auto_trade_live_pullback_engine: bool = True
     auto_trade_live_capital_sizing: bool = True
+    # Dynamic capital-based lot sizing (app/execution/dynamic_sizing.py). Only
+    # dyn_sizing_instruments are sized dynamically; every other instrument is
+    # exactly 1 lot and that lot must still pass the funds/margin/risk checks.
+    # "off" = not computed; "log" = computed and recorded (SIZING_DECISION), lots
+    # unchanged; "enforce" = computed lots are used (PAPER only unless
+    # dyn_sizing_live is also True). Funds/margin are read fresh from Angel before
+    # every LIVE entry; unverified or stale inputs reject the trade when enforced.
+    # PAPER T1 scale-out books the executable bid (like a LIVE MARKET sell), not
+    # max(price, T1). False restores the old resting-limit-at-T1 paper fill.
+    paper_t1_fill_at_bid: bool = True
+    # First-hour re-entry lockout (app/engine/first_hour.py). Off by default.
+    first_hour_lockout: bool = False
+    first_hour_lockout_exempt: list[str] = ["NIFTY", "SENSEX"]
+    first_hour_lockout_session_start_ist: str = "09:15"
+    first_hour_lockout_until_ist: str = "10:15"
+    # Late-entry check (app/execution/late_entry.py): "off" | "log" (record only)
+    # | "enforce" (skip the BUY). LIVE enforces only with late_entry_live=True.
+    late_entry_mode: str = "off"
+    late_entry_live: bool = False
+    late_entry_max_prem_rise_pct: dict[str, float] = {"10": 10.0}
+    late_entry_max_underlying_move_pct: float = 0.0
+    late_entry_min_reward_risk: float = 1.0
+    late_entry_max_spread_pct: float = 0.0
+    # Pullback Quality classifier (app/execution/pullback_quality.py): "off" |
+    # "log". It records a label per BUY and never blocks one.
+    pullback_quality_mode: str = "off"
+    pullback_quality_params: dict[str, float] = {}
+    dyn_sizing_mode: str = "off"
+    dyn_sizing_live: bool = False
+    dyn_sizing_instruments: list[str] = ["NIFTY", "SENSEX"]
+    dyn_sizing_limits: dict[str, dict[str, float]] = {
+        "NIFTY": {"max_lots": 10, "max_capital_pct": 50.0, "risk_per_trade": 5000.0,
+                  "max_exposure": 250000.0},
+        "SENSEX": {"max_lots": 10, "max_capital_pct": 50.0, "risk_per_trade": 5000.0,
+                   "max_exposure": 250000.0},
+        "DEFAULT": {"max_lots": 1, "max_capital_pct": 25.0, "risk_per_trade": 3000.0,
+                    "max_exposure": 100000.0},
+    }
+    dyn_sizing_max_portfolio_exposure: float = 500000.0
+    dyn_sizing_max_open_positions: int = 3
+    dyn_sizing_daily_loss_limit: float = 10000.0
+    dyn_sizing_slippage_points: dict[str, float] = {"NIFTY": 1.0, "SENSEX": 2.0, "DEFAULT": 1.0}
+    dyn_sizing_max_quote_age_sec: float = 5.0
+    # A BUY submitted to Angel within this many seconds may not be in Angel's
+    # available cash yet, so its value is reserved; older ones already are.
+    dyn_sizing_pending_reserve_sec: float = 15.0
     # v3.5.32: LIVE single-stock option auto-buys only (not MCX, not index): 1 lot,
     # no stop / trail / no-progress exit; sold when the bid or LTP reaches T2 (T1 if
     # no T2), else at the live equity square-off. Profit lock still applies.
