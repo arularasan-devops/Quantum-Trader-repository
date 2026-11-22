@@ -2917,13 +2917,14 @@ class AppState:
     def _pullback_quality(self, decision: Decision, opt: str) -> dict:
         from app.execution import pullback_quality
 
+        n = int(pullback_quality._p("window"))
         oc: list[float] = []
         with contextlib.suppress(Exception):
-            oc = [float(c.close) for c in (self.provider.option_candles(opt, limit=30) or [])]
+            oc = [float(c.close) for c in (self.provider.option_candles(opt, limit=n) or [])]
         ask = float(self._live_entry_ask(opt) or decision.current_premium or 0.0)
         return pullback_quality.classify(
             call=decision.option_type == OptionType.CALL,
-            candles=self.provider.futures_candles(limit=30) or [], option_closes=oc,
+            candles=self.provider.futures_candles(limit=n) or [], option_closes=oc,
             ask=ask, stop=self._entry_stop(decision, ask), target=decision.target1)
 
     def _late_entry_check(self, decision: Decision, opt: str) -> dict:
