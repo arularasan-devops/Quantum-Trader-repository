@@ -2904,6 +2904,28 @@ class AppState:
             return tool
         return float(broker) - float(account_risk.account.day_pnl)
 
+    def _entry_stop(self, decision: Decision, entry: float) -> float | None:
+        """The hard stop _arm_auto_entry will apply for a fill at ``entry``."""
+        stop = float(decision.stop_loss) if decision.stop_loss is not None else None
+        pts = settings.auto_trade_stop_points.get(self._instrument)
+        if pts and pts > 0 and entry > 0:
+            return max(0.05, entry - float(pts))
+        if stop is not None and entry > 0 and settings.auto_trade_max_stop_pct > 0:
+            stop = max(stop, entry * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
+        return stop
+
+    def _pullback_quality(self, decision: Decision, opt: str) -> dict:
+        from app.execution import pullback_quality
+
+        oc: list[float] = []
+        with contextlib.suppress(Exception):
+            oc = [float(c.close) for c in (self.provider.option_candles(opt, limit=30) or [])]
+        ask = float(self._live_entry_ask(opt) or decision.current_premium or 0.0)
+        return pullback_quality.classify(
+            call=decision.option_type == OptionType.CALL,
+            candles=self.provider.futures_candles(limit=30) or [], option_closes=oc,
+            ask=ask, stop=self._entry_stop(decision, ask), target=decision.target1)
+
     def _late_entry_check(self, decision: Decision, opt: str) -> dict:
         from app.execution import late_entry
 
@@ -2912,16 +2934,20 @@ class AppState:
         with contextlib.suppress(Exception):
             q = next((x for x in self.provider.option_chain() if x.symbol == opt), None)
             bid = float(q.bid) if q is not None and q.bid else None
-        oc: list[float] = []
-        uc: list[float] = []
+        oc: list[tuple[int, float]] = []
+        uc: list[tuple[int, float]] = []
+        n = max(late_entry.windows()) + 5
         with contextlib.suppress(Exception):
-            oc = [float(c.close) for c in (self.provider.option_candles(opt, limit=15) or [])]
+            oc = [(int(c.time), float(c.close))
+                  for c in (self.provider.option_candles(opt, limit=n) or [])]
         with contextlib.suppress(Exception):
-            uc = [float(c.close) for c in (self.provider.futures_candles(limit=15) or [])]
+            uc = [(int(c.time), float(c.close))
+                  for c in (self.provider.futures_candles(limit=n) or [])]
         return late_entry.assess(
             call=decision.option_type == OptionType.CALL, ask=float(ask), bid=bid,
-            signal_premium=decision.current_premium, stop=decision.stop_loss,
-            target=decision.target1, option_closes=oc, underlying_closes=uc)
+            signal_premium=decision.current_premium,
+            stop=self._entry_stop(decision, float(ask)), target=decision.target1,
+            option_bars=oc, underlying_bars=uc, now=time.time())
 
     def _dynamic_size(self, decision: Decision, opt: str, lot_size: int, live: bool,
                       deployed: float, deployed_self: float, open_positions: int,
@@ -2934,12 +2960,7 @@ class AppState:
         ask = self._live_entry_ask(opt)
         entry = max(float(decision.current_premium or 0.0),
                     float(getattr(self, "_auto_entry_ask", 0.0) or 0.0), ask)
-        stop = float(decision.stop_loss) if decision.stop_loss is not None else None
-        pts = settings.auto_trade_stop_points.get(self._instrument)
-        if pts and pts > 0 and entry > 0:
-            stop = entry - float(pts)
-        elif stop is not None and settings.auto_trade_max_stop_pct > 0:
-            stop = max(stop, entry * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
+        stop = self._entry_stop(decision, entry)
         t = time.time()
         funds = margin = None
         if live:
@@ -4126,6 +4147,9 @@ class AppState:
 
         if self._stock_hold_active(live):
             lots = 1
+        if settings.pullback_quality_mode == "log" and lots >= 1:
+            with contextlib.suppress(Exception):
+                self._sizing_event("PULLBACK_QUALITY", self._pullback_quality(decision, opt), live)
         if settings.late_entry_mode in ("log", "enforce") and lots >= 1:
             le = self._late_entry_check(decision, opt)
             le_enforce = settings.late_entry_mode == "enforce" and (

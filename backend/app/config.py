@@ -918,6 +918,10 @@ class Settings(BaseSettings):
     late_entry_max_underlying_move_pct: float = 0.0
     late_entry_min_reward_risk: float = 1.0
     late_entry_max_spread_pct: float = 0.0
+    # Pullback Quality classifier (app/execution/pullback_quality.py): "off" |
+    # "log". It records a label per BUY and never blocks one.
+    pullback_quality_mode: str = "off"
+    pullback_quality_params: dict[str, float] = {}
     dyn_sizing_mode: str = "off"
     dyn_sizing_live: bool = False
     dyn_sizing_instruments: list[str] = ["NIFTY", "SENSEX"]

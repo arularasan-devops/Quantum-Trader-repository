@@ -14,24 +14,34 @@ from app.config import settings
 WINDOWS = (1, 3, 5, 10)
 
 
-def _chg_pct(closes: list[float], n: int, now_px: float) -> float | None:
-    if now_px <= 0 or len(closes) <= n:
-        return None
-    ref = float(closes[-1 - n])
-    return (now_px - ref) / ref * 100.0 if ref > 0 else None
+def windows() -> list[int]:
+    """Recorded windows plus any window with a configured limit."""
+    return sorted(set(WINDOWS) | {int(k) for k in (settings.late_entry_max_prem_rise_pct or {})})
+
+
+def _ref_close(bars: list[tuple[int, float]], at: float) -> float | None:
+    """Close of the last 1-min bar that opened at or before ``at`` - 60 (i.e.
+    the bar completed by ``at``); None when history doesn't reach that far."""
+    ref = None
+    for t, c in bars:
+        if t + 60 <= at and c and c > 0:
+            ref = float(c)
+    return ref
 
 
 def assess(*, call: bool, ask: float, bid: float | None, signal_premium: float | None,
-           stop: float | None, target: float | None, option_closes: list[float],
-           underlying_closes: list[float]) -> dict:
-    """``option_closes``/``underlying_closes``: 1-min closes, oldest first, the
-    last one being the current (still forming) minute."""
+           stop: float | None, target: float | None, option_bars: list[tuple[int, float]],
+           underlying_bars: list[tuple[int, float]], now: float) -> dict:
+    """``option_bars``/``underlying_bars``: (bar open time, close), oldest first.
+    Windows are measured by timestamp against ``now``, so cached or gappy
+    history can't stretch a 10-minute comparison."""
     rec: dict = {"ask": round(ask, 2), "bid": bid, "signal_premium": signal_premium,
                  "stop": stop, "target": target, "reasons": []}
-    for n in WINDOWS:
-        v = _chg_pct(option_closes, n, ask)
+    for n in windows():
+        ref = _ref_close(option_bars, now - n * 60)
+        v = (ask - ref) / ref * 100.0 if ref and ask > 0 else None
         rec[f"prem_chg_{n}m_pct"] = round(v, 2) if v is not None else None
-    u = [float(c) for c in underlying_closes[-11:] if c]
+    u = [float(c) for t, c in underlying_bars if c and t >= now - 11 * 60]
     if len(u) >= 2:
         sign = 1.0 if call else -1.0
         start_i = (min if call else max)(range(len(u)), key=lambda i: u[i])
