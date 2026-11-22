@@ -12,6 +12,7 @@ import logging
 import contextlib
 import math
 import threading
+import json
 import time
 from datetime import datetime, timezone
 
@@ -2875,6 +2876,111 @@ class AppState:
             return False
         return account_risk.ist_minutes(now) >= h * 60 + m
 
+    def _lock_open_mtm(self, live: bool) -> float:
+        """The open-MTM term of the day equity used by the profit lock and the
+        post-lock loss budget. With daily_lock_equity_source="angel" (LIVE) it is
+        chosen so day_pnl + term == Angel's account P&L for today, manual trades
+        included; if Angel can't be read, the tool's own open MTM is used."""
+        tool = sum(o._liq_pnl() for o in registry.active() if o.position.option_symbol)
+        if not (live and settings.daily_lock_equity_source == "angel"):
+            return tool
+        broker = None
+        try:
+            from app.market import angelone
+
+            broker = angelone.broker_day_pnl(ttl=settings.daily_lock_broker_pnl_ttl_sec)
+        except Exception:
+            broker = None
+        if broker is None:
+            t = time.time()
+            if t - float(getattr(self, "_lock_pnl_alert_ts", 0.0) or 0.0) > 300:
+                self._lock_pnl_alert_ts = t
+                self._add_alert("LOCK_BROKER_PNL", "Angel day P&L unreadable — profit lock "
+                                "is using the tool's own P&L", "warning")
+            return tool
+        return float(broker) - float(account_risk.account.day_pnl)
+
+    def _dynamic_size(self, decision: Decision, opt: str, lot_size: int, live: bool,
+                      deployed: float, deployed_self: float, open_positions: int) -> dict:
+        """Inputs for app.execution.dynamic_sizing.compute: entry at the ask, the
+        stop that will be applied after fill, and FRESH funds/margin (LIVE: read
+        from Angel now, uncached; PAPER: configured capital and premium x lot)."""
+        from app.execution import dynamic_sizing
+
+        ask = self._live_entry_ask(opt)
+        entry = max(float(decision.current_premium or 0.0),
+                    float(getattr(self, "_auto_entry_ask", 0.0) or 0.0), ask)
+        stop = float(decision.stop_loss) if decision.stop_loss is not None else None
+        pts = settings.auto_trade_stop_points.get(self._instrument)
+        if pts and pts > 0 and entry > 0:
+            stop = entry - float(pts)
+        elif stop is not None and settings.auto_trade_max_stop_pct > 0:
+            stop = max(stop, entry * (1.0 - settings.auto_trade_max_stop_pct / 100.0))
+        t = time.time()
+        funds = margin = None
+        if live:
+            fn = getattr(self.provider, "sizing_snapshot", None)
+            snap = None
+            if callable(fn) and entry > 0:
+                try:
+                    snap = fn(opt, entry)
+                except Exception:
+                    snap = None
+            funds = (snap or {}).get("funds")
+            margin = (snap or {}).get("margin_per_lot")
+        elif entry > 0:
+            funds = {"value": max(0.0, settings.capital - deployed), "ts": t,
+                     "source": "paper_capital"}
+            margin = {"value": entry * lot_size, "ts": t, "source": "paper_premium"}
+        extra: dict[str, int] = {}
+        if live and entry > 0 and lot_size > 0:
+            extra["live_order_value_cap"] = int(
+                settings.auto_trade_live_max_order_value // (entry * lot_size))
+        try:
+            day_pnl = float(account_risk.account.day_pnl)
+        except Exception:
+            day_pnl = 0.0
+        rec = dynamic_sizing.compute(
+            instrument=self._instrument, entry=entry, stop=stop, lot_size=lot_size,
+            funds=funds, margin_per_lot=margin, pending_reserve=self._pending_buy_reserve(t),
+            deployed_instrument=deployed_self, deployed_portfolio=deployed,
+            open_positions=open_positions, day_pnl=day_pnl, extra_caps=extra,
+            now=time.time())
+        rec["option_symbol"] = opt
+        return rec
+
+    def _pending_buy_reserve(self, now: float) -> float:
+        """Value of other instruments' BUYs sent within dyn_sizing_pending_reserve_sec:
+        they may not be reflected in Angel's available cash yet. Older ones are
+        already blocked there, so they are not counted twice."""
+        total = 0.0
+        for other in registry.active():
+            if other is self:
+                continue
+            pend = getattr(other, "_pending_order", None)
+            if not pend or pend.get("side") != "BUY":
+                continue
+            if now - float(pend.get("ts") or now) > settings.dyn_sizing_pending_reserve_sec:
+                continue
+            try:
+                ls = get_spec(other.instrument).lot_size
+            except Exception:
+                ls = 0
+            remaining = max(0, int(pend.get("lots") or 0) - int(pend.get("filled_lots") or 0))
+            total += other._live_entry_ask(pend.get("symbol")) * ls * remaining
+        return total
+
+    def _sizing_event(self, kind: str, rec: dict, live: bool) -> None:
+        """Durable sizing record in the order audit log (PAPER entries tagged mode=paper)."""
+        flat = {k: v for k, v in rec.items() if k not in ("limits", "constraints")}
+        flat["sizing_limits"] = json.dumps(rec.get("limits")) if rec.get("limits") else None
+        flat["sizing_constraints"] = (json.dumps(rec.get("constraints"))
+                                      if rec.get("constraints") else None)
+        flat.pop("mode", None)
+        flat.pop("instrument", None)
+        self._event(kind, None, mode="live" if live else "paper",
+                    sizing_mode=rec.get("mode"), **flat)
+
     def _live_entry_ask(self, opt: str | None) -> float:
         """Current ask of ``opt`` from the feed (0 when unknown). Read-only."""
         try:
@@ -3024,9 +3130,7 @@ class AppState:
                     and self._auto_entry_prem is not None):
                 with contextlib.suppress(Exception):
                     acct = account_risk.account
-                    equity = acct.day_pnl + sum(
-                        o._liq_pnl() for o in registry.active() if o.position.option_symbol
-                    )
+                    equity = acct.day_pnl + self._lock_open_mtm(live)
                     if acct.must_flatten(equity):
                         self._pending_exit_reason = "PROFIT LOCK"
                         self.sell(confirm=live)
@@ -3162,7 +3266,7 @@ class AppState:
                         )
                         self._pending_exit_reason = "SCALE-OUT T1"
                         res = self.sell(confirm=live, lots=book,
-                                        fill_px=(max(prem, t1) if not live else None))
+                                        fill_px=(max(prem, t1) if not live and not settings.paper_t1_fill_at_bid else None))
                         if res.ok:
                             self._auto_scaled_out = True
                             self._auto_stop = max(
@@ -3723,9 +3827,7 @@ class AppState:
         # daily loss, daily profit target, giveback from the day's equity peak,
         # trade cap, loss streak, max concurrent and the manual kill switch.
         with contextlib.suppress(Exception):
-            account_risk.account.note_equity(
-                now, sum(o._liq_pnl() for o in registry.active()
-                         if o.position.option_symbol))
+            account_risk.account.note_equity(now, self._lock_open_mtm(live))
         can, _reason = self.risk.can_open(time.time())
         if can and live and live_control.kill_switch_engaged():
             can, _reason = False, "kill switch engaged (live)"
@@ -3914,8 +4016,7 @@ class AppState:
         if ((not live or settings.auto_trade_live_loss_budget)
                 and lots >= 1 and decision.stop_loss is not None):
             acct = account_risk.account
-            equity = acct.day_pnl + sum(
-                o._liq_pnl() for o in registry.active() if o.position.option_symbol)
+            equity = acct.day_pnl + self._lock_open_mtm(live)
             budget = account_risk.entry_loss_budget(
                 acct.day_peak_equity, equity,
                 per_trade_cap=settings.auto_trade_max_loss_rupees,
@@ -3974,10 +4075,41 @@ class AppState:
 
         if self._stock_hold_active(live):
             lots = 1
+        dyn = None
+        if settings.dyn_sizing_mode in ("log", "enforce") and lots >= 1:
+            # Dynamic capital-based sizing, recalculated right before submission
+            # from fresh funds/margin. Enforced only in PAPER unless dyn_sizing_live.
+            enforce = settings.dyn_sizing_mode == "enforce" and (not live or settings.dyn_sizing_live)
+            dyn = self._dynamic_size(decision, opt, lot_size, live, deployed, deployed_self,
+                                     open_positions)
+            dyn["mode"] = "enforce" if enforce else "log"
+            dyn["path_lots"] = int(lots)
+            self._sizing_event("SIZING_DECISION", dyn, live)
+            if enforce:
+                if dyn["lots"] < 1:
+                    self._auto_last_action = (
+                        f"AUTO SKIP {opt}: dynamic sizing {dyn['reject']}")
+                    self._auto_last_action_ts = now
+                    self._auto_last_key = key
+                    exec_funnel.blocked(
+                        "RISK", "DYNAMIC_SIZING", instrument=self._instrument, option=opt,
+                        value=dyn.get("binding"), where="state.py:_auto_trade",
+                        reason=str(dyn["reject"]),
+                    )
+                    return
+                lots = int(dyn["lots"])
         exec_funnel.reached("EXECUTION")
         exec_funnel.reached("BROKER")
         res = self.buy(decision.recommended_option, lots=lots, confirm=live,
                        manual=False)
+        if dyn is not None:
+            self._sizing_event("SIZING_RESULT", {
+                "mode": dyn["mode"], "calculated_lots": dyn["lots"], "requested_lots": int(lots),
+                "accepted": bool(res.ok), "accepted_lots": int(res.lots or 0) if res.ok else 0,
+                "filled_lots": int(res.filled_lots or 0), "order_status": res.status,
+                "order_id": res.order_id, "fill_premium": res.fill_premium,
+                "message": (res.message or "")[:200],
+            }, live)
         self._auto_last_key = key
         self._auto_key_traded_ts = float(now) if res.ok else None
         prev_key, tries = getattr(self, "_auto_unsent", (None, 0))
