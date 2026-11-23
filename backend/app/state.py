@@ -1129,6 +1129,33 @@ class AppState:
         return bool(rej and rej[0] == sym
                     and time.time() - rej[1] <= settings.live_exit_reject_window_sec)
 
+    def _sell_halt_reason(self, sym: str) -> str | None:
+        rec = self._order_recovery or {}
+        if rec.get("sell_halted") != sym:
+            return None
+        return (f"Angel rejected a SELL of {sym} for funds/margin, so it would open a "
+                "short. No SELL sent: check the position in Angel, close it there if "
+                "needed, then confirm via /api/order-recovery.")
+
+    def _halt_sells_on_funds_reject(self, sym: str | None, message: str | None) -> None:
+        """A SELL that closes a long never needs funds. A funds/margin reject means
+        Angel would treat it as a NEW short (position converted, already closed,
+        or its quantity held by another order): stop sending SELLs for it."""
+        from app.engine import reject_guard
+        if not (settings.live_sell_funds_reject_halt and sym
+                and reject_guard.is_funds_reject(message or "")):
+            return
+        if (self._order_recovery or {}).get("sell_halted") == sym:
+            return
+        self._enter_recovery(f"Angel rejected a SELL of {sym} for funds/margin "
+                             f"({(message or '')[:120]}) — it would open a short")
+        self._order_recovery["sell_halted"] = sym
+        self._persist_state()
+        self._add_alert("SELL_HALTED_FUNDS_REJECT", f"{sym}: Angel rejected the SELL for "
+                        "funds/margin. The bot sends no more SELLs or exchange stops for "
+                        "it. Check the position in Angel now and close it there if open.",
+                        "critical")
+
     def _sync_angel_close(self, sym: str, px: float, why: str) -> OrderResult:
         """The position was closed in the Angel app: book it at Angel's sell
         average so the journal matches Angel. Only a resting exchange stop is
@@ -1374,6 +1401,8 @@ class AppState:
             self._add_alert("EXCH_STOP_DROPPED", f"Exchange stop {es['order_id']} "
                             f"{st.status.lower()}: {st.message} — the bot floor exit still "
                             "applies", "warning")
+            if st.status == "REJECTED":
+                self._halt_sells_on_funds_reject(es.get("symbol"), st.message)
             return False
         if not self.position.option_symbol:
             self._release_exch_stop()  # flat but still resting: it would open a short
@@ -1837,13 +1866,23 @@ class AppState:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, message="Angel shows this position already "
                                    "closed — no SELL sent. Confirm flat via /api/order-recovery.")
+            halted = self._sell_halt_reason(sym)
             auto_check = self._exit_needs_broker_check(sym)
+            if halted:
+                # Read-only, throttled: book it if Angel shows it closed meanwhile.
+                rec = self._order_recovery
+                auto_check = time.time() - float(rec.get("halt_checked") or 0.0) >= 15.0
+                if auto_check:
+                    rec["halt_checked"] = time.time()
             if (check_broker and not partial) or auto_check:
                 row = self._angel_closed_row(sym)
                 if row:
                     return self._sync_angel_close(sym, float(row["sell_avg"]),
                                                   "Exit now" if check_broker else
                                                   "closed in Angel before the bot exit")
+            if halted:
+                return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                   lots=lots, status="NOT_SENT", message=halted)
             held_up = self._release_exch_stop()
             if held_up is not None:
                 return held_up
@@ -1856,6 +1895,7 @@ class AppState:
             if not res.ok:
                 if res.status == "REJECTED":
                     self._sell_rejected = (sym, now)
+                    self._halt_sells_on_funds_reject(sym, res.message)
                 if res.status == "NOT_SENT" and not self._pending_exit:
                     self._exit_retry_at = now + settings.live_exit_retry_sec
                 return res
@@ -3785,7 +3825,7 @@ class AppState:
         # restart — an in-memory cooldown handed the bot a fresh ladder every
         # time the backend came back up mid-session.
         cool_block = account_risk.account.instrument_blocked(self._instrument, now)
-        if cool_block and not eng:
+        if cool_block and (not eng or settings.auto_trade_cooldown_with_engine):
             self._auto_last_action = f"AUTO WAIT {self._instrument}: {cool_block}"
             self._auto_last_action_ts = now
             exec_funnel.blocked(

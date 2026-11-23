@@ -186,5 +186,56 @@ st.sell(confirm=True)
 check("flag off: SELL sent", len(sells(b)) == 1, str(b.orders))
 settings.live_exit_broker_check = True
 
+# 6. SELL rejected for funds (Angel would open a short) -> no further SELLs
+st, b, sym = engine()
+drop_stop(st, b)
+b.reject_sells = True
+b.positions[sym] = {"net_qty": 2 * 2, "buy_avg": 100.0, "sell_avg": 0.0}
+st.sell(confirm=True)
+n_stops = len(b.stops)
+for _ in range(5):
+    r = st.sell(confirm=True)
+    st._auto_trade(None, True, int(time.time()))
+check("funds reject: one SELL only", len(sells(b)) == 1, str(b.orders))
+check("funds reject: recovery + halt", (st._order_recovery or {}).get("sell_halted") == sym,
+      str(st._order_recovery))
+check("funds reject: no new exchange stop", len(b.stops) == n_stops, str(b.stops))
+check("funds reject: NOT_SENT message", r.status == "NOT_SENT" and "short" in r.message,
+      r.message)
+check("funds reject: critical alert",
+      any(a.kind == "SELL_HALTED_FUNDS_REJECT" for a in st.alerts))
+st._recovery_cleared("operator checked Angel")
+check("cleared recovery lifts the halt", st._sell_halt_reason(sym) is None)
+
+# 7. exchange stop rejected for funds -> halt, no bot SELL
+st, b, sym = engine()
+oid = st._exch_stop["order_id"]
+b.status[oid] = b.status[oid].model_copy(update={
+    "status": "REJECTED", "message": "Your order has been rejected due to Insufficient "
+    "Funds. Available funds - Rs. 147920.51. You require Rs. 305662.04"})
+st._poll_exch_stop(time.time() + 10, min_gap=0.0)
+st.sell(confirm=True)
+check("stop funds reject: no bot SELL", not sells(b), str(b.orders))
+check("stop funds reject: halted", (st._order_recovery or {}).get("sell_halted") == sym)
+
+# 8. non-funds reject -> no halt (old behaviour)
+st, b, sym = engine()
+oid = st._exch_stop["order_id"]
+b.status[oid] = b.status[oid].model_copy(update={"status": "REJECTED",
+                                                 "message": "RMS: price band"})
+st._poll_exch_stop(time.time() + 10, min_gap=0.0)
+check("other reject: no halt", st._order_recovery is None, str(st._order_recovery))
+
+# 9. halt flag off -> old behaviour (SELL re-sent after a funds reject)
+settings.live_sell_funds_reject_halt = False
+st, b, sym = engine()
+drop_stop(st, b)
+b.reject_sells = True
+b.positions[sym] = {"net_qty": 4, "buy_avg": 100.0, "sell_avg": 0.0}
+st.sell(confirm=True)
+st.sell(confirm=True)
+check("halt flag off: SELL re-sent", len(sells(b)) == 2, str(b.orders))
+settings.live_sell_funds_reject_halt = True
+
 print("ALL PASS" if not FAIL else f"{len(FAIL)} FAIL: {FAIL}")
 raise SystemExit(1 if FAIL else 0)

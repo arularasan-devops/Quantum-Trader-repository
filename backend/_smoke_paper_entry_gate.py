@@ -267,6 +267,22 @@ check("journal row: paper, auto, stop reason, loss",
       row is not None and row[0] == "paper" and row[1] == 1
       and "STOP" in (row[2] or "").upper() and row[5] < 0, str(row))
 
+# 13b. per-instrument cooldown also governs the pullback engine
+from app.engine import account_risk as _ar2  # noqa: E402
+eng, sym, prem = fresh()
+_ar2.account.last_exit[eng.instrument] = time.time() - 60
+settings.auto_trade_reentry_cooldown_sec = 3600.0
+took, why = attempt(eng, buy(sym, prem))
+check("cooldown blocks re-entry with the pullback engine on",
+      not took and why == "INSTRUMENT_COOLDOWN", why)
+settings.auto_trade_cooldown_with_engine = False
+eng, sym, prem = fresh()
+took, why = attempt(eng, buy(sym, prem))
+check("cooldown_with_engine off: old bypass", why != "INSTRUMENT_COOLDOWN", why)
+settings.auto_trade_cooldown_with_engine = True
+_ar2.account.last_exit.pop(eng.instrument, None)
+settings.auto_trade_reentry_cooldown_sec = 900.0
+
 # 14. paper isolation
 check("no broker place_order call in any case", not BROKER_CALLS, str(BROKER_CALLS))
 eng, sym, prem = fresh()
