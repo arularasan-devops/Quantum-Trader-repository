@@ -252,6 +252,8 @@ def entry_block(instrument: str, entry: float, bid: float, ask: float,
 
 
 class PaperBooks:
+    scope_sql = "book NOT LIKE 'S-%'"  # strategy books (S-*) have their own board
+
     def __init__(self, db: Database | None = None, specs: list[str] | None = None) -> None:
         self.db = db or Database()
         for ddl in _DDL:
@@ -362,8 +364,11 @@ class PaperBooks:
         _log.info("BOOK %s EXIT %s @ %.2f · %s · net ₹%.0f", b.id, p.option, price, reason, net)
 
     # ------------------------------------------------------------ lifecycle
+    def _enabled(self) -> bool:
+        return bool(settings.paper_books_enabled)
+
     def on_tick(self, st, decision, chain, now: float) -> None:
-        if not settings.paper_books_enabled:
+        if not self._enabled():
             return
         with self._lock:
             self._roll(now)
@@ -651,7 +656,7 @@ class PaperBooks:
     def trades(self, book: str | None = None, status: str | None = None,
                page: int = 1, page_size: int = 50, since: float | None = None,
                until: float | None = None) -> dict:
-        where, args = [], []
+        where, args = [self.scope_sql], []
         if since is not None:
             where.append("entry_ts >= ?")
             args.append(float(since))

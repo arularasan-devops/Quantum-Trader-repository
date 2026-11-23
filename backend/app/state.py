@@ -48,6 +48,7 @@ from app.engine import backtest as bt
 from app.engine import decision as eng
 from app.engine import learning as learn
 from app.engine import paper_books
+from app.engine import strategy_books
 from app.engine import paper_positions
 from app.engine import recovery as rec_eng
 from app.engine import risk_v2
@@ -2498,6 +2499,7 @@ class AppState:
         journal_hooks.after_tick(self, decision, chain, was_in_pos, now)
         # Parallel PAPER comparison books (ledger only; never the broker).
         paper_books.on_tick(self, decision, chain, now)
+        strategy_books.on_tick(self, decision, chain, now)
 
         # Phase 23 — the break-even hurdle shadow. It runs AFTER the auto-trader
         # has decided, records this BUY opportunity with the measured book, and
@@ -5362,6 +5364,7 @@ class AppState:
             with open(os.path.join(settings.data_dir, "base_breakout_shadow.jsonl"), "a",
                       encoding="utf-8") as fh:
                 fh.write(json.dumps(row) + "\n")
+            strategy_books.on_breakout(self, row, chain, now)
         except Exception:
             _log.debug("base breakout shadow log failed", exc_info=True)
 
