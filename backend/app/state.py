@@ -13,6 +13,7 @@ import contextlib
 import math
 import threading
 import json
+import os
 import time
 from datetime import datetime, timezone
 
@@ -241,6 +242,8 @@ class AppState:
         self._em_early_price: float | None = None
         self._em_early_ctime: int | None = None
         self._em_last_stage: int | None = None
+        self._bb_last_ct: int | None = None
+        self._bb_day: tuple[str, int] = ("", 0)
         # Open Early-Momentum outcome record for this instrument's current
         # EARLY-BUY leg (how far the premium reaches). Analysis-only.
         self._em_outcome: dict | None = None
@@ -2295,6 +2298,10 @@ class AppState:
         # neither the frozen engine nor the Early Momentum result above.
         if settings.early_early_enabled:
             self._apply_early_early(decision, candles, chain, snap_ind, price, now)
+
+        # Base Breakout shadow: LOG-ONLY research record, never touches the decision.
+        if settings.base_breakout_shadow_enabled:
+            self._log_base_breakout(candles, chain, now)
 
         # Quick Scalp Engine — a SEPARATE feature-flagged add-on. Fully isolated:
         # it reads market data, produces its own short-duration scalp advisory,
@@ -5319,6 +5326,42 @@ class AppState:
         self._em_outcome = momentum_outcomes.update(
             self._instrument, em, chain, now, self._em_outcome
         )
+
+    def _log_base_breakout(self, candles: list[Candle], chain: list[OptionQuote],
+                           now: float) -> None:
+        """Append a Base Breakout candidate (once per signal candle) with the ATM
+        option's bid/ask. Best effort: a logging failure never breaks a tick."""
+        try:
+            from app.execution import base_breakout
+
+            # Label from the provider actually serving this instrument (split
+            # feed: Groww for NFO/BFO, Angel One for MCX); skip simulated data.
+            feed = type(self.provider).__name__.removesuffix("Provider").lower()
+            with contextlib.suppress(Exception):
+                if self.provider.feed_mode() == "simulated":
+                    feed = "simulated"
+            if feed == "simulated":
+                return
+            bb = base_breakout.detect(candles, now)
+            if bb is None or bb["candle_time"] == self._bb_last_ct:
+                return
+            self._bb_last_ct = bb["candle_time"]
+            day = time.strftime("%Y-%m-%d", time.gmtime(now + 19800))
+            n = self._bb_day[1] + 1 if self._bb_day[0] == day else 1
+            self._bb_day = (day, n)
+            want = OptionType.CALL if bb["side"] == "CE" else OptionType.PUT
+            opts = [q for q in chain if q.option_type == want]
+            q = min(opts, key=lambda x: abs(x.strike - bb["close"])) if opts else None
+            row = {"ts": int(now), "instrument": self._instrument, "n_today": n, **bb,
+                   "option": q.symbol if q else None, "strike": q.strike if q else None,
+                   "bid": q.bid if q else None, "ask": q.ask if q else None,
+                   "ltp": q.premium if q else None, "mode": "shadow", "feed": feed}
+            os.makedirs(settings.data_dir, exist_ok=True)
+            with open(os.path.join(settings.data_dir, "base_breakout_shadow.jsonl"), "a",
+                      encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except Exception:
+            _log.debug("base breakout shadow log failed", exc_info=True)
 
     def _apply_early_early(
         self,

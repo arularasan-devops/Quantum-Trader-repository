@@ -1034,6 +1034,10 @@ class Settings(BaseSettings):
     # signal/confidence/strategy; it only adds an advisory + a Signal-Delay
     # measurement. Off by default → the app behaves exactly as before.
     early_momentum_enabled: bool = False
+    # Base Breakout shadow (app/execution/base_breakout.py): LOG-ONLY. Records the
+    # first close out of a quiet 20-min base to data/base_breakout_shadow.jsonl
+    # with the ATM option bid/ask. Never changes a signal and never orders.
+    base_breakout_shadow_enabled: bool = False
     # Minimum aligned-evidence score (0..100) before an EARLY BUY is advised.
     early_momentum_min_score: float = 60.0
     # An EARLY entry must still be near the start of the move: reject it once price
