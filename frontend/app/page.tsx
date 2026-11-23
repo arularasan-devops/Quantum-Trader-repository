@@ -42,6 +42,7 @@ import OptionsBoard from "@/components/OptionsBoard";
 import JournalBoard from "@/components/JournalBoard";
 import ReportsBoard from "@/components/ReportsBoard";
 import PaperBooksBoard from "@/components/PaperBooksBoard";
+import StrategyBooksBoard from "@/components/StrategyBooksBoard";
 import CommandCenter from "@/components/CommandCenter";
 import QuantumSignal from "@/components/QuantumSignal";
 import TopMovers from "@/components/TopMovers";
@@ -545,7 +546,10 @@ export default function Page() {
         </>
       ) : view === "books" ? (
         /* Six parallel PAPER books (5L/10L/15L x FULL/RISK) on the same signals. */
-        <PaperBooksBoard />
+        <>
+          <StrategyBooksBoard />
+          <PaperBooksBoard />
+        </>
       ) : view === "reports" ? (
         /* Every BUY signal persisted in journal v2, executed or skipped, with reason. */
         <ReportsBoard />

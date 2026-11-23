@@ -2043,6 +2043,24 @@ async def paper_books_summary() -> dict:
     return paper_books.books().summary()
 
 
+@app.get("/api/strategy-books")
+async def strategy_books_summary() -> dict:
+    """PAPER per-strategy books (ledger only, no orders)."""
+    from app.engine import strategy_books
+
+    return strategy_books.books().summary()
+
+
+@app.get("/api/strategy-books/trades")
+async def strategy_books_trades(book: str | None = None, status: str | None = None,
+                                page: int = 1, page_size: int = 200,
+                                since: float | None = None, until: float | None = None) -> dict:
+    from app.engine import strategy_books
+
+    return strategy_books.books().trades(book, status, max(1, page),
+                                         max(1, min(page_size, 1000)), since, until)
+
+
 @app.get("/api/paper-books/trades.csv")
 async def paper_books_trades_csv(book: str | None = None, status: str | None = None,
                                  since: float | None = None,

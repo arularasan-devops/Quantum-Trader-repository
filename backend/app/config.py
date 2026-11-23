@@ -879,6 +879,13 @@ class Settings(BaseSettings):
         "1000000:RISK", "1500000:FULL", "1500000:RISK",
     ]
     paper_books_risk_pct: float = 1.0
+    # PAPER strategy books (engine/strategy_books.py): one virtual account per entry
+    # strategy (PULLBACK, BREAKOUT_RETEST, MOMENTUM, IGNITION, REVERSAL, SUPERTREND,
+    # PATTERN, GAPUP, BASE_BREAKOUT), each with its own capital, never shared. Ledger
+    # only, no orders. BASE_BREAKOUT needs QT_BASE_BREAKOUT_SHADOW_ENABLED=true.
+    strategy_books_enabled: bool = False
+    strategy_books_capital: float = 250000.0
+    strategy_books_risk_pct: float = 1.0
     # v3.5.35: SELL research book — margin blocked per short lot, % of strike x lot size.
     paper_sell_margin_pct: float = 15.0
     # Paper Books also listed in the Journal's Paper tab while the stack trades
