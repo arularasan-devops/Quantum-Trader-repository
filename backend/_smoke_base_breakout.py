@@ -36,6 +36,10 @@ def main():
     r = bb.detect(novol, now)
     assert r and r["vol_ratio"] is None, "no-volume feed skips the volume check"
     assert bb.detect(_with_last(101.0, 200)[-60:], now) is None, "short history"
+    gap = _with_last(101.0, 200)
+    del gap[30]
+    assert bb.detect(gap, now) is None, "missing minute must not fire"
+    assert bb.detect(_with_last(101.0, 200), now + 120) is None, "stale candle ignored"
 
     import json
     import os
@@ -47,8 +51,9 @@ def main():
     st = AppState.__new__(AppState)
     st._bb_last_ct, st._bb_day, st._instrument = None, ("", 0), "CRUDEOIL"
     d = tempfile.mkdtemp()
-    old = settings.data_dir
+    old, old_feed = settings.data_dir, settings.data_provider
     settings.data_dir = d
+    settings.data_provider = "simulated"
     chain = [OptionQuote(symbol=f"X{k}{t.value}", strike=k, option_type=t, premium=50.0,
                          iv=.3, delta=.5, gamma=.01, theta=-1, vega=1, oi=1, oi_change=0,
                          volume=1, bid=49.5, ask=50.5)
@@ -56,13 +61,16 @@ def main():
     try:
         bars = _with_last(101.0, 200)
         st._log_base_breakout(bars, chain, now)
+        assert not os.path.exists(os.path.join(d, "base_breakout_shadow.jsonl")), "sim feed not logged"
+        settings.data_provider = "angelone"
+        st._log_base_breakout(bars, chain, now)
         st._log_base_breakout(bars, chain, now + 5)  # same candle: no duplicate
         rows = [json.loads(x) for x in open(os.path.join(d, "base_breakout_shadow.jsonl"))]
         assert len(rows) == 1 and rows[0]["option"] == "X101.0CE" and rows[0]["ask"] == 50.5, rows
-        assert rows[0]["mode"] == "shadow" and rows[0]["n_today"] == 1
+        assert rows[0]["mode"] == "shadow" and rows[0]["n_today"] == 1 and rows[0]["feed"] == "angelone"
         st._log_base_breakout(bars[:10], chain, now)  # no signal: no crash, no row
     finally:
-        settings.data_dir = old
+        settings.data_dir, settings.data_provider = old, old_feed
     assert settings.base_breakout_shadow_enabled is False
     print("base_breakout smoke OK")
 

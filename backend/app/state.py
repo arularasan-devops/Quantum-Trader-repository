@@ -5334,6 +5334,9 @@ class AppState:
         try:
             from app.execution import base_breakout
 
+            feed = settings.data_provider.lower()
+            if feed in ("simulated", "sim", "demo"):
+                return
             bb = base_breakout.detect(candles, now)
             if bb is None or bb["candle_time"] == self._bb_last_ct:
                 return
@@ -5347,7 +5350,7 @@ class AppState:
             row = {"ts": int(now), "instrument": self._instrument, "n_today": n, **bb,
                    "option": q.symbol if q else None, "strike": q.strike if q else None,
                    "bid": q.bid if q else None, "ask": q.ask if q else None,
-                   "ltp": q.premium if q else None, "mode": "shadow"}
+                   "ltp": q.premium if q else None, "mode": "shadow", "feed": feed}
             os.makedirs(settings.data_dir, exist_ok=True)
             with open(os.path.join(settings.data_dir, "base_breakout_shadow.jsonl"), "a",
                       encoding="utf-8") as fh:
