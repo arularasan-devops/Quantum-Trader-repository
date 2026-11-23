@@ -4757,6 +4757,8 @@ class AppState:
             return None
         wait = (settings.auto_trade_post_stop_cooldown_sec if self._auto_last_exit_was_stop
                 else settings.auto_trade_reentry_cooldown_sec)
+        if account_risk.cooldown_exempt(self._instrument):
+            wait = 0.0
         return max(0.0, wait - (now - ex))
 
     def _reset_auto_trade_marks(self, force: bool = False) -> None:

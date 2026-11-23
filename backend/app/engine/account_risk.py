@@ -159,6 +159,12 @@ def lots_for_budget(budget: float, entry: float, stop: float, lot_size: int) -> 
     return int(budget // (per_unit * lot_size))
 
 
+
+def cooldown_exempt(instrument: str) -> bool:
+    """True when the instrument is listed in auto_trade_cooldown_exempt."""
+    raw = settings.auto_trade_cooldown_exempt or ""
+    return instrument.upper() in {x.strip().upper() for x in raw.split(",") if x.strip()}
+
 class AccountRisk:
     """Shared, disk-persisted daily risk state for the whole option book."""
 
@@ -435,6 +441,8 @@ class AccountRisk:
         five-minute cooldown was short enough to allow it.
         """
         self._roll(now)
+        if cooldown_exempt(instrument):
+            return None
         stop_ts = self.last_stop.get(instrument)
         stop_wait = settings.auto_trade_post_stop_cooldown_sec
         if stop_ts is not None and stop_wait > 0 and now - stop_ts < stop_wait:
