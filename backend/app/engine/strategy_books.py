@@ -149,6 +149,11 @@ class StrategyBooks(PaperBooks):
         side = gapup.gap_side(gapup.gap_pct(ohlc.get("open"), ohlc.get("prev_close")))
         if side is None:
             return
+        d0 = time.mktime(time.strptime(day, "%Y-%m-%d")) - time.timezone - 19800
+        if self.db.query_one("SELECT COUNT(*) AS n FROM jr_book_trades WHERE book = ? AND "
+                             "instrument = ? AND entry_ts >= ?", (b.id, inst, d0))["n"]:
+            self._gap_done.add((inst, day))  # already traded today (e.g. before a restart)
+            return
         want = "CE" if side.upper() in ("UP", "CE", "CALL") else "PE"
         ces = {q.strike: q for q in quotes.values() if q.option_type.value == "CE"}
         pes = {q.strike: q for q in quotes.values() if q.option_type.value == "PE"}
@@ -233,4 +238,4 @@ def on_breakout(st, row: dict, chain, now: float) -> None:
         _log.exception("strategy books breakout failed")
 
 
-__all__ = ["STRATEGIES", "books", "on_tick", "on_breakout", "iso", "time"]
+__all__ = ["STRATEGIES", "books", "on_tick", "on_breakout", "iso"]

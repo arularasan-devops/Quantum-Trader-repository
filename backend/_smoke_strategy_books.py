@@ -95,6 +95,11 @@ check("GAPUP book bought the ATM CE on a 1% gap-up", gp and gp.option == "S_CE_B
 SB.on_tick(st_s, NS(**{**dec.__dict__, "signal": Signal.HOLD}), chain, now + 5)
 check("one GAPUP entry per day",
       SB.db.query_one("SELECT COUNT(*) n FROM jr_book_trades WHERE book='S-GAPUP'")["n"] == 1)
+SB_r = sbm.StrategyBooks(Database(url))
+SB_r._by_id["S-GAPUP"].positions.clear()
+SB_r.on_tick(st_s, NS(**{**dec.__dict__, "signal": Signal.HOLD}), chain, now + 6)
+check("no second GAPUP entry after a restart",
+      SB_r.db.query_one("SELECT COUNT(*) n FROM jr_book_trades WHERE book='S-GAPUP'")["n"] == 1)
 
 # isolation from the existing Paper Books board, restart, off switch
 PB = pb.PaperBooks(Database(url))
