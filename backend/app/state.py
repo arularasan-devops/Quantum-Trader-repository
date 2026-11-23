@@ -1789,6 +1789,15 @@ class AppState:
                 self._book_exit(self.position.quantity_lots, None,
                                 float(px) if px else None)
                 self._reset_auto_trade_marks()
+            elif (self.position.option_symbol
+                  and self._order_recovery.get("sell_halted") == self.position.option_symbol):
+                # Operator closed it in Angel after a funds-reject halt: book it
+                # (Angel's sell average when readable) so no bot SELL follows.
+                row = self._angel_closed_row(self.position.option_symbol)
+                px = (row or {}).get("sell_avg")
+                self._pending_exit_reason = "MANUAL EXIT (ANGEL)"
+                self._book_exit(self.position.quantity_lots, None, float(px) if px else None)
+                self._reset_auto_trade_marks()
             self._ledger_position = None
             self._order_recovery.pop("conflicts", None)
         elif action == "adopt_position":
