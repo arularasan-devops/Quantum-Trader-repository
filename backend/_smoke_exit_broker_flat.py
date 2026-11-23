@@ -207,6 +207,42 @@ check("funds reject: critical alert",
 st._recovery_cleared("operator checked Angel")
 check("cleared recovery lifts the halt", st._sell_halt_reason(sym) is None)
 
+# 6b. halt is manual-only; confirm_flat books the app position, no SELL
+st, b, sym = engine()
+drop_stop(st, b)
+b.reject_sells = True
+b.positions[sym] = {"net_qty": 4, "buy_avg": 100.0, "sell_avg": 0.0}
+st.sell(confirm=True)
+st._reconcile_recovery()
+check("halt survives auto reconciliation", (st._order_recovery or {}).get("sell_halted") == sym)
+b.positions[sym] = {"net_qty": 0, "buy_avg": 100.0, "sell_avg": 108.0}
+st.resolve_recovery("confirm_flat", "closed in Angel app")
+check("confirm_flat books the app position", not st.position.option_symbol)
+check("confirm_flat: still one SELL", len(sells(b)) == 1, str(b.orders))
+
+# 6c. funds reject arriving later via pending reconciliation -> halt, no second SELL
+st, b, sym = engine()
+drop_stop(st, b)
+b.positions[sym] = {"net_qty": 4, "buy_avg": 100.0, "sell_avg": 0.0}
+_orig_place = b.place_order
+def _ack_only(sym_, side, lots, product=None):
+    r = _orig_place(sym_, side, lots, product)
+    b.status[r.order_id] = OrderResult(ok=False, mode="live", side=side, option_symbol=sym_,
+                                       lots=lots, filled_lots=0, order_id=r.order_id,
+                                       status="OPEN")
+    return r
+b.place_order = _ack_only
+st.sell(confirm=True)
+oid = st._pending_exit["order_id"] if st._pending_exit else None
+check("async: SELL pending", oid is not None, str(st._pending_exit))
+if oid:
+    b.status[oid] = b.status[oid].model_copy(update={
+        "status": "REJECTED", "message": "rejected due to Insufficient Funds"})
+st.sell(confirm=True)
+check("async funds reject: halted", (st._order_recovery or {}).get("sell_halted") == sym,
+      str(st._order_recovery))
+check("async funds reject: no second SELL", len(sells(b)) == 1, str(b.orders))
+
 # 7. exchange stop rejected for funds -> halt, no bot SELL
 st, b, sym = engine()
 oid = st._exch_stop["order_id"]
