@@ -156,6 +156,10 @@ class Settings(BaseSettings):
     live_exit_reject_window_sec: float = 120.0
     # After a live SELL that never reached Angel, wait this long before retrying.
     live_exit_retry_sec: float = 5.0
+    # A SELL (bot exit or exchange stop) that Angel rejects for funds/margin
+    # would have opened a new short: send no more SELLs for that symbol, enter
+    # manual order recovery and alert. Closing a long never needs funds.
+    live_sell_funds_reject_halt: bool = True
     # A live BUY Angel acknowledged but whose fill can't be read from the order
     # book: after this many seconds, adopt it once Angel's positions show exactly
     # that quantity (at Angel's buy average). 0 = off.
@@ -354,6 +358,8 @@ class Settings(BaseSettings):
     # A STOP earns a longer wait than a target — the view has just been proven
     # wrong, not completed.
     auto_trade_post_stop_cooldown_sec: float = 1800.0
+    # Apply the per-instrument cooldown to pullback-engine entries too.
+    auto_trade_cooldown_with_engine: bool = True
     # A live auto-buy whose connection to Angel never opened (nothing sent) is
     # retried while the signal stays valid: wait this long, at most this many times.
     auto_trade_unsent_retry_sec: float = 15.0
