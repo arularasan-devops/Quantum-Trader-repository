@@ -73,7 +73,7 @@ class StrategyBooks(PaperBooks):
         affordable = int(max(0.0, self.available(b)) // (entry * lot_size))
         per_lot = (entry - stop) * lot_size
         budget = b.capital * settings.strategy_books_risk_pct / 100.0
-        lots = min(affordable, int(budget // per_lot))
+        lots = min(affordable, int((budget + 1e-6) // per_lot))  # tolerate float noise at the cap
         return lots, round(per_lot * lots, 2)
 
     def _close(self, b, p, price, reason, now) -> None:

@@ -64,6 +64,8 @@ check("lots from own capital & 1% risk: 2500 // ((120-115)*65) = 7", p.lots == 7
 check("entry at the ask", p.entry == 120.0, p.entry)
 check("1 lot above the 1% risk budget is not bought",
       SB.size(SB._by_id["S-REVERSAL"], 120.0, 80.0, 65)[0] == 0)
+check("1 lot exactly at the risk budget is bought",
+      SB.size(SB._by_id["S-REVERSAL"], 1.1, 0.9, 12500)[0] == 1)  # (1.1-0.9)*12500 = 2500.000...1
 s0 = {r["book"]: r for r in SB.summary()["books"]}
 check("used margin = 120*65*7", s0["S-PULLBACK"]["used_margin"] == 54600, s0["S-PULLBACK"])
 check("available = balance - used", s0["S-PULLBACK"]["available"] == 250000 - 54600)
