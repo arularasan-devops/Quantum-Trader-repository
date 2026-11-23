@@ -891,6 +891,9 @@ class AppState:
             if status in ("REJECTED", "CANCELLED"):
                 self._add_alert("ORDER_REJECTED", f"{pend['side']} {pend['symbol']}: {status} "
                                 f"{st.message}", "critical")
+                if attr == "_pending_exit" and status == "REJECTED":
+                    self._sell_rejected = (pend["symbol"], time.time())
+                    self._halt_sells_on_funds_reject(pend["symbol"], st.message)
                 if attr == "_pending_order" and pend.get("auto_entry") and not total:
                     from app.engine import reject_guard
                     reject_guard.record_reject(self._instrument,
@@ -1438,6 +1441,8 @@ class AppState:
             if st.status in ("CANCELLED", "REJECTED"):
                 self._event("EXCH_STOP_CANCELLED", {"order_id": oid, "side": "SELL",
                             "symbol": sym, "lots": es.get("lots")}, st)
+                if st.status == "REJECTED":
+                    self._halt_sells_on_funds_reject(sym, st.message)
                 self._exch_stop = None
                 self._exch_stop_breach_at = None
                 self._persist_state()
@@ -1891,6 +1896,10 @@ class AppState:
                 return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
                                    lots=lots, status="NOT_SENT",
                                    message="Last SELL never reached Angel; retrying shortly.")
+            halted = self._sell_halt_reason(sym)
+            if halted:
+                return OrderResult(ok=False, mode="live", side="SELL", option_symbol=sym,
+                                   lots=lots, status="NOT_SENT", message=halted)
             res = self._submit_live("_pending_exit", sym, "SELL", lots)
             if not res.ok:
                 if res.status == "REJECTED":
