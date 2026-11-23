@@ -1153,6 +1153,7 @@ class AppState:
         self._enter_recovery(f"Angel rejected a SELL of {sym} for funds/margin "
                              f"({(message or '')[:120]}) — it would open a short")
         self._order_recovery["sell_halted"] = sym
+        self._order_recovery["manual_only"] = True
         self._persist_state()
         self._add_alert("SELL_HALTED_FUNDS_REJECT", f"{sym}: Angel rejected the SELL for "
                         "funds/margin. The bot sends no more SELLs or exchange stops for "
