@@ -16,12 +16,12 @@ acct = account_risk.account
 for inst in ("NIFTY", "SENSEX", "CRUDEOIL"):
     acct.record_exit(inst, -100.0, now - 60, stopped=True)
 
-settings.auto_trade_cooldown_exempt = []
+settings.auto_trade_cooldown_exempt = ""
 for inst in ("NIFTY", "SENSEX", "CRUDEOIL"):
     if not acct.instrument_blocked(inst, now):
         fails.append(f"default: {inst} should wait")
 
-settings.auto_trade_cooldown_exempt = ["nifty", " SENSEX "]
+settings.auto_trade_cooldown_exempt = "nifty, SENSEX "
 for inst in ("NIFTY", "SENSEX"):
     if acct.instrument_blocked(inst, now):
         fails.append(f"exempt: {inst} should not wait")

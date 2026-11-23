@@ -162,8 +162,8 @@ def lots_for_budget(budget: float, entry: float, stop: float, lot_size: int) -> 
 
 def cooldown_exempt(instrument: str) -> bool:
     """True when the instrument is listed in auto_trade_cooldown_exempt."""
-    return instrument.upper() in {
-        str(x).strip().upper() for x in (settings.auto_trade_cooldown_exempt or [])}
+    raw = settings.auto_trade_cooldown_exempt or ""
+    return instrument.upper() in {x.strip().upper() for x in raw.split(",") if x.strip()}
 
 class AccountRisk:
     """Shared, disk-persisted daily risk state for the whole option book."""

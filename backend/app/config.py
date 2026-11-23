@@ -360,9 +360,9 @@ class Settings(BaseSettings):
     auto_trade_post_stop_cooldown_sec: float = 1800.0
     # Apply the per-instrument cooldown to pullback-engine entries too.
     auto_trade_cooldown_with_engine: bool = True
-    # Instruments with NO re-entry / post-stop cooldown (e.g. ["NIFTY","SENSEX"]):
+    # Comma list of instruments with NO re-entry / post-stop cooldown (e.g. "NIFTY,SENSEX"):
     # they may be bought again on the next signal after an exit. Empty = all wait.
-    auto_trade_cooldown_exempt: list[str] = []
+    auto_trade_cooldown_exempt: str = ""
     # A live auto-buy whose connection to Angel never opened (nothing sent) is
     # retried while the signal stays valid: wait this long, at most this many times.
     auto_trade_unsent_retry_sec: float = 15.0
