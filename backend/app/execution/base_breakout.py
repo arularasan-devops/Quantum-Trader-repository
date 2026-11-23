@@ -29,8 +29,8 @@ def detect(candles: list[Candle], now: float) -> dict | None:
     sig = done[-1]
     base = done[-1 - BASE:-1]
     prior = done[-1 - BASE - ATR_N:-1 - BASE]
-    # A gap in the feed would stretch the windows; require contiguous minutes.
-    if sig.time - prior[0].time > (BASE + ATR_N + 5) * 60:
+    # Every minute of the base and reference windows must be present.
+    if sig.time - prior[0].time != (BASE + ATR_N) * 60:
         return None
     hi = max(c.high for c in base)
     lo = min(c.low for c in base)
