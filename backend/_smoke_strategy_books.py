@@ -27,7 +27,10 @@ settings.strategy_books_risk_pct = 1.0
 settings.daily_profit_target = 0.0
 settings.daily_lock_steps = ""
 settings.auto_trade_min_confidence = 80.0
-url = f"sqlite:///{tempfile.mkdtemp()}/sb.db"
+url = os.environ.get("SB_SMOKE_DB_URL") or f"sqlite:///{tempfile.mkdtemp()}/sb.db"
+if os.environ.get("SB_SMOKE_DB_URL"):  # throwaway test DB only
+    for t in ("jr_book_trades", "jr_book_days"):
+        Database(url).execute(f"DROP TABLE IF EXISTS {t}")
 spec = NS(lot_size=65, exchange="NSE")
 sbm.get_spec = pb.get_spec = lambda s: spec
 sbm.StrategyBooks._past_cutoff = staticmethod(lambda i, n: False)
@@ -59,6 +62,8 @@ check("only the signal's strategies bought", held == {"S-PULLBACK", "S-MOMENTUM"
 p = SB._by_id["S-PULLBACK"].positions["NIFTY"]
 check("lots from own capital & 1% risk: 2500 // ((120-115)*65) = 7", p.lots == 7, p.lots)
 check("entry at the ask", p.entry == 120.0, p.entry)
+check("1 lot above the 1% risk budget is not bought",
+      SB.size(SB._by_id["S-REVERSAL"], 120.0, 80.0, 65)[0] == 0)
 s0 = {r["book"]: r for r in SB.summary()["books"]}
 check("used margin = 120*65*7", s0["S-PULLBACK"]["used_margin"] == 54600, s0["S-PULLBACK"])
 check("available = balance - used", s0["S-PULLBACK"]["available"] == 250000 - 54600)

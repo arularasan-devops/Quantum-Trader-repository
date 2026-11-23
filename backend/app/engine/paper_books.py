@@ -252,7 +252,7 @@ def entry_block(instrument: str, entry: float, bid: float, ask: float,
 
 
 class PaperBooks:
-    scope_sql = "book NOT LIKE 'S-%'"  # strategy books (S-*) have their own board
+    scope_sql = "substr(book, 1, 2) <> 'S-'"  # strategy books (S-*) have their own board
 
     def __init__(self, db: Database | None = None, specs: list[str] | None = None) -> None:
         self.db = db or Database()

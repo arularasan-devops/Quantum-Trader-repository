@@ -37,7 +37,7 @@ def book_id(strategy: str) -> str:
 
 
 class StrategyBooks(PaperBooks):
-    scope_sql = "book LIKE 'S-%'"
+    scope_sql = "substr(book, 1, 2) = 'S-'"
 
     def __init__(self, db=None) -> None:
         super().__init__(db, specs=[])
@@ -73,7 +73,7 @@ class StrategyBooks(PaperBooks):
         affordable = int(max(0.0, self.available(b)) // (entry * lot_size))
         per_lot = (entry - stop) * lot_size
         budget = b.capital * settings.strategy_books_risk_pct / 100.0
-        lots = min(affordable, max(1, int(budget // per_lot))) if affordable else 0
+        lots = min(affordable, int(budget // per_lot))
         return lots, round(per_lot * lots, 2)
 
     def _close(self, b, p, price, reason, now) -> None:
