@@ -19,6 +19,7 @@ BASE = 20
 RANGE_X = 4.0
 ATR_N = 60
 VOL_X = 1.5
+STALE_SEC = 90
 
 
 def detect(candles: list[Candle], now: float) -> dict | None:
@@ -27,6 +28,10 @@ def detect(candles: list[Candle], now: float) -> dict | None:
     if len(done) < BASE + ATR_N + 1:
         return None
     sig = done[-1]
+    # Only the candle that just completed: older history (e.g. a freshly opened
+    # instrument's backfill) would be paired with the current option quotes.
+    if now - (sig.time + 60) > STALE_SEC:
+        return None
     base = done[-1 - BASE:-1]
     prior = done[-1 - BASE - ATR_N:-1 - BASE]
     # Every minute of the base and reference windows must be present.
