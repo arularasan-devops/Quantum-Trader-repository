@@ -54,6 +54,15 @@ def main():
     old, old_feed = settings.data_dir, settings.data_provider
     settings.data_dir = d
     settings.data_provider = "simulated"
+
+    class SimulatedProvider:
+        pass
+
+    class GrowwProvider:
+        def feed_mode(self):
+            return "live"
+
+    st.provider = SimulatedProvider()
     chain = [OptionQuote(symbol=f"X{k}{t.value}", strike=k, option_type=t, premium=50.0,
                          iv=.3, delta=.5, gamma=.01, theta=-1, vega=1, oi=1, oi_change=0,
                          volume=1, bid=49.5, ask=50.5)
@@ -64,10 +73,13 @@ def main():
         assert not os.path.exists(os.path.join(d, "base_breakout_shadow.jsonl")), "sim feed not logged"
         settings.data_provider = "angelone"
         st._log_base_breakout(bars, chain, now)
+        assert not os.path.exists(os.path.join(d, "base_breakout_shadow.jsonl")), "sim provider not logged"
+        st.provider = GrowwProvider()
+        st._log_base_breakout(bars, chain, now)
         st._log_base_breakout(bars, chain, now + 5)  # same candle: no duplicate
         rows = [json.loads(x) for x in open(os.path.join(d, "base_breakout_shadow.jsonl"))]
         assert len(rows) == 1 and rows[0]["option"] == "X101.0CE" and rows[0]["ask"] == 50.5, rows
-        assert rows[0]["mode"] == "shadow" and rows[0]["n_today"] == 1 and rows[0]["feed"] == "angelone"
+        assert rows[0]["mode"] == "shadow" and rows[0]["n_today"] == 1 and rows[0]["feed"] == "groww"
         st._log_base_breakout(bars[:10], chain, now)  # no signal: no crash, no row
     finally:
         settings.data_dir, settings.data_provider = old, old_feed

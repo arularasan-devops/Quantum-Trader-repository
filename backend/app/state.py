@@ -5334,8 +5334,13 @@ class AppState:
         try:
             from app.execution import base_breakout
 
-            feed = settings.data_provider.lower()
-            if feed in ("simulated", "sim", "demo"):
+            # Label from the provider actually serving this instrument (split
+            # feed: Groww for NFO/BFO, Angel One for MCX); skip simulated data.
+            feed = type(self.provider).__name__.removesuffix("Provider").lower()
+            with contextlib.suppress(Exception):
+                if self.provider.feed_mode() == "simulated":
+                    feed = "simulated"
+            if feed == "simulated":
                 return
             bb = base_breakout.detect(candles, now)
             if bb is None or bb["candle_time"] == self._bb_last_ct:
